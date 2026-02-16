@@ -1,0 +1,184 @@
+{% extends "base.html" %}
+
+{% block title %}OC Table Editor - Upload{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h4 class="mb-0">Upload CSV Files</h4>
+            </div>
+            <div class="card-body">
+                <form id="uploadForm" enctype="multipart/form-data">
+                    <div class="mb-3">
+                        <label class="form-label">Metadata CSV (optional)</label>
+                        <input type="file" class="form-control" name="metadata_file" accept=".csv">
+                        <div class="form-text">
+                            Upload a META-CSV file containing bibliographic metadata
+                        </div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label class="form-label">Citations CSV (optional)</label>
+                        <input type="file" class="form-control" name="citations_file" accept=".csv">
+                        <div class="form-text">
+                            Upload a CITS-CSV file containing citation data
+                        </div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" name="verify_id_existence" id="verifyIdExistence">
+                            <label class="form-check-label" for="verifyIdExistence">
+                                Verify ID existence (slower, requires internet)
+                            </label>
+                        </div>
+                        <div class="form-text text-muted">
+                            Check if IDs exist in external databases. This may take longer and requires internet access.
+                        </div>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary" id="uploadBtn">
+                        <span class="spinner-border spinner-border-sm d-none" role="status"></span>
+                        Upload & Validate
+                    </button>
+                </form>
+                
+                <div id="uploadAlert" class="alert d-none mt-3"></div>
+            </div>
+        </div>
+        
+        <div class="card mt-4">
+            <div class="card-header">
+                <h5 class="mb-0">Saved Drafts</h5>
+            </div>
+            <div class="card-body">
+                <div id="draftsList">
+                    <p class="text-muted">Loading drafts...</p>
+                </div>
+                <button class="btn btn-sm btn-secondary" id="refreshDrafts">Refresh</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    // Load drafts on page load
+    loadDrafts();
+    
+    document.getElementById('refreshDrafts').addEventListener('click', loadDrafts);
+    
+    // Form submission
+    document.getElementById('uploadForm').addEventListener('submit', async function(e) {
+        e.preventDefault();
+        
+        const btn = document.getElementById('uploadBtn');
+        const spinner = btn.querySelector('.spinner-border');
+        const alert = document.getElementById('uploadAlert');
+        
+        btn.disabled = true;
+        spinner.classList.remove('d-none');
+        alert.classList.add('d-none');
+        
+        const formData = new FormData(this);
+        const checkbox = document.getElementById('verifyIdExistence');
+        formData.append('verify_id_existence', checkbox.checked);
+        
+        try {
+            const response = await fetch('/api/upload/', {
+                method: 'POST',
+                body: formData
+            });
+            
+            const data = await response.json();
+            
+            if (response.ok) {
+                alert.className = 'alert alert-success mt-3';
+                alert.textContent = 'Files uploaded and validated successfully! Redirecting...';
+                alert.classList.remove('d-none');
+                
+                setTimeout(() => {
+                    window.location.href = data.html_url;
+                }, 1500);
+            } else {
+                throw new Error(data.detail || 'Upload failed');
+            }
+        } catch (error) {
+            alert.className = 'alert alert-danger mt-3';
+            alert.textContent = 'Error: ' + error.message;
+            alert.classList.remove('d-none');
+        } finally {
+            btn.disabled = false;
+            spinner.classList.add('d-none');
+        }
+    });
+});
+
+async function loadDrafts() {
+    const draftsList = document.getElementById('draftsList');
+    
+    try {
+        const response = await fetch('/api/draft/list');
+        const data = await response.json();
+        
+        if (data.drafts.length === 0) {
+            draftsList.innerHTML = '<p class="text-muted">No saved drafts found.</p>';
+            return;
+        }
+        
+        let html = '<div class="list-group">';
+        data.drafts.forEach(draft => {
+            const name = draft.draft_name || 'Untitled Draft';
+            const date = new Date(draft.last_updated).toLocaleString();
+            const metaBadge = draft.has_metadata ? '<span class="badge bg-info">Meta</span>' : '';
+            const citsBadge = draft.has_citations ? '<span class="badge bg-success">Cits</span>' : '';
+            
+            html += `
+                <div class="list-group-item list-group-item-action d-flex justify-content-between align-items-center">
+                    <div>
+                        <a href="/editor/${draft.session_id}" class="text-decoration-none">
+                            <strong>${name}</strong>
+                        </a>
+                        <br>
+                        <small class="text-muted">${date}</small>
+                        <span class="ms-2">${metaBadge} ${citsBadge}</span>
+                    </div>
+                    <button class="btn btn-sm btn-outline-danger" onclick="deleteDraft('${draft.session_id}')">
+                        Delete
+                    </button>
+                </div>
+            `;
+        });
+        html += '</div>';
+        
+        draftsList.innerHTML = html;
+    } catch (error) {
+        draftsList.innerHTML = '<p class="text-danger">Error loading drafts: ' + error.message + '</p>';
+    }
+}
+
+async function deleteDraft(sessionId) {
+    if (!confirm('Are you sure you want to delete this draft?')) {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/api/draft/${sessionId}`, {
+            method: 'DELETE'
+        });
+        
+        if (response.ok) {
+            loadDrafts();
+        } else {
+            alert('Error deleting draft');
+        }
+    } catch (error) {
+        alert('Error: ' + error.message);
+    }
+}
+</script>
+{% endblock %}

@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+
+{% block title %}Error{% endblock %}
+
+{% block content %}
+<div class="container mt-5">
+    <div class="row justify-content-center">
+        <div class="col-md-6">
+            <div class="alert alert-danger" role="alert">
+                <h4 class="alert-heading">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" class="bi bi-exclamation-triangle-fill flex-shrink-0 me-2" viewBox="0 0 16 16">
+                        <path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.987 1.967l.05.125.2.2c.018.34.057.745.17 1.29.754l.058-1.71.604-2.767-1.794-3.632A8 8 0 1 1 8 8c0 4.42 3.582 8 8 8s-8-3.582-8-8c0 1.533.425 2.967 1.194 4.092l.058 1.71.604 2.767 1.794 3.632.17.545.152 1.95.17 2.29l.05-.125c.896-.2 1.444-1.189.987-1.967L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.351 3.507a.552.552 0 0 1 1.1 0l.349-3.507A.905.905 0 0 0 8 5c-.535 0-.954-.462-.9-.995L6.751 1.493a.552.552 0 0 1-1.1 0L7.1 5a.905.905 0 0 0-.9-.995zM8 10a1 1 0 1 0 0-2 0 1 1 0 0 0 0 2zm0-6a1 1 0 1 0 0-2 0 1 1 0 0 0 0 2z"/>
+                    </svg>
+                    An error occurred
+                </h4>
+                <p class="mb-4 fs-5 text-body-secondary">Sorry, something went wrong while processing your request.</p>
+                
+                {% if error %}
+                    <hr>
+                    <div class="d-flex align-items-center mb-3">
+                        <strong class="me-auto">Error details:</strong>
+                        <p class="mb-0 mt-1 text-danger">{{ error }}</p>
+                    </div>
+                {% endif %}
+                
+                <div class="d-grid gap-2 d-md-flex justify-content-md-end mt-4">
+                    <a href="{{ url_for('index') }}" class="btn btn-outline-secondary">Back to Home</a>
+                    {% if referrer %}
+                        <a href="{{ referrer }}" class="btn btn-outline-primary">Go Back</a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

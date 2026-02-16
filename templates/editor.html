@@ -1,0 +1,440 @@
+{% extends "base.html" %}
+
+{% block title %}OC Table Editor - {{ session_id[:8] }}{% endblock %}
+
+{% block content %}
+<div class="row">
+    <!-- Sidebar controls -->
+    <div class="col-md-2">
+        <div class="card">
+            <div class="card-header">
+                <h6 class="mb-0">Actions</h6>
+            </div>
+            <div class="card-body p-2">
+                <div class="d-grid gap-2">
+                    <button class="btn btn-primary btn-sm" id="revalidateBtn">
+                        <span class="spinner-border spinner-border-sm d-none" role="status"></span>
+                        Re-Validate
+                    </button>
+                    <button class="btn btn-success btn-sm" id="exportBtn">
+                        Export CSV
+                    </button>
+                    <button class="btn btn-secondary btn-sm" id="saveDraftBtn">
+                        Save Draft
+                    </button>
+                    <button class="btn btn-outline-danger btn-sm" id="deleteDraftBtn">
+                        Delete Draft
+                    </button>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mt-3">
+            <div class="card-header">
+                <h6 class="mb-0">Session Info</h6>
+            </div>
+            <div class="card-body p-2">
+                <p class="mb-1 small"><strong>Session:</strong> <span id="sessionId">{{ session_id[:8] }}</span></p>
+                <p class="mb-1 small"><strong>Edited Items:</strong> <span id="editedCount">0</span></p>
+                <p class="mb-1 small" id="editedSinceValContainer">
+                    <strong>Edits Since Validation:</strong> 
+                    <span id="editedSinceVal">No</span>
+                </p>
+                <p class="mb-1 small"><strong>Last Validated:</strong> <span id="lastValidated">-</span></p>
+            </div>
+        </div>
+        
+        <div class="card mt-3">
+            <div class="card-header">
+                <h6 class="mb-0">Tips</h6>
+            </div>
+            <div class="card-body p-2 small">
+                <ul class="mb-0 ps-3">
+                    <li>Click on any text to edit it</li>
+                    <li>Grey background = edited item</li>
+                    <li>Underline = has validation issues</li>
+                    <li>Click colored square for issue details</li>
+                    <li>Re-validate after editing</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Main editor area -->
+    <div class="col-md-10">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0">Validation Results</h5>
+                <div>
+                    <button class="btn btn-sm btn-outline-secondary" id="showAllBtn">Show All</button>
+                    <button class="btn btn-sm btn-outline-secondary" id="showEditedBtn">Show Edited</button>
+                </div>
+            </div>
+            <div class="card-body" id="tableContainer">
+                <div class="text-center py-5">
+                    <div class="spinner-border" role="status">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                    <p class="mt-2">Loading table...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Edit modal -->
+<div class="modal fade" id="editModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Edit Item</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <label class="form-label">Current Value:</label>
+                <p class="form-control-plaintext" id="currentValue"></p>
+                
+                <label class="form-label" for="newValue">New Value:</label>
+                <input type="text" class="form-control" id="newValue" placeholder="Enter new value">
+                
+                <div class="form-text" id="itemInfo"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" id="saveEditBtn">Save</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Alert container -->
+<div class="position-fixed bottom-0 end-0 p-3" style="z-index: 11">
+    <div id="alertToast" class="toast" role="alert" aria-live="assertive" aria-atomic="true">
+        <div class="toast-header">
+            <strong class="me-auto" id="alertTitle"></strong>
+            <button type="button" class="btn-close" data-bs-dismiss="toast"></button>
+        </div>
+        <div class="toast-body" id="alertMessage"></div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const sessionId = '{{ session_id }}';
+let currentItemId = null;
+let editModal = null;
+let alertToast = null;
+
+document.addEventListener('DOMContentLoaded', function() {
+    editModal = new bootstrap.Modal(document.getElementById('editModal'));
+    alertToast = new bootstrap.Toast(document.getElementById('alertToast'));
+    
+    // Load initial data
+    loadTable();
+    loadSessionInfo();
+    
+    // Event listeners
+    document.getElementById('revalidateBtn').addEventListener('click', revalidate);
+    document.getElementById('exportBtn').addEventListener('click', exportCSV);
+    document.getElementById('saveDraftBtn').addEventListener('click', saveDraft);
+    document.getElementById('deleteDraftBtn').addEventListener('click', deleteDraft);
+    document.getElementById('showAllBtn').addEventListener('click', () => loadTable());
+    document.getElementById('showEditedBtn').addEventListener('click', loadEditedOnly);
+    document.getElementById('saveEditBtn').addEventListener('click', saveEdit);
+});
+
+async function loadTable() {
+    const container = document.getElementById('tableContainer');
+    
+    try {
+        const response = await fetch(`/api/edit/html/${sessionId}`);
+        const data = await response.json();
+        
+        if (response.ok) {
+            container.innerHTML = data.html;
+            setupEditHandlers();
+        } else {
+            throw new Error(data.detail || 'Failed to load table');
+        }
+    } catch (error) {
+        container.innerHTML = `<div class="alert alert-danger">Error: ${error.message}</div>`;
+    }
+}
+
+async function loadEditedOnly() {
+    const container = document.getElementById('tableContainer');
+    
+    try {
+        const response = await fetch(`/api/edit/session/${sessionId}`);
+        const sessionData = await response.json();
+        
+        if (!response.ok) throw new Error('Failed to load session');
+        
+        // Get HTML and filter for edited items
+        const htmlResponse = await fetch(`/api/edit/html/${sessionId}`);
+        const htmlData = await htmlResponse.json();
+        
+        if (!htmlResponse.ok) throw new Error('Failed to load HTML');
+        
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(htmlData.html, 'text/html');
+        const table = doc.getElementById('table-data');
+        
+        if (!table) throw new Error('Table not found');
+        
+        // Filter rows to show only edited items
+        const tbody = table.querySelector('tbody');
+        const editedItemIds = new Set();
+        
+        // Get edited items from session
+        const editStateResponse = await fetch('/api/edit/edited/' + sessionId);
+        if (editStateResponse.ok) {
+            const editData = await editStateResponse.json();
+            editData.edited_items.forEach(item => editedItemIds.add(item.item_id));
+        }
+        
+        if (editedItemIds.size === 0) {
+            showAlert('info', 'No Edits', 'No items have been edited yet.');
+            return;
+        }
+        
+        // Filter rows containing edited items
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+        rows.forEach(row => {
+            const editedSpan = row.querySelector('.item-data.edited');
+            if (!editedSpan) {
+                row.style.display = 'none';
+            }
+        });
+        
+        container.innerHTML = doc.body.innerHTML;
+        setupEditHandlers();
+        
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    }
+}
+
+async function loadSessionInfo() {
+    try {
+        const response = await fetch(`/api/edit/session/${sessionId}`);
+        const data = await response.json();
+        
+        if (response.ok) {
+            document.getElementById('editedCount').textContent = data.edited_items_count;
+            document.getElementById('editedSinceVal').textContent = data.has_edits_since_validation ? 'Yes' : 'No';
+            document.getElementById('lastValidated').textContent = data.last_validated_at 
+                ? new Date(data.last_validated_at).toLocaleString() 
+                : '-';
+        }
+    } catch (error) {
+        console.error('Error loading session info:', error);
+    }
+}
+
+function setupEditHandlers() {
+    // Make all item-data spans editable
+    const items = document.querySelectorAll('.item-data');
+    items.forEach(item => {
+        item.addEventListener('click', function(e) {
+            e.preventDefault();
+            const itemIdSpan = this.nextElementSibling;
+            if (itemIdSpan && itemIdSpan.classList.contains('issue-icon')) {
+                currentItemId = itemIdSpan.id;
+            } else {
+                // Find the nearest issue icon
+                const issueIcon = this.parentElement.querySelector('.issue-icon');
+                currentItemId = issueIcon ? issueIcon.id : null;
+            }
+            
+            if (currentItemId) {
+                openEditModal(this.textContent, currentItemId);
+            }
+        });
+        
+        // Add hover cursor
+        item.style.cursor = 'pointer';
+    });
+}
+
+function openEditModal(currentValue, itemId) {
+    document.getElementById('currentValue').textContent = currentValue;
+    document.getElementById('newValue').value = currentValue;
+    document.getElementById('itemInfo').textContent = `Item ID: ${itemId}`;
+    editModal.show();
+}
+
+async function saveEdit() {
+    const newValue = document.getElementById('newValue').value;
+    
+    try {
+        const response = await fetch('/api/edit/item', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                session_id: sessionId,
+                item_id: currentItemId,
+                new_value: newValue
+            })
+        });
+        
+        const data = await response.json();
+        
+        if (response.ok) {
+            showAlert('success', 'Saved', 'Item updated successfully!');
+            editModal.hide();
+            loadTable();
+            loadSessionInfo();
+        } else {
+            throw new Error(data.detail || 'Failed to save');
+        }
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    }
+}
+
+async function revalidate() {
+    const btn = document.getElementById('revalidateBtn');
+    const spinner = btn.querySelector('.spinner-border');
+    
+    btn.disabled = true;
+    spinner.classList.remove('d-none');
+    
+    try {
+        const response = await fetch('/api/edit/revalidate', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                session_id: sessionId
+            })
+        });
+        
+        const data = await response.json();
+        
+        if (response.ok) {
+            showAlert('success', 'Validation Complete', `Found ${data.error_count} errors/warnings.`);
+            loadTable();
+            loadSessionInfo();
+        } else {
+            throw new Error(data.detail || 'Validation failed');
+        }
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    } finally {
+        btn.disabled = false;
+        spinner.classList.add('d-none');
+    }
+}
+
+async function exportCSV() {
+    try {
+        const response = await fetch('/api/export/', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                session_id: sessionId,
+                revalidate: false
+            })
+        });
+        
+        if (response.ok) {
+            // Handle CSV download
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'exported_data.csv';
+            a.click();
+            window.URL.revokeObjectURL(url);
+        } else {
+            const data = await response.json();
+            throw new Error(data.detail || 'Export failed');
+        }
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    }
+}
+
+async function saveDraft() {
+    try {
+        const response = await fetch('/api/draft/save', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                session_id: sessionId
+            })
+        });
+        
+        const data = await response.json();
+        
+        if (response.ok) {
+            showAlert('success', 'Saved', data.message);
+        } else {
+            throw new Error(data.detail || 'Failed to save');
+        }
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    }
+}
+
+async function deleteDraft() {
+    if (!confirm('Are you sure you want to delete this draft?')) {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/api/draft/${sessionId}`, {
+            method: 'DELETE'
+        });
+        
+        if (response.ok) {
+            showAlert('success', 'Deleted', 'Draft deleted successfully.');
+            setTimeout(() => {
+                window.location.href = '/';
+            }, 1500);
+        } else {
+            throw new Error('Failed to delete draft');
+        }
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    }
+}
+
+function showAlert(type, title, message) {
+    const titleEl = document.getElementById('alertTitle');
+    const messageEl = document.getElementById('alertMessage');
+    const toast = document.getElementById('alertToast');
+    
+    titleEl.textContent = title;
+    messageEl.textContent = message;
+    
+    toast.classList.remove('text-bg-success', 'text-bg-danger', 'text-bg-info', 'text-bg-warning');
+    
+    switch(type) {
+        case 'success':
+            toast.classList.add('text-bg-success');
+            break;
+        case 'error':
+            toast.classList.add('text-bg-danger');
+            break;
+        case 'info':
+            toast.classList.add('text-bg-info');
+            break;
+        case 'warning':
+            toast.classList.add('text-bg-warning');
+            break;
+    }
+    
+    alertToast.show();
+}
+</script>
+{% endblock %}
