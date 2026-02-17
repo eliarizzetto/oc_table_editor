@@ -172,11 +172,20 @@ class SessionManager:
         """
         html_file = TEMP_DIR / session_id / f'{table_type}_html.html'
         
+        # Check if file exists
         if not html_file.exists():
             return None
         
-        async with aio_open(html_file, 'r', encoding='utf-8') as f:
-            return await f.read()
+        # Check if file is not empty
+        if html_file.stat().st_size == 0:
+            return None
+        
+        try:
+            async with aio_open(html_file, 'r', encoding='utf-8') as f:
+                content = await f.read()
+                return content
+        except Exception as e:
+            return None
     
     @staticmethod
     async def load_report(session_id: str, table_type: str) -> Optional[dict]:

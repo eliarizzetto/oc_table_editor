@@ -62,8 +62,7 @@ class ValidatorService:
         cits_csv_path: str,
         meta_output_dir: str,
         cits_output_dir: str,
-        verify_id_existence: bool = False,
-        strict_sequentiality: bool = False
+        verify_id_existence: bool = False
     ) -> Tuple[list, list]:
         """
         Validate paired metadata and citations CSV files.
@@ -74,7 +73,6 @@ class ValidatorService:
             meta_output_dir: Directory to store metadata validation output
             cits_output_dir: Directory to store citations validation output
             verify_id_existence: Whether to check ID existence (external APIs)
-            strict_sequentiality: If True, skip closure check if other checks fail
             
         Returns:
             Tuple of (metadata_errors, citations_errors)
@@ -84,7 +82,6 @@ class ValidatorService:
             meta_output_dir=meta_output_dir,
             cits_csv_doc=cits_csv_path,
             cits_output_dir=cits_output_dir,
-            strict_sequentiality=strict_sequentiality,
             meta_kwargs={'verify_id_existence': verify_id_existence},
             cits_kwargs={'verify_id_existence': verify_id_existence}
         )
@@ -93,7 +90,7 @@ class ValidatorService:
     @staticmethod
     def get_report_json_path(csv_path: str, output_dir: str) -> Optional[str]:
         """
-        Get the path to the JSON validation report.
+        Get path to JSON validation report.
         
         Args:
             csv_path: Original CSV file path
@@ -102,12 +99,23 @@ class ValidatorService:
         Returns:
             Path to JSON report or None if not found
         """
-        from os.path import listdir
+        from os import listdir
         basename = Path(csv_path).stem
+        output_path = Path(output_dir)
         
-        # Look for the JSON report
-        for f in listdir(output_dir):
-            if f.startswith(f"out_validate_{basename}") or f.startswith(f"out_validate_{basename}_"):
-                return str(Path(output_dir) / f)
+        # Look for JSON report with multiple possible patterns
+        json_files = [f for f in listdir(output_dir) if f.endswith('.json')]
+        
+        # Skip edit_state.json as it's our internal tracking file
+        for f in json_files:
+            f_lower = f.lower()
+            # Try different naming patterns, but skip edit_state.json
+            if f_lower.endswith('.json') and 'edit_state' not in f_lower and basename in f_lower:
+                return str(output_path / f)
+        
+        # If not found, try to find any JSON file except edit_state.json
+        for f in json_files:
+            if f != 'edit_state.json':
+                return str(output_path / f)
         
         return None

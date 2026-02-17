@@ -49,10 +49,41 @@ async def get_html(session_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    html_content = await SessionManager.load_html(session_id, 'meta')
+    # Load HTML based on which files exist
+    table_type = None
+    if session.has_metadata:
+        table_type = 'meta'
+    elif session.has_citations:
+        table_type = 'cits'
+    
+    if not table_type:
+        raise HTTPException(status_code=400, detail="No data files found in session")
+    
+    html_content = await SessionManager.load_html(session_id, table_type)
     
     if not html_content:
-        raise HTTPException(status_code=404, detail="HTML content not found")
+        from config import TEMP_DIR
+        session_dir = TEMP_DIR / session_id
+        html_file = session_dir / f'{table_type}_html.html'
+        
+        # Check what files exist in the session directory
+        if not session_dir.exists():
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Session directory not found: {session_dir}"
+            )
+        
+        existing_files = list(session_dir.glob('*.html'))
+        if not existing_files:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No HTML files found in session directory. Expected: {html_file}"
+            )
+        
+        raise HTTPException(
+            status_code=404,
+            detail=f"HTML content not found for table type '{table_type}'. Expected file: {html_file}. Found HTML files: {[f.name for f in existing_files]}"
+        )
     
     # Apply edit tracking if exists
     edit_states = await SessionManager.load_edit_state(session_id)
@@ -66,19 +97,22 @@ async def get_html(session_id: str):
 @router.post("/item")
 async def edit_item(request: EditItemRequest):
     """
-    Edit a single item in the table.
+    Edit a single item in table.
     
     - **session_id**: Session identifier
-    - **item_id**: Unique identifier for the item (e.g., '0-id-0')
-    - **new_value**: New text value for the item
+    - **item_id**: Unique identifier for item (e.g., '0-id-0')
+    - **new_value**: New text value for item
     """
     session = await SessionManager.load_session(request.session_id)
     
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
+    # Determine table type
+    table_type = 'meta' if session.has_metadata else 'cits'
+    
     # Load current HTML
-    html_content = await SessionManager.load_html(request.session_id, 'meta')
+    html_content = await SessionManager.load_html(request.session_id, table_type)
     
     if not html_content:
         raise HTTPException(status_code=404, detail="HTML content not found")
@@ -93,7 +127,7 @@ async def edit_item(request: EditItemRequest):
     updated_html = HTMLParser.update_item_value(html_content, request.item_id, request.new_value)
     
     # Save updated HTML
-    await SessionManager.save_html(request.session_id, updated_html, 'meta')
+    await SessionManager.save_html(request.session_id, updated_html, table_type)
     
     # Update edit state
     edit_states = await SessionManager.load_edit_state(request.session_id)
@@ -140,20 +174,39 @@ async def revalidate(request: RevalidateRequest):
     # Use provided verify_id_existence or session default
     verify_id = request.verify_id_existence if request.verify_id_existence is not None else session.verify_id_existence
     
+    # Determine table type
+    table_type = 'meta' if session.has_metadata else 'cits'
+    
     # Load current HTML and parse it
-    html_content = await SessionManager.load_html(request.session_id, 'meta')
+    html_content = await SessionManager.load_html(request.session_id, table_type)
     
     if not html_content:
         raise HTTPException(status_code=404, detail="HTML content not found")
     
     # Parse table data from HTML
-    rows_data = HTMLParser.parse_table(html_content)
+    try:
+        rows_data = HTMLParser.parse_table(html_content)
+    except Exception as e:
+        raise ValueError(f"Failed to parse HTML table: {str(e)}")
+    
+    if not rows_data:
+        raise ValueError("No data found in HTML table")
     
     # Generate CSV from parsed data
-    session_dir = Path(session.meta_html_path).parent
+    # Use correct HTML path to get session directory
+    html_path = session.meta_html_path if table_type == 'meta' else session.cits_html_path
+    if not html_path:
+        raise HTTPException(
+            status_code=500,
+            detail=f"HTML path not found for table type '{table_type}'"
+        )
+    session_dir = Path(html_path).parent
     original_csv_path = session.meta_csv_path if session.has_metadata else session.cits_csv_path
     
-    csv_content = CSVExporter.rows_to_csv(rows_data, original_csv_path)
+    try:
+        csv_content = CSVExporter.rows_to_csv(rows_data, original_csv_path)
+    except Exception as e:
+        raise ValueError(f"Failed to convert table to CSV: {str(e)}")
     
     # Save temporary CSV file
     temp_csv_path = session_dir / 'temp_revalidate.csv'
@@ -165,26 +218,29 @@ async def revalidate(request: RevalidateRequest):
         if session.has_metadata and session.has_citations:
             # Note: For paired files, we'd need both tables
             # For now, handle single table case
-            report = ValidatorService.validate_metadata(
+            errors = ValidatorService.validate_metadata(
                 csv_path=str(temp_csv_path),
                 output_dir=str(session_dir),
                 verify_id_existence=verify_id
             )
         elif session.has_metadata:
-            report = ValidatorService.validate_metadata(
+            errors = ValidatorService.validate_metadata(
                 csv_path=str(temp_csv_path),
                 output_dir=str(session_dir),
                 verify_id_existence=verify_id
             )
         else:
-            report = ValidatorService.validate_citations(
+            errors = ValidatorService.validate_citations(
                 csv_path=str(temp_csv_path),
                 output_dir=str(session_dir),
                 verify_id_existence=verify_id
             )
         
-        # Get report path
-        report_path = ValidatorService.get_report_json_path(str(temp_csv_path), str(session_dir))
+        # Get report path (use original CSV path, not temp CSV path)
+        report_path = ValidatorService.get_report_json_path(original_csv_path, str(session_dir))
+        
+        if not report_path:
+            raise ValueError("Validation report not found. Check that validation completed successfully.")
         
         # Generate new HTML
         temp_html_path = session_dir / 'temp_revalidate.html'
@@ -201,7 +257,7 @@ async def revalidate(request: RevalidateRequest):
             new_html = HTMLParser.apply_edit_tracking(new_html, edited_ids)
         
         # Save updated HTML
-        await SessionManager.save_html(request.session_id, new_html, 'meta')
+        await SessionManager.save_html(request.session_id, new_html, table_type)
         
         # Update session report path
         if session.has_metadata:
@@ -220,7 +276,7 @@ async def revalidate(request: RevalidateRequest):
         
         return {
             "success": True,
-            "error_count": len(report),
+            "error_count": len(errors),
             "html_updated": True
         }
         
@@ -241,20 +297,23 @@ async def get_filtered_rows(request: GetFilteredRowsRequest):
     Get HTML table containing only rows involved in a specific issue.
     
     - **session_id**: Session identifier
-    - **issue_id**: ID of the issue (e.g., 'meta-0', 'cits-1')
+    - **issue_id**: ID of issue (e.g., 'meta-0', 'cits-1')
     """
     session = await SessionManager.load_session(request.session_id)
     
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
+    # Determine table type
+    table_type = 'meta' if session.has_metadata else 'cits'
+    
     # Load current HTML
-    html_content = await SessionManager.load_html(request.session_id, 'meta')
+    html_content = await SessionManager.load_html(request.session_id, table_type)
     
     if not html_content:
         raise HTTPException(status_code=404, detail="HTML content not found")
     
-    # Get row indices for the issue
+    # Get row indices for issue
     row_indices = HTMLParser.get_rows_by_issue(html_content, request.issue_id)
     
     # Extract filtered table
@@ -270,6 +329,37 @@ async def get_filtered_rows(request: GetFilteredRowsRequest):
         "html": filtered_html,
         "row_indices": row_indices,
         "issue_id": request.issue_id
+    }
+
+
+@router.get("/edited/{session_id}")
+async def get_edited_items(session_id: str):
+    """
+    Get list of edited items for a session.
+    
+    - **session_id**: Session identifier
+    """
+    session = await SessionManager.load_session(session_id)
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    edit_states = await SessionManager.load_edit_state(session_id)
+    
+    # Filter only edited items
+    edited_items = [
+        {
+            "item_id": item_id,
+            "original_value": state.original_value,
+            "edited_value": state.edited_value
+        }
+        for item_id, state in edit_states.items()
+        if state.edited
+    ]
+    
+    return {
+        "edited_items": edited_items,
+        "count": len(edited_items)
     }
 
 

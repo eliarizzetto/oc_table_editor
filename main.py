@@ -46,8 +46,8 @@ app = FastAPI(
 
 # Setup directories
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
-Path(__file__).parent.parent / "oc_table_editor" / "static" / "css".mkdir(parents=True, exist_ok=True)
-Path(__file__).parent.parent / "oc_table_editor" / "static" / "js".mkdir(parents=True, exist_ok=True)
+(Path(__file__).parent.parent / "oc_table_editor" / "static" / "css").mkdir(parents=True, exist_ok=True)
+(Path(__file__).parent.parent / "oc_table_editor" / "static" / "js").mkdir(parents=True, exist_ok=True)
 
 # Setup templates
 templates = Jinja2Templates(directory="templates")

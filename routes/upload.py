@@ -32,17 +32,18 @@ async def upload_files(
     - **citations_file**: Optional citations CSV file
     - **verify_id_existence**: Whether to check ID existence (external APIs)
     """
-    # Validate that at least one file is provided
-    if not metadata_file and not citations_file:
-        raise HTTPException(status_code=400, detail="At least one CSV file must be provided")
+    # Check file sizes and validate files exist with content
+    has_metadata = False
+    has_citations = False
     
-    # Check file sizes
     if metadata_file:
         metadata_file.file.seek(0, 2)  # Seek to end
         size = metadata_file.file.tell()
         metadata_file.file.seek(0)  # Reset
         
-        if size > MAX_UPLOAD_SIZE:
+        if size > 0 and size <= MAX_UPLOAD_SIZE:
+            has_metadata = True
+        elif size > MAX_UPLOAD_SIZE:
             raise HTTPException(
                 status_code=400,
                 detail=f"Metadata file exceeds maximum size of {MAX_UPLOAD_SIZE / (1024*1024)} MB"
@@ -53,11 +54,17 @@ async def upload_files(
         size = citations_file.file.tell()
         citations_file.file.seek(0)
         
-        if size > MAX_UPLOAD_SIZE:
+        if size > 0 and size <= MAX_UPLOAD_SIZE:
+            has_citations = True
+        elif size > MAX_UPLOAD_SIZE:
             raise HTTPException(
                 status_code=400,
                 detail=f"Citations file exceeds maximum size of {MAX_UPLOAD_SIZE / (1024*1024)} MB"
             )
+    
+    # Validate that at least one file is provided
+    if not has_metadata and not has_citations:
+        raise HTTPException(status_code=400, detail="At least one CSV file must be provided")
     
     # Create session
     session_id = SessionManager.create_session_id()
@@ -66,29 +73,59 @@ async def upload_files(
     # Create session object
     session = Session(
         session_id=session_id,
-        has_metadata=metadata_file is not None,
-        has_citations=citations_file is not None,
+        has_metadata=has_metadata,
+        has_citations=has_citations,
         verify_id_existence=verify_id_existence
     )
     
     # Save uploaded files
-    if metadata_file:
+    if has_metadata:
+        # Use provided filename or default to 'metadata.csv'
+        filename = metadata_file.filename or 'metadata.csv'
+        if not filename:
+            raise HTTPException(
+                status_code=400,
+                detail="Metadata filename is required"
+            )
         meta_content = await metadata_file.read()
+        
+        # Validate file content is not empty
+        if not meta_content:
+            raise HTTPException(
+                status_code=400,
+                detail="Metadata file is empty. Please upload a valid CSV file."
+            )
+        
         meta_path = await SessionManager.save_uploaded_file(
-            session_id, meta_content, metadata_file.filename
+            session_id, meta_content, filename
         )
         session.meta_csv_path = meta_path
     
-    if citations_file:
+    if has_citations:
+        # Use provided filename or default to 'citations.csv'
+        filename = citations_file.filename or 'citations.csv'
+        if not filename:
+            raise HTTPException(
+                status_code=400,
+                detail="Citations filename is required"
+            )
         cits_content = await citations_file.read()
+        
+        # Validate file content is not empty
+        if not cits_content:
+            raise HTTPException(
+                status_code=400,
+                detail="Citations file is empty. Please upload a valid CSV file."
+            )
+        
         cits_path = await SessionManager.save_uploaded_file(
-            session_id, cits_content, citations_file.filename
+            session_id, cits_content, filename
         )
         session.cits_csv_path = cits_path
     
     # Run validation
     try:
-        if metadata_file and citations_file:
+        if has_metadata and has_citations:
             # Validate paired files
             meta_report, cits_report = ValidatorService.validate_pair(
                 meta_csv_path=session.meta_csv_path,
@@ -106,9 +143,19 @@ async def upload_files(
                 session.cits_csv_path, str(session_dir)
             )
             
+            # Validate report paths were found
+            if not session.meta_report_path:
+                raise ValueError(
+                    f"Metadata validation report not found. Expected in: {session_dir}"
+                )
+            if not session.cits_report_path:
+                raise ValueError(
+                    f"Citations validation report not found. Expected in: {session_dir}"
+                )
+            
             # Generate HTML for both tables
-            meta_html_path = session_dir / 'meta.html'
-            cits_html_path = session_dir / 'cits.html'
+            meta_html_path = session_dir / 'meta_html.html'
+            cits_html_path = session_dir / 'cits_html.html'
             
             make_gui(
                 session.meta_csv_path,
@@ -131,7 +178,7 @@ async def upload_files(
             
             session.meta_html_path = str(merged_html_path)
             
-        elif metadata_file:
+        elif has_metadata:
             # Validate metadata only
             meta_report = ValidatorService.validate_metadata(
                 csv_path=session.meta_csv_path,
@@ -143,8 +190,14 @@ async def upload_files(
                 session.meta_csv_path, str(session_dir)
             )
             
+            # Validate report path was found
+            if not session.meta_report_path:
+                raise ValueError(
+                    f"Metadata validation report not found. Expected in: {session_dir}"
+                )
+            
             # Generate HTML
-            meta_html_path = session_dir / 'meta.html'
+            meta_html_path = session_dir / 'meta_html.html'
             make_gui(
                 session.meta_csv_path,
                 session.meta_report_path,
@@ -153,7 +206,7 @@ async def upload_files(
             
             session.meta_html_path = str(meta_html_path)
             
-        elif citations_file:
+        elif has_citations:
             # Validate citations only
             cits_report = ValidatorService.validate_citations(
                 csv_path=session.cits_csv_path,
@@ -165,8 +218,14 @@ async def upload_files(
                 session.cits_csv_path, str(session_dir)
             )
             
+            # Validate report path was found
+            if not session.cits_report_path:
+                raise ValueError(
+                    f"Citations validation report not found. Expected in: {session_dir}"
+                )
+            
             # Generate HTML
-            cits_html_path = session_dir / 'cits.html'
+            cits_html_path = session_dir / 'cits_html.html'
             make_gui(
                 session.cits_csv_path,
                 session.cits_report_path,
@@ -189,9 +248,34 @@ async def upload_files(
             "html_url": f"/editor/{session_id}"
         }
         
+    except ValueError as e:
+        # Clean up on error
+        SessionManager.delete_session(session_id)
+        # Log the error for debugging
+        import traceback
+        traceback.print_exc()
+        
+        # Provide user-friendly error message
+        error_msg = str(e)
+        if "delimiter" in error_msg.lower():
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid CSV file format. Please ensure the file is a valid CSV with proper delimiters (comma, semicolon, or tab)."
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"CSV validation error: {error_msg}"
+            )
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
     except Exception as e:
         # Clean up on error
         SessionManager.delete_session(session_id)
+        # Log the error for debugging
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Validation failed: {str(e)}"

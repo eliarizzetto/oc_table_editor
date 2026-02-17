@@ -16,4 +16,7 @@ ALLOWED_EXTENSIONS = {'.csv'}
 DEFAULT_VERIFY_ID_EXISTENCE = False  # Default: no external API calls
 
 # Session settings
+SESSION_DIR = TEMP_DIR
+SESSION_CLEANUP_INTERVAL = 3600  # 1 hour in seconds
+SESSION_EXPIRY_HOURS = 24
 SESSION_TIMEOUT = None  # Sessions persist indefinitely (drafts)

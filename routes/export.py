@@ -44,8 +44,11 @@ async def export_csv(request: ExportRequest):
                 "exported": False
             }
     
+    # Determine table type for HTML loading
+    table_type = 'meta' if session.has_metadata else 'cits'
+    
     # Load current HTML
-    html_content = await SessionManager.load_html(request.session_id, 'meta')
+    html_content = await SessionManager.load_html(request.session_id, table_type)
     
     if not html_content:
         raise HTTPException(status_code=404, detail="HTML content not found")
@@ -59,15 +62,15 @@ async def export_csv(request: ExportRequest):
     
     # Determine filename
     if session.has_metadata:
-        table_type = "metadata"
+        filename_prefix = "metadata"
     else:
-        table_type = "citations"
+        filename_prefix = "citations"
     
     # Return CSV as downloadable file
     return StreamingResponse(
         StringIO(csv_content),
         media_type="text/csv",
         headers={
-            "Content-Disposition": f"attachment; filename={table_type}_edited.csv"
+            "Content-Disposition": f"attachment; filename={filename_prefix}_edited.csv"
         }
     )
