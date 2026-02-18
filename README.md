@@ -8,7 +8,7 @@ A web application for editing validated CSV tables (metadata and citations) with
 - **Validation Pipeline**: Full validation using oc_validator (wellformedness, syntax, existence, semantics, duplicates, closure)
 - **HTML Editor**: Interactive editing of validated data with validation feedback
 - **Individual Span Editing**: Edit each data element or separator independently
-- **Edit Tracking**: Visual indication of modified data (yellow background)
+- **Edit Tracking**: Visual indication of modified data (grey background)
 - **CSV Export**: Export edited data back to original CSV format
 - **Draft Management**: Save and restore editing sessions
 - **Local Browser**: Runs entirely in browser (static file mode)

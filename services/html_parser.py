@@ -155,19 +155,20 @@ class HTMLParser:
         
         Args:
             html_content: HTML string containing the table
-            item_id: Unique identifier for the item (e.g., '0-id-0')
+            item_id: Unique identifier for the item (e.g., '0-id-0'), which is
+                     the ID of the .item-container span wrapping the .item-data span.
             
         Returns:
             Current text value or None if not found
         """
         soup = BeautifulSoup(html_content, 'html.parser')
-        span = soup.find('span', id=item_id)
+        container = soup.find('span', id=item_id)
         
-        if not span:
+        if not container:
             return None
         
-        # Find the item-data sibling
-        item_data = span.find_previous_sibling('span', class_='item-data')
+        # item-data is a direct child of the item-container
+        item_data = container.find('span', class_='item-data')
         if item_data:
             return item_data.get_text(strip=False)
         
@@ -180,27 +181,27 @@ class HTMLParser:
         
         Args:
             html_content: Original HTML string
-            item_id: Unique identifier for the item
+            item_id: Unique identifier for the item (ID of the .item-container span)
             new_value: New text value for the item
             
         Returns:
             Updated HTML string
         """
         soup = BeautifulSoup(html_content, 'html.parser')
-        span = soup.find('span', id=item_id)
+        container = soup.find('span', id=item_id)
         
-        if not span:
+        if not container:
             raise ValueError(f"Item with id '{item_id}' not found")
         
-        # Find and update the item-data sibling
-        item_data = span.find_previous_sibling('span', class_='item-data')
+        # item-data is a direct child of the item-container
+        item_data = container.find('span', class_='item-data')
         if item_data:
             item_data.string = new_value
         else:
-            # If no item-data found, create one
+            # If no item-data child found, create one inside the container
             new_item_data = soup.new_tag('span', **{'class': 'item-data'})
             new_item_data.string = new_value
-            span.insert_before(new_item_data)
+            container.insert(0, new_item_data)
         
         return str(soup)
     
@@ -212,6 +213,7 @@ class HTMLParser:
         Args:
             html_content: Original HTML string
             edited_item_ids: List of item IDs that have been edited
+                             (IDs of .item-container spans)
             
         Returns:
             HTML string with edit tracking applied
@@ -219,10 +221,10 @@ class HTMLParser:
         soup = BeautifulSoup(html_content, 'html.parser')
         
         for item_id in edited_item_ids:
-            span = soup.find('span', id=item_id)
-            if span:
-                # Find the item-data sibling and add 'edited' class
-                item_data = span.find_previous_sibling('span', class_='item-data')
+            container = soup.find('span', id=item_id)
+            if container:
+                # item-data is a direct child of the item-container
+                item_data = container.find('span', class_='item-data')
                 if item_data:
                     existing_classes = item_data.get('class', [])
                     if isinstance(existing_classes, list):

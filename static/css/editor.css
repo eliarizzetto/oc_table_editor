@@ -62,9 +62,34 @@ body {
     width: 0.8em;
     height: 0.8em;
     margin-left: 0.2em;
-    cursor: help;
+    cursor: pointer;
     border-radius: 2px;
     vertical-align: middle;
+}
+
+/* Underline item-data that precede error/warning issue icons */
+span.item-data:has(~ span.issue-icon.error) {
+    text-decoration: underline;
+    text-decoration-color: LightCoral;
+}
+
+span.item-data:has(~ span.issue-icon.warning) {
+    text-decoration: underline;
+    text-decoration-color: Orange;
+}
+
+/* Popover max-width */
+.popover {
+    max-width: 500px;
+}
+
+/* Highlight utility classes (used by highlightInvolvedElements) */
+.highlight-error {
+    background-color: LightCoral;
+}
+
+.highlight-warning {
+    background-color: Orange;
 }
 
 /* Separator */

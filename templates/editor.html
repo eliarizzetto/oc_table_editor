@@ -154,6 +154,7 @@ async function loadTable() {
         if (response.ok) {
             container.innerHTML = data.html;
             setupEditHandlers();
+            initBootstrapWidgets();
         } else {
             throw new Error(data.detail || 'Failed to load table');
         }
@@ -210,6 +211,7 @@ async function loadEditedOnly() {
         
         container.innerHTML = doc.body.innerHTML;
         setupEditHandlers();
+        initBootstrapWidgets();
         
     } catch (error) {
         showAlert('error', 'Error', error.message);
@@ -234,26 +236,31 @@ async function loadSessionInfo() {
 }
 
 function setupEditHandlers() {
-    // Make all item-data spans editable
+    // Make all item-data spans editable — both errored and valid items.
+    // We identify items by the .item-container parent's id (e.g. "4-id-0"),
+    // which is always present regardless of whether the item has errors.
     const items = document.querySelectorAll('.item-data');
     items.forEach(item => {
         item.addEventListener('click', function(e) {
+            // Don't interfere if the click is being handled by an issue-icon
+            // (issue-icons are siblings inside the same container, not children
+            //  of item-data, so stopPropagation on the icon is sufficient —
+            //  but we add an explicit guard here for safety).
+            if (e.target.classList.contains('issue-icon')) return;
+
+            e.stopPropagation(); // prevent the table-level clearHighlights from firing
             e.preventDefault();
-            const itemIdSpan = this.nextElementSibling;
-            if (itemIdSpan && itemIdSpan.classList.contains('issue-icon')) {
-                currentItemId = itemIdSpan.id;
-            } else {
-                // Find the nearest issue icon
-                const issueIcon = this.parentElement.querySelector('.issue-icon');
-                currentItemId = issueIcon ? issueIcon.id : null;
-            }
-            
-            if (currentItemId) {
-                openEditModal(this.textContent, currentItemId);
-            }
+
+            // The .item-container span wraps this .item-data and all sibling
+            // issue-icons; its id is the stable item identifier used by the API.
+            const container = this.closest('.item-container');
+            if (!container || !container.id) return;
+
+            currentItemId = container.id;
+            openEditModal(this.textContent, currentItemId);
         });
-        
-        // Add hover cursor
+
+        // Ensure pointer cursor even when CSS hasn't applied it yet
         item.style.cursor = 'pointer';
     });
 }
