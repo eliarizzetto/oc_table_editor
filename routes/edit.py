@@ -80,6 +80,17 @@ class GetFilteredRowsRequest(BaseModel):
     issue_id: str
 
 
+class DeleteRowRequest(BaseModel):
+    session_id: str
+    row_id: str   # e.g. "row5"
+
+
+class ClearCellRequest(BaseModel):
+    session_id: str
+    row_id: str       # e.g. "row5"
+    field_name: str   # e.g. "id", "author"
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -247,6 +258,67 @@ async def add_item_to_cell(request: AddItemRequest):
         "success": True,
         "new_item_id": new_item_id
     }
+
+
+@router.post("/row/delete")
+async def delete_row(request: DeleteRowRequest):
+    """
+    Delete an entire table row from the individual HTML file.
+
+    The row is identified by its ``<tr id="rowN">`` attribute.  After deletion
+    the user should re-validate to export the updated table without this row.
+    """
+    session = await SessionManager.load_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    table_type = 'meta' if session.has_metadata else 'cits'
+    html_content = await SessionManager.load_html(request.session_id, table_type)
+    if not html_content:
+        raise HTTPException(status_code=404, detail="HTML content not found")
+
+    updated_html = HTMLParser.delete_row(html_content, request.row_id)
+    await SessionManager.save_html(request.session_id, updated_html, table_type)
+
+    session.mark_edited()
+    await SessionManager.save_session(session)
+
+    return {"success": True, "row_id": request.row_id}
+
+
+@router.post("/cell/clear")
+async def clear_cell_route(request: ClearCellRequest):
+    """
+    Clear all values from a single cell, leaving one empty item-container.
+
+    Works for both multi-value and single-value fields.  Also serves as the
+    "initialise" endpoint for cells that currently have no item-containers at
+    all (e.g. a field that was empty in the original CSV).
+    """
+    session = await SessionManager.load_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    table_type = 'meta' if session.has_metadata else 'cits'
+    html_content = await SessionManager.load_html(request.session_id, table_type)
+    if not html_content:
+        raise HTTPException(status_code=404, detail="HTML content not found")
+
+    new_html, new_item_id = HTMLParser.clear_cell(
+        html_content, request.row_id, request.field_name
+    )
+    if not new_item_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Cell '{request.field_name}' not found in row '{request.row_id}'"
+        )
+
+    await SessionManager.save_html(request.session_id, new_html, table_type)
+
+    session.mark_edited()
+    await SessionManager.save_session(session)
+
+    return {"success": True, "new_item_id": new_item_id}
 
 
 @router.post("/revalidate")

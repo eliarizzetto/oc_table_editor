@@ -98,6 +98,90 @@ span.item-data:has(~ span.issue-icon.warning) {
     color: #6c757d;
 }
 
+/* ── Empty item slot ────────────────────────────────────────────────────── */
+
+/*
+ * An empty .item-data span (no text content) gets the .empty-slot class added
+ * by setupEditHandlers() so it remains clickable and visually distinct.
+ */
+.item-data.empty-slot {
+    display: inline-block;
+    min-width: 5.5em;
+    min-height: 1.4em;
+    border: 1.5px dashed #adb5bd;
+    border-radius: 3px;
+    vertical-align: middle;
+    color: #adb5bd;
+    font-style: italic;
+    font-size: 0.82em;
+    padding: 1px 5px;
+    line-height: 1.6;
+}
+
+.item-data.empty-slot::before {
+    content: 'empty';
+}
+
+.item-data.empty-slot:hover {
+    border-color: #6c757d;
+    color: #6c757d;
+    background-color: #f8f9fa;
+}
+
+/* ── "Add first value" placeholder in cells with no containers ──────────── */
+
+.add-first-item-btn {
+    font-size: 0.78em;
+    padding: 1px 6px;
+    line-height: 1.5;
+    opacity: 0.7;
+}
+
+.add-first-item-btn:hover {
+    opacity: 1;
+}
+
+/* ── Delete-row button (injected into .row-number cell) ─────────────────── */
+
+.delete-row-btn {
+    font-size: 0.7em;
+    padding: 0 4px;
+    line-height: 1.4;
+    opacity: 0;               /* hidden until row is hovered */
+    transition: opacity 0.15s;
+    vertical-align: middle;
+    margin-left: 3px;
+}
+
+tr:hover .delete-row-btn {
+    opacity: 0.6;
+}
+
+tr:hover .delete-row-btn:hover {
+    opacity: 1;
+}
+
+/* ── Clear-cell button (injected into each .field-value cell) ───────────── */
+
+.clear-cell-btn {
+    font-size: 0.68em;
+    padding: 0 4px;
+    line-height: 1.3;
+    opacity: 0;               /* hidden until cell is hovered */
+    transition: opacity 0.15s;
+    vertical-align: middle;
+    margin-left: 4px;
+    white-space: nowrap;
+}
+
+td.field-value:hover .clear-cell-btn {
+    opacity: 0.5;
+}
+
+td.field-value:hover .clear-cell-btn:hover {
+    opacity: 1;
+}
+
 /* Modal */
 .modal-dialog {
     max-width: 600px;
@@ -108,8 +192,8 @@ span.item-data:has(~ span.issue-icon.warning) {
     min-width: 300px;
 }
 
-/* Sidebar buttons */
-.btn-sm {
+/* Sidebar action buttons — full-width inside the d-grid container */
+.d-grid .btn {
     width: 100%;
 }
 

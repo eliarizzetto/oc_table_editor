@@ -212,6 +212,76 @@ class HTMLParser:
         return str(soup)
 
     @staticmethod
+    def delete_row(html_content: str, row_id: str) -> str:
+        """
+        Remove an entire table row from the HTML.
+
+        Args:
+            html_content: HTML string containing the table.
+            row_id:       The ``id`` attribute of the ``<tr>`` to delete
+                          (e.g. ``"row5"``).
+
+        Returns:
+            Updated HTML string with the row removed.
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        row = soup.find('tr', id=row_id)
+        if row:
+            row.decompose()
+        return str(soup)
+
+    @staticmethod
+    def clear_cell(html_content: str, row_id: str, field_name: str) -> tuple:
+        """
+        Clear all content from a cell, leaving exactly one empty item-container.
+
+        Works regardless of whether the cell already has item-containers or none
+        (handles both the "clear existing values" and "initialise empty cell"
+        use cases).
+
+        Args:
+            html_content: HTML string containing the table.
+            row_id:       ``id`` attribute of the parent ``<tr>``
+                          (e.g. ``"row5"``).
+            field_name:   Name of the field / column (e.g. ``"id"``, ``"author"``).
+
+        Returns:
+            Tuple ``(updated_html, new_item_id)`` where ``new_item_id`` is the
+            ``id`` of the single empty item-container left in the cell.
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        row = soup.find('tr', id=row_id)
+        if not row:
+            return html_content, ''
+
+        # Locate the cell by its "field-value {field_name}" class pair
+        cell = None
+        for td in row.find_all('td', class_='field-value'):
+            if field_name in td.get('class', []):
+                cell = td
+                break
+
+        if not cell:
+            return html_content, ''
+
+        # Remove every existing item-container (their .sep children go with them)
+        for container in cell.find_all('span', class_='item-container'):
+            container.decompose()
+
+        # Derive row number from row_id (format: "row{N}")
+        row_num = row_id[3:]  # strip "row" prefix
+        new_item_id = f"{row_num}-{field_name}-0"
+
+        # Insert one fresh empty item-container so the cell remains clickable
+        new_container = soup.new_tag('span', **{'class': 'item-container', 'id': new_item_id})
+        new_item_data = soup.new_tag('span', **{'class': 'item-data', 'style': 'cursor: pointer;'})
+        new_item_data.string = ''
+        new_container.append(new_item_data)
+        cell.append(new_container)
+
+        return str(soup), new_item_id
+
+    @staticmethod
     def remove_item(html_content: str, item_id: str) -> str:
         """
         Remove an item-container from a multi-value cell and fix separators.

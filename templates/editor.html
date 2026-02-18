@@ -102,8 +102,14 @@
                 <div class="form-text" id="itemInfo"></div>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-outline-secondary me-auto" id="addItemBtn" style="display:none;">
+                <button type="button" class="btn btn-outline-danger btn-sm" id="deleteRowBtn" title="Delete the entire row containing this item">
+                    🗑 Delete row
+                </button>
+                <button type="button" class="btn btn-outline-secondary btn-sm ms-1" id="addItemBtn" style="display:none;">
                     + Add another item
+                </button>
+                <button type="button" class="btn btn-outline-warning btn-sm ms-1 me-auto" id="clearCellBtn">
+                    ✕ Clear field
                 </button>
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
                 <button type="button" class="btn btn-primary" id="saveEditBtn">Save</button>
@@ -242,32 +248,69 @@ async function loadSessionInfo() {
 }
 
 function setupEditHandlers() {
-    // Make all item-data spans editable — both errored and valid items.
-    // We identify items by the .item-container parent's id (e.g. "4-id-0"),
-    // which is always present regardless of whether the item has errors.
-    const items = document.querySelectorAll('.item-data');
-    items.forEach(item => {
+    // 1. Mark empty .item-data spans with .empty-slot for CSS styling
+    document.querySelectorAll('.item-data').forEach(span => {
+        if (span.textContent.trim() === '') {
+            span.classList.add('empty-slot');
+        }
+    });
+
+    // 2. Attach click handlers to all .item-data spans (non-issue-icon clicks)
+    document.querySelectorAll('.item-data').forEach(item => {
         item.addEventListener('click', function(e) {
-            // Don't interfere if the click is being handled by an issue-icon
-            // (issue-icons are siblings inside the same container, not children
-            //  of item-data, so stopPropagation on the icon is sufficient —
-            //  but we add an explicit guard here for safety).
             if (e.target.classList.contains('issue-icon')) return;
-
-            e.stopPropagation(); // prevent the table-level clearHighlights from firing
+            e.stopPropagation();
             e.preventDefault();
-
-            // The .item-container span wraps this .item-data and all sibling
-            // issue-icons; its id is the stable item identifier used by the API.
             const container = this.closest('.item-container');
             if (!container || !container.id) return;
-
             currentItemId = container.id;
             openEditModal(this.textContent, currentItemId);
         });
-
-        // Ensure pointer cursor even when CSS hasn't applied it yet
         item.style.cursor = 'pointer';
+    });
+
+    // 3. Inject delete-row buttons into row-number cells (visible on row hover)
+    document.querySelectorAll('td.row-number').forEach(cell => {
+        const row = cell.closest('tr');
+        if (!row || !row.id) return;
+        const rowId = row.id;
+        const delBtn = document.createElement('button');
+        delBtn.className = 'btn btn-outline-danger delete-row-btn';
+        delBtn.title = 'Delete this entire row';
+        delBtn.textContent = '×';
+        delBtn.addEventListener('click', e => { e.stopPropagation(); deleteRow(rowId); });
+        cell.appendChild(delBtn);
+    });
+
+    // 4. Inject clear-cell buttons + "add first value" for empty multi-value cells
+    document.querySelectorAll('td.field-value').forEach(cell => {
+        const classes = Array.from(cell.classList);
+        const fvIdx = classes.indexOf('field-value');
+        const fieldName = (fvIdx >= 0 && fvIdx + 1 < classes.length) ? classes[fvIdx + 1] : null;
+        if (!fieldName) return;
+        const row = cell.closest('tr');
+        if (!row || !row.id) return;
+        const rowId = row.id;
+
+        // "✕ clear" button — revealed on cell hover via CSS
+        const clearBtn = document.createElement('button');
+        clearBtn.className = 'btn btn-outline-secondary clear-cell-btn';
+        clearBtn.title = `Clear all values in "${fieldName}"`;
+        clearBtn.textContent = '✕ clear';
+        clearBtn.addEventListener('click', e => { e.stopPropagation(); clearCell(rowId, fieldName); });
+        cell.appendChild(clearBtn);
+
+        // For empty multi-value cells, inject a small "add first value" button
+        if (MULTI_VALUE_FIELDS.has(fieldName)) {
+            const containers = cell.querySelectorAll('.item-container');
+            if (containers.length === 0) {
+                const addBtn = document.createElement('button');
+                addBtn.className = 'btn btn-sm btn-outline-secondary add-first-item-btn';
+                addBtn.textContent = '+ add value';
+                addBtn.addEventListener('click', e => { e.stopPropagation(); initCell(rowId, fieldName); });
+                cell.insertBefore(addBtn, clearBtn);
+            }
+        }
     });
 }
 
@@ -290,12 +333,83 @@ function openEditModal(currentValue, itemId) {
     document.getElementById('newValue').value = currentValue;
     document.getElementById('itemInfo').textContent = `Item ID: ${itemId}`;
 
-    // Show "Add another item" button only for multi-value fields
+    const parts = itemId.split('-');
+    const rowId = 'row' + parts[0];
     const fieldName = fieldNameFromItemId(itemId);
+
+    // Show "Add another item" button only for multi-value fields
     const addBtn = document.getElementById('addItemBtn');
     addBtn.style.display = (fieldName && MULTI_VALUE_FIELDS.has(fieldName)) ? '' : 'none';
 
+    // Wire "Clear field" and "Delete row" buttons to the current item's context
+    document.getElementById('clearCellBtn').onclick = () => clearCell(rowId, fieldName);
+    document.getElementById('deleteRowBtn').onclick = () => deleteRow(rowId);
+
     editModal.show();
+}
+
+async function deleteRow(rowId) {
+    if (!confirm(`Delete the entire row? All data in this row will be permanently removed from the table.`)) return;
+    try {
+        const response = await fetch('/api/edit/row/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sessionId, row_id: rowId })
+        });
+        const data = await response.json();
+        if (response.ok) {
+            editModal.hide();
+            showAlert('success', 'Row Deleted', 'The row has been removed from the table.');
+            loadTable();
+            loadSessionInfo();
+        } else {
+            throw new Error(data.detail || 'Failed to delete row');
+        }
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    }
+}
+
+async function clearCell(rowId, fieldName) {
+    if (!confirm(`Clear all values in the "${fieldName}" field for this row?`)) return;
+    try {
+        const response = await fetch('/api/edit/cell/clear', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sessionId, row_id: rowId, field_name: fieldName })
+        });
+        const data = await response.json();
+        if (response.ok) {
+            editModal.hide();
+            showAlert('success', 'Field Cleared', `The "${fieldName}" field has been cleared.`);
+            loadTable();
+            loadSessionInfo();
+        } else {
+            throw new Error(data.detail || 'Failed to clear field');
+        }
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    }
+}
+
+async function initCell(rowId, fieldName) {
+    // Initialise an empty multi-value cell so it becomes clickable
+    try {
+        const response = await fetch('/api/edit/cell/clear', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sessionId, row_id: rowId, field_name: fieldName })
+        });
+        const data = await response.json();
+        if (response.ok) {
+            loadTable();
+            loadSessionInfo();
+        } else {
+            throw new Error(data.detail || 'Failed to initialize cell');
+        }
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    }
 }
 
 async function addItemToCell(itemId) {
