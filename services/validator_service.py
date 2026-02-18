@@ -13,49 +13,91 @@ from oc_validator.main import Validator, ClosureValidator
 
 class ValidatorService:
     """Wrapper service for oc_validator functionality."""
-    
+
     @staticmethod
-    def validate_metadata(csv_path: str, output_dir: str, verify_id_existence: bool = False) -> list:
+    def _make_no_errors_html(out_fp: str, csv_path: str) -> None:
+        """
+        Write a minimal 'no errors found' HTML file to out_fp.
+
+        This is used instead of calling make_gui when the validation report is
+        empty, because make_gui tries to open 'valid_page.html' via a bare
+        relative path (which does not exist in the oc_table_editor working
+        directory) and crashes with a FileNotFoundError.
+
+        Args:
+            out_fp:   Destination HTML file path.
+            csv_path: Path to the CSV that was validated (used for the title).
+        """
+        filename = Path(csv_path).name
+        html = (
+            '<!DOCTYPE html><html lang="en"><head>'
+            '<meta charset="utf-8">'
+            '<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">'
+            '</head><body>'
+            '<div class="container-fluid general-info">'
+            '<h4>Validation Results</h4>'
+            f'<p>There are <strong>0</strong> errors/warnings in the table submitted for validation.</p>'
+            f'<p class="text-success"><strong>✓ No issues found in <em>{filename}</em>.</strong></p>'
+            '</div>'
+            '<div class="table-container container-fluid"></div>'
+            '<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>'
+            '</body></html>'
+        )
+        with open(out_fp, 'w', encoding='utf-8') as f:
+            f.write(html)
+
+    @staticmethod
+    def validate_single(csv_path: str, output_dir: str, verify_id_existence: bool = False) -> Tuple[list, str]:
+        """
+        Validate a single CSV file (metadata OR citations — auto-detected).
+
+        Args:
+            csv_path:            Path to the CSV file.
+            output_dir:          Directory to store validation output.
+            verify_id_existence: Whether to check ID existence via external APIs.
+
+        Returns:
+            Tuple of (error_list, report_json_path).
+        """
+        validator = Validator(
+            csv_doc=csv_path,
+            output_dir=output_dir,
+            use_meta_endpoint=False,
+            verify_id_existence=verify_id_existence
+        )
+        errors = validator.validate()
+        return errors, validator.output_fp_json
+
+    @staticmethod
+    def validate_metadata(csv_path: str, output_dir: str, verify_id_existence: bool = False) -> Tuple[list, str]:
         """
         Validate a metadata CSV file.
-        
+
         Args:
-            csv_path: Path to the metadata CSV file
-            output_dir: Directory to store validation output
-            verify_id_existence: Whether to check ID existence (external APIs)
-            
+            csv_path:            Path to the metadata CSV file.
+            output_dir:          Directory to store validation output.
+            verify_id_existence: Whether to check ID existence via external APIs.
+
         Returns:
-            List of validation errors
+            Tuple of (error_list, report_json_path).
         """
-        validator = Validator(
-            csv_doc=csv_path,
-            output_dir=output_dir,
-            use_meta_endpoint=False,
-            verify_id_existence=verify_id_existence
-        )
-        return validator.validate()
-    
+        return ValidatorService.validate_single(csv_path, output_dir, verify_id_existence)
+
     @staticmethod
-    def validate_citations(csv_path: str, output_dir: str, verify_id_existence: bool = False) -> list:
+    def validate_citations(csv_path: str, output_dir: str, verify_id_existence: bool = False) -> Tuple[list, str]:
         """
         Validate a citations CSV file.
-        
+
         Args:
-            csv_path: Path to the citations CSV file
-            output_dir: Directory to store validation output
-            verify_id_existence: Whether to check ID existence (external APIs)
-            
+            csv_path:            Path to the citations CSV file.
+            output_dir:          Directory to store validation output.
+            verify_id_existence: Whether to check ID existence via external APIs.
+
         Returns:
-            List of validation errors
+            Tuple of (error_list, report_json_path).
         """
-        validator = Validator(
-            csv_doc=csv_path,
-            output_dir=output_dir,
-            use_meta_endpoint=False,
-            verify_id_existence=verify_id_existence
-        )
-        return validator.validate()
-    
+        return ValidatorService.validate_single(csv_path, output_dir, verify_id_existence)
+
     @staticmethod
     def validate_pair(
         meta_csv_path: str,
@@ -63,19 +105,19 @@ class ValidatorService:
         meta_output_dir: str,
         cits_output_dir: str,
         verify_id_existence: bool = False
-    ) -> Tuple[list, list]:
+    ) -> Tuple[list, list, str, str]:
         """
-        Validate paired metadata and citations CSV files.
-        
+        Validate paired metadata and citations CSV files using ClosureValidator.
+
         Args:
-            meta_csv_path: Path to the metadata CSV file
-            cits_csv_path: Path to the citations CSV file
-            meta_output_dir: Directory to store metadata validation output
-            cits_output_dir: Directory to store citations validation output
-            verify_id_existence: Whether to check ID existence (external APIs)
-            
+            meta_csv_path:       Path to the metadata CSV file.
+            cits_csv_path:       Path to the citations CSV file.
+            meta_output_dir:     Directory to store metadata validation output.
+            cits_output_dir:     Directory to store citations validation output.
+            verify_id_existence: Whether to check ID existence via external APIs.
+
         Returns:
-            Tuple of (metadata_errors, citations_errors)
+            Tuple of (meta_errors, cits_errors, meta_report_json_path, cits_report_json_path).
         """
         validator = ClosureValidator(
             meta_csv_doc=meta_csv_path,
@@ -85,37 +127,7 @@ class ValidatorService:
             meta_kwargs={'verify_id_existence': verify_id_existence},
             cits_kwargs={'verify_id_existence': verify_id_existence}
         )
-        return validator.validate()
-    
-    @staticmethod
-    def get_report_json_path(csv_path: str, output_dir: str) -> Optional[str]:
-        """
-        Get path to JSON validation report.
-        
-        Args:
-            csv_path: Original CSV file path
-            output_dir: Output directory
-            
-        Returns:
-            Path to JSON report or None if not found
-        """
-        from os import listdir
-        basename = Path(csv_path).stem
-        output_path = Path(output_dir)
-        
-        # Look for JSON report with multiple possible patterns
-        json_files = [f for f in listdir(output_dir) if f.endswith('.json')]
-        
-        # Skip edit_state.json as it's our internal tracking file
-        for f in json_files:
-            f_lower = f.lower()
-            # Try different naming patterns, but skip edit_state.json
-            if f_lower.endswith('.json') and 'edit_state' not in f_lower and basename in f_lower:
-                return str(output_path / f)
-        
-        # If not found, try to find any JSON file except edit_state.json
-        for f in json_files:
-            if f != 'edit_state.json':
-                return str(output_path / f)
-        
-        return None
+        meta_errors, cits_errors = validator.validate()
+        meta_report_path = validator.meta_validator.output_fp_json
+        cits_report_path = validator.cits_validator.output_fp_json
+        return meta_errors, cits_errors, meta_report_path, cits_report_path

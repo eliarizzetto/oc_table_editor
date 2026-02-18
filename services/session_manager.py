@@ -137,54 +137,81 @@ class SessionManager:
             for item_id, state_data in state_dict.items()
         }
     
+    # ---------------------------------------------------------------------------
+    # HTML file-name scheme
+    #
+    #  table_type='meta'    → meta_table.html   (individual meta table only)
+    #  table_type='cits'    → cits_table.html   (individual cits table only)
+    #  table_type='display' → meta_html.html    (the file served to the browser;
+    #                                             for single-table sessions this
+    #                                             is the same as the individual
+    #                                             file; for paired sessions it is
+    #                                             the merged view)
+    # ---------------------------------------------------------------------------
+
+    _HTML_FILENAMES: dict = {
+        'meta': 'meta_table.html',
+        'cits': 'cits_table.html',
+        'display': 'meta_html.html',
+    }
+
+    @staticmethod
+    def _html_filename(table_type: str) -> str:
+        """Return the on-disk filename for a given table_type key."""
+        fname = SessionManager._HTML_FILENAMES.get(table_type)
+        if fname is None:
+            raise ValueError(
+                f"Unknown table_type '{table_type}'. "
+                f"Expected one of: {list(SessionManager._HTML_FILENAMES.keys())}"
+            )
+        return fname
+
     @staticmethod
     async def save_html(session_id: str, html_content: str, table_type: str) -> str:
         """
         Save HTML content to file.
-        
+
         Args:
-            session_id: Session identifier
-            html_content: HTML string to save
-            table_type: 'meta' or 'cits'
-            
+            session_id:   Session identifier.
+            html_content: HTML string to save.
+            table_type:   'meta', 'cits', or 'display'.
+
         Returns:
-            Path to saved HTML file
+            Path to saved HTML file.
         """
         session_dir = TEMP_DIR / session_id
-        html_file = session_dir / f'{table_type}_html.html'
-        
+        html_file = session_dir / SessionManager._html_filename(table_type)
+
         async with aio_open(html_file, 'w', encoding='utf-8') as f:
             await f.write(html_content)
-        
+
         return str(html_file)
-    
+
     @staticmethod
     async def load_html(session_id: str, table_type: str) -> Optional[str]:
         """
         Load HTML content from file.
-        
+
         Args:
-            session_id: Session identifier
-            table_type: 'meta' or 'cits'
-            
+            session_id: Session identifier.
+            table_type: 'meta', 'cits', or 'display'.
+
         Returns:
-            HTML content as string or None if not found
+            HTML content as string or None if not found.
         """
-        html_file = TEMP_DIR / session_id / f'{table_type}_html.html'
-        
-        # Check if file exists
+        html_file = TEMP_DIR / session_id / SessionManager._html_filename(table_type)
+
         if not html_file.exists():
             return None
-        
-        # Check if file is not empty
+
         if html_file.stat().st_size == 0:
             return None
-        
+
         try:
             async with aio_open(html_file, 'r', encoding='utf-8') as f:
                 content = await f.read()
                 return content
-        except Exception as e:
+        except Exception:
             return None
     
     @staticmethod
