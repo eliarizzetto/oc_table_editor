@@ -51,6 +51,8 @@
             <div class="card-body p-2 small">
                 <ul class="mb-0 ps-3">
                     <li>Click on any text to edit it</li>
+                    <li>Clear a value to remove it from a multi-value cell</li>
+                    <li>Use <em>+ Add another item</em> to append a new value to a multi-value cell</li>
                     <li>Grey background = edited item</li>
                     <li>Underline = has validation issues</li>
                     <li>Click colored square for issue details</li>
@@ -100,6 +102,9 @@
                 <div class="form-text" id="itemInfo"></div>
             </div>
             <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary me-auto" id="addItemBtn" style="display:none;">
+                    + Add another item
+                </button>
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
                 <button type="button" class="btn btn-primary" id="saveEditBtn">Save</button>
             </div>
@@ -142,6 +147,7 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('showAllBtn').addEventListener('click', () => loadTable());
     document.getElementById('showEditedBtn').addEventListener('click', loadEditedOnly);
     document.getElementById('saveEditBtn').addEventListener('click', saveEdit);
+    document.getElementById('addItemBtn').addEventListener('click', () => addItemToCell(currentItemId));
 });
 
 async function loadTable() {
@@ -265,11 +271,57 @@ function setupEditHandlers() {
     });
 }
 
+// Multi-value fields (must match HTMLParser.ITEM_SEPARATORS in html_parser.py)
+const MULTI_VALUE_FIELDS = new Set(['citing_id', 'cited_id', 'id', 'author', 'publisher', 'editor']);
+
+/**
+ * Parse the field name from an item_id string.
+ * item_id format: "{row}-{field}-{index}"  (field may contain hyphens, e.g. "citing_id")
+ * Everything between the first and last "-" component is the field name.
+ */
+function fieldNameFromItemId(itemId) {
+    const parts = itemId.split('-');
+    if (parts.length < 3) return null;
+    return parts.slice(1, -1).join('-');
+}
+
 function openEditModal(currentValue, itemId) {
     document.getElementById('currentValue').textContent = currentValue;
     document.getElementById('newValue').value = currentValue;
     document.getElementById('itemInfo').textContent = `Item ID: ${itemId}`;
+
+    // Show "Add another item" button only for multi-value fields
+    const fieldName = fieldNameFromItemId(itemId);
+    const addBtn = document.getElementById('addItemBtn');
+    addBtn.style.display = (fieldName && MULTI_VALUE_FIELDS.has(fieldName)) ? '' : 'none';
+
     editModal.show();
+}
+
+async function addItemToCell(itemId) {
+    try {
+        const response = await fetch('/api/edit/item/add', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                session_id: sessionId,
+                item_id: itemId
+            })
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+            editModal.hide();
+            showAlert('success', 'Item Added', 'A new empty slot has been added. Click it to enter a value.');
+            loadTable();
+            loadSessionInfo();
+        } else {
+            throw new Error(data.detail || 'Failed to add item');
+        }
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    }
 }
 
 async function saveEdit() {

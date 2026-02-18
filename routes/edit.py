@@ -65,6 +65,11 @@ class EditItemRequest(BaseModel):
     new_value: str
 
 
+class AddItemRequest(BaseModel):
+    session_id: str
+    item_id: str   # ID of any existing .item-container in the target cell
+
+
 class RevalidateRequest(BaseModel):
     session_id: str
     verify_id_existence: Optional[bool] = None
@@ -154,6 +159,18 @@ async def edit_item(request: EditItemRequest):
                             detail=f"Item '{request.item_id}' not found")
 
     updated_html = HTMLParser.update_item_value(html_content, request.item_id, request.new_value)
+
+    # Auto-remove empty items from multi-value fields so that no stray
+    # separators are left in the HTML (and therefore in the exported CSV).
+    _MULTI_VALUE_FIELDS = set(HTMLParser.ITEM_SEPARATORS.keys())
+    parts = request.item_id.split('-')
+    if len(parts) >= 3:
+        # item_id format: "{row}-{field}-{index}"
+        # field name is everything between the first and last component
+        field_name = '-'.join(parts[1:-1])
+        if field_name in _MULTI_VALUE_FIELDS and request.new_value.strip() == '':
+            updated_html = HTMLParser.remove_item(updated_html, request.item_id)
+
     await SessionManager.save_html(request.session_id, updated_html, table_type)
 
     # Track the edit
@@ -178,6 +195,57 @@ async def edit_item(request: EditItemRequest):
         "success": True,
         "original_value": original_value,
         "new_value": request.new_value
+    }
+
+
+@router.post("/item/add")
+async def add_item_to_cell(request: AddItemRequest):
+    """
+    Append a new empty item slot to a multi-value cell.
+
+    Inserts a new empty .item-container at the end of the cell that contains
+    the referenced item_id, and adds the appropriate .sep span to the
+    previously-last container.  The caller should reload the table after
+    this call and click the new empty slot to fill it in.
+    """
+    session = await SessionManager.load_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Validate that the field is a multi-value field
+    parts = request.item_id.split('-')
+    if len(parts) < 3:
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid item_id format: '{request.item_id}'")
+    field_name = '-'.join(parts[1:-1])
+    if field_name not in HTMLParser.ITEM_SEPARATORS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Field '{field_name}' is not a multi-value field"
+        )
+
+    separator = HTMLParser.ITEM_SEPARATORS[field_name]
+
+    # Always operate on the individual (parseable) HTML
+    table_type = 'meta' if session.has_metadata else 'cits'
+
+    html_content = await SessionManager.load_html(request.session_id, table_type)
+    if not html_content:
+        raise HTTPException(status_code=404, detail="HTML content not found")
+
+    new_html, new_item_id = HTMLParser.add_item(html_content, request.item_id, separator)
+    if not new_item_id:
+        raise HTTPException(status_code=404,
+                            detail=f"Item '{request.item_id}' not found in HTML")
+
+    await SessionManager.save_html(request.session_id, new_html, table_type)
+
+    session.mark_edited()
+    await SessionManager.save_session(session)
+
+    return {
+        "success": True,
+        "new_item_id": new_item_id
     }
 
 

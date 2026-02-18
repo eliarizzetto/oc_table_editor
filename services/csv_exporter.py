@@ -37,15 +37,17 @@ class CSVExporter:
         writer.writeheader()
         
         for row in rows_data:
-            # Join items with appropriate separator
+            # Join items with appropriate separator.
+            # Filter out blank items first so that emptied item-containers
+            # (e.g. user deleted a value) do not leave stray separators.
             csv_row = {}
             for field, items in row.items():
                 if field in ['citing_id', 'cited_id', 'id']:
                     # Space-separated IDs
-                    csv_row[field] = ' '.join(items)
+                    csv_row[field] = ' '.join(i for i in items if i.strip())
                 elif field in ['author', 'publisher', 'editor']:
                     # Semicolon-separated agents
-                    csv_row[field] = '; '.join(items)
+                    csv_row[field] = '; '.join(i for i in items if i.strip())
                 else:
                     # Single value fields
                     csv_row[field] = items[0] if items else ''
@@ -118,16 +120,18 @@ class CSVExporter:
         writer.writeheader()
         
         for row in rows_data:
-            # Join items with appropriate separator
+            # Join items with appropriate separator.
+            # Filter out blank items first so that emptied item-containers
+            # do not leave stray separators in the exported CSV.
             csv_row = {}
             for field in fieldnames:
                 items = row.get(field, [])
                 if field in ['citing_id', 'cited_id', 'id']:
                     # Space-separated IDs
-                    csv_row[field] = ' '.join(items)
+                    csv_row[field] = ' '.join(i for i in items if i.strip())
                 elif field in ['author', 'publisher', 'editor']:
                     # Semicolon-separated agents
-                    csv_row[field] = '; '.join(items)
+                    csv_row[field] = '; '.join(i for i in items if i.strip())
                 else:
                     # Single value fields
                     csv_row[field] = items[0] if items else ''

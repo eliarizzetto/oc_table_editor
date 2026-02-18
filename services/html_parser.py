@@ -59,9 +59,15 @@ class HTMLParser:
                 # Extract text from each item-data span
                 items = [span.get_text(strip=False) for span in item_data_spans]
                 
-                # If no item-data spans found, try direct text
+                # Filter out blank items produced by emptied item-containers so
+                # that the CSV exporter does not generate stray separators.
+                items = [t for t in items if t.strip()]
+                
+                # If no item-data spans found, or all items were blank,
+                # fall back to a single empty string (valid empty-cell CSV).
                 if not items:
-                    items = [cell.get_text(strip=False)]
+                    items = [cell.get_text(strip=False) if not item_data_spans
+                             else '']
                 
                 row_data[header] = items
             
@@ -204,7 +210,117 @@ class HTMLParser:
             container.insert(0, new_item_data)
         
         return str(soup)
-    
+
+    @staticmethod
+    def remove_item(html_content: str, item_id: str) -> str:
+        """
+        Remove an item-container from a multi-value cell and fix separators.
+
+        Rules:
+        - If the container is the **only** item in the cell: do nothing
+          (leave the empty item-data in place; caller decides what to do).
+        - If the container is **not the last** in the cell: remove the whole
+          container (its own .sep child goes with it).
+        - If the container **is the last** in the cell: first remove the .sep
+          span from the now-new-last container, then remove this container.
+
+        Args:
+            html_content: HTML string containing the table.
+            item_id:      ID of the .item-container span to remove.
+
+        Returns:
+            Updated HTML string.
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        container = soup.find('span', id=item_id)
+        if not container:
+            return html_content  # nothing to do
+
+        # Collect all sibling item-containers in the same parent element
+        parent = container.parent
+        if not parent:
+            return html_content
+
+        siblings = [s for s in parent.find_all('span', class_='item-container', recursive=False)]
+
+        # Only one item in the cell — leave it; just return unchanged HTML
+        if len(siblings) <= 1:
+            return str(soup)
+
+        is_last = (siblings[-1] == container)
+
+        if is_last:
+            # Remove the .sep from the new-last container (the one before this)
+            new_last = siblings[-2]
+            sep = new_last.find('span', class_='sep')
+            if sep:
+                sep.decompose()
+
+        # Remove the target container itself
+        container.decompose()
+
+        return str(soup)
+
+    @staticmethod
+    def add_item(html_content: str, after_item_id: str, field_separator: str) -> tuple:
+        """
+        Append a new empty item-container to the same cell as after_item_id.
+
+        The new container is always appended at the end of the cell.
+        A .sep span (containing field_separator) is added to the previously-last
+        container so that the separator appears between the old last value and the
+        new empty slot.
+
+        Args:
+            html_content:    HTML string containing the table.
+            after_item_id:   ID of an existing .item-container in the target cell.
+                             The new item is inserted after ALL existing containers
+                             (append semantics regardless of which item was active).
+            field_separator: The separator string to insert (e.g. ' ' or '; ').
+
+        Returns:
+            Tuple (updated_html_string, new_item_id).
+            new_item_id is the id attribute assigned to the new container.
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        ref_container = soup.find('span', id=after_item_id)
+        if not ref_container:
+            return html_content, ''
+
+        parent = ref_container.parent
+        if not parent:
+            return html_content, ''
+
+        siblings = [s for s in parent.find_all('span', class_='item-container', recursive=False)]
+
+        # Parse row and field from the reference item-id (format: row-field-index)
+        # Field name sits between the first and last '-' separated component.
+        parts = after_item_id.split('-')
+        # parts[0] = row number, parts[-1] = index, parts[1:-1] = field name parts
+        row_part = parts[0]
+        field_part = '-'.join(parts[1:-1])
+        new_index = len(siblings)  # append at end
+        new_item_id = f"{row_part}-{field_part}-{new_index}"
+
+        # Add a .sep to the currently-last container (if it doesn't already have one)
+        last_container = siblings[-1]
+        existing_sep = last_container.find('span', class_='sep')
+        if not existing_sep:
+            sep_tag = soup.new_tag('span', **{'class': 'sep'})
+            sep_tag.string = field_separator
+            last_container.append(sep_tag)
+
+        # Build the new empty item-container
+        new_container = soup.new_tag('span', **{'class': 'item-container', 'id': new_item_id})
+        new_item_data = soup.new_tag('span', **{'class': 'item-data', 'style': 'cursor: pointer;'})
+        new_item_data.string = ''
+        new_container.append(new_item_data)
+
+        # Insert after the last existing container
+        last_container.insert_after(new_container)
+
+        return str(soup), new_item_id
+
     @staticmethod
     def apply_edit_tracking(html_content: str, edited_item_ids: List[str]) -> str:
         """
