@@ -239,6 +239,183 @@ class SessionManager:
         
         return json.loads(content)
     
+    # ---------------------------------------------------------------------------
+    # Undo / Redo snapshot management
+    # ---------------------------------------------------------------------------
+
+    MAX_UNDO_DEPTH: int = 20
+
+    @staticmethod
+    def _undo_dir(session_id: str) -> Path:
+        """Return path to the undo-snapshots subdirectory for a session."""
+        return TEMP_DIR / session_id / 'undo'
+
+    @staticmethod
+    async def load_undo_state(session_id: str) -> dict:
+        """Load undo/redo index from ``undo_state.json``.  Returns ``{}`` on miss."""
+        state_file = TEMP_DIR / session_id / 'undo_state.json'
+        if not state_file.exists():
+            return {}
+        try:
+            async with aio_open(state_file, 'r', encoding='utf-8') as f:
+                return json.loads(await f.read())
+        except Exception:
+            return {}
+
+    @staticmethod
+    async def save_undo_state(session_id: str, state: dict) -> None:
+        state_file = TEMP_DIR / session_id / 'undo_state.json'
+        async with aio_open(state_file, 'w', encoding='utf-8') as f:
+            await f.write(json.dumps(state, indent=2))
+
+    @staticmethod
+    async def push_undo_snapshot(
+        session_id: str, html_content: str, table_type: str
+    ) -> None:
+        """
+        Push ``html_content`` onto the undo stack for ``table_type``.
+
+        Must be called **before** applying a mutation so that undo restores this
+        exact pre-mutation state.  Clears the redo stack (forward history is lost
+        when a new edit is made).
+        """
+        undo_dir = SessionManager._undo_dir(session_id)
+        undo_dir.mkdir(parents=True, exist_ok=True)
+
+        state = await SessionManager.load_undo_state(session_id)
+        ts = state.get(table_type, {'undo': [], 'redo': []})
+
+        # Clear redo snapshots
+        for idx in ts.get('redo', []):
+            (undo_dir / f"{table_type}_{idx}.html").unlink(missing_ok=True)
+        ts['redo'] = []
+
+        undo_stack: list = ts.get('undo', [])
+
+        # Choose a monotonically increasing index
+        new_idx = (max(undo_stack) + 1) if undo_stack else 0
+        snapshot_path = undo_dir / f"{table_type}_{new_idx}.html"
+        async with aio_open(snapshot_path, 'w', encoding='utf-8') as f:
+            await f.write(html_content)
+
+        undo_stack.append(new_idx)
+
+        # Enforce maximum depth — remove oldest entries
+        while len(undo_stack) > SessionManager.MAX_UNDO_DEPTH:
+            oldest = undo_stack.pop(0)
+            (undo_dir / f"{table_type}_{oldest}.html").unlink(missing_ok=True)
+
+        ts['undo'] = undo_stack
+        state[table_type] = ts
+        await SessionManager.save_undo_state(session_id, state)
+
+    @staticmethod
+    async def pop_undo_snapshot(
+        session_id: str, current_html: str, table_type: str
+    ):
+        """
+        Undo: restore the previous snapshot.
+
+        Pushes ``current_html`` onto the redo stack so the action can be
+        redone.
+
+        Returns ``(previous_html, undo_state_dict)`` or ``(None, state)`` if
+        there is nothing to undo.
+        """
+        undo_dir = SessionManager._undo_dir(session_id)
+        state = await SessionManager.load_undo_state(session_id)
+        ts = state.get(table_type, {'undo': [], 'redo': []})
+
+        undo_stack: list = ts.get('undo', [])
+        if not undo_stack:
+            return None, state
+
+        # Pop most-recent undo snapshot
+        prev_idx = undo_stack.pop()
+        snapshot_path = undo_dir / f"{table_type}_{prev_idx}.html"
+        if not snapshot_path.exists():
+            ts['undo'] = undo_stack
+            state[table_type] = ts
+            await SessionManager.save_undo_state(session_id, state)
+            return None, state
+
+        async with aio_open(snapshot_path, 'r', encoding='utf-8') as f:
+            prev_html = await f.read()
+
+        # Save current HTML onto redo stack
+        redo_stack: list = ts.get('redo', [])
+        all_existing = undo_stack + redo_stack
+        redo_idx = (max(all_existing) + 1) if all_existing else 0
+        async with aio_open(undo_dir / f"{table_type}_{redo_idx}.html",
+                            'w', encoding='utf-8') as f:
+            await f.write(current_html)
+        redo_stack.append(redo_idx)
+
+        ts['undo'] = undo_stack
+        ts['redo'] = redo_stack
+        state[table_type] = ts
+        await SessionManager.save_undo_state(session_id, state)
+
+        return prev_html, state
+
+    @staticmethod
+    async def pop_redo_snapshot(
+        session_id: str, current_html: str, table_type: str
+    ):
+        """
+        Redo: restore the next snapshot.
+
+        Pushes ``current_html`` back onto the undo stack.
+
+        Returns ``(next_html, undo_state_dict)`` or ``(None, state)`` if there
+        is nothing to redo.
+        """
+        undo_dir = SessionManager._undo_dir(session_id)
+        state = await SessionManager.load_undo_state(session_id)
+        ts = state.get(table_type, {'undo': [], 'redo': []})
+
+        redo_stack: list = ts.get('redo', [])
+        if not redo_stack:
+            return None, state
+
+        # Pop most-recent redo snapshot
+        next_idx = redo_stack.pop()
+        snapshot_path = undo_dir / f"{table_type}_{next_idx}.html"
+        if not snapshot_path.exists():
+            ts['redo'] = redo_stack
+            state[table_type] = ts
+            await SessionManager.save_undo_state(session_id, state)
+            return None, state
+
+        async with aio_open(snapshot_path, 'r', encoding='utf-8') as f:
+            next_html = await f.read()
+
+        # Push current HTML back onto undo stack
+        undo_stack: list = ts.get('undo', [])
+        all_existing = undo_stack + redo_stack
+        undo_idx = (max(all_existing) + 1) if all_existing else 0
+        async with aio_open(undo_dir / f"{table_type}_{undo_idx}.html",
+                            'w', encoding='utf-8') as f:
+            await f.write(current_html)
+        undo_stack.append(undo_idx)
+
+        ts['undo'] = undo_stack
+        ts['redo'] = redo_stack
+        state[table_type] = ts
+        await SessionManager.save_undo_state(session_id, state)
+
+        return next_html, state
+
+    @staticmethod
+    async def get_undo_availability(session_id: str, table_type: str) -> dict:
+        """Return ``{"can_undo": bool, "can_redo": bool}`` for the given table."""
+        state = await SessionManager.load_undo_state(session_id)
+        ts = state.get(table_type, {})
+        return {
+            'can_undo': len(ts.get('undo', [])) > 0,
+            'can_redo': len(ts.get('redo', [])) > 0,
+        }
+
     @staticmethod
     def list_sessions() -> list:
         """

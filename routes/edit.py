@@ -91,6 +91,10 @@ class ClearCellRequest(BaseModel):
     field_name: str   # e.g. "id", "author"
 
 
+class UndoRedoRequest(BaseModel):
+    session_id: str
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -169,6 +173,9 @@ async def edit_item(request: EditItemRequest):
         raise HTTPException(status_code=404,
                             detail=f"Item '{request.item_id}' not found")
 
+    # Save snapshot for undo BEFORE applying the mutation
+    await SessionManager.push_undo_snapshot(request.session_id, html_content, table_type)
+
     updated_html = HTMLParser.update_item_value(html_content, request.item_id, request.new_value)
 
     # Auto-remove empty items from multi-value fields so that no stray
@@ -244,6 +251,9 @@ async def add_item_to_cell(request: AddItemRequest):
     if not html_content:
         raise HTTPException(status_code=404, detail="HTML content not found")
 
+    # Save snapshot for undo BEFORE applying the mutation
+    await SessionManager.push_undo_snapshot(request.session_id, html_content, table_type)
+
     new_html, new_item_id = HTMLParser.add_item(html_content, request.item_id, separator)
     if not new_item_id:
         raise HTTPException(status_code=404,
@@ -277,6 +287,9 @@ async def delete_row(request: DeleteRowRequest):
     if not html_content:
         raise HTTPException(status_code=404, detail="HTML content not found")
 
+    # Save snapshot for undo BEFORE applying the mutation
+    await SessionManager.push_undo_snapshot(request.session_id, html_content, table_type)
+
     updated_html = HTMLParser.delete_row(html_content, request.row_id)
     await SessionManager.save_html(request.session_id, updated_html, table_type)
 
@@ -303,6 +316,9 @@ async def clear_cell_route(request: ClearCellRequest):
     html_content = await SessionManager.load_html(request.session_id, table_type)
     if not html_content:
         raise HTTPException(status_code=404, detail="HTML content not found")
+
+    # Save snapshot for undo BEFORE applying the mutation
+    await SessionManager.push_undo_snapshot(request.session_id, html_content, table_type)
 
     new_html, new_item_id = HTMLParser.clear_cell(
         html_content, request.row_id, request.field_name
@@ -587,3 +603,87 @@ async def get_session(session_id: str):
         "edited_items_count": edited_count,
         "last_validated_at": session.last_validated_at
     }
+
+
+# ---------------------------------------------------------------------------
+# Undo / Redo endpoints
+# ---------------------------------------------------------------------------
+
+def _undo_availability(undo_state: dict, table_type: str) -> dict:
+    """Return ``{"can_undo": bool, "can_redo": bool}`` from an undo-state dict."""
+    ts = undo_state.get(table_type, {})
+    return {
+        "can_undo": len(ts.get('undo', [])) > 0,
+        "can_redo": len(ts.get('redo', [])) > 0,
+    }
+
+
+@router.get("/undo_state/{session_id}")
+async def get_undo_state(session_id: str):
+    """Return whether undo and redo are currently available for this session."""
+    session = await SessionManager.load_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    table_type = 'meta' if session.has_metadata else 'cits'
+    return await SessionManager.get_undo_availability(session_id, table_type)
+
+
+@router.post("/undo")
+async def undo(request: UndoRedoRequest):
+    """
+    Undo the last mutation.
+
+    Restores the HTML to the state it was in before the most recent edit,
+    add-item, delete-row, or clear-cell operation.  The undone state is pushed
+    onto the redo stack so it can be re-applied with ``/redo``.
+    """
+    session = await SessionManager.load_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    table_type = 'meta' if session.has_metadata else 'cits'
+    current_html = await SessionManager.load_html(request.session_id, table_type)
+    if not current_html:
+        raise HTTPException(status_code=404, detail="HTML content not found")
+
+    prev_html, undo_state = await SessionManager.pop_undo_snapshot(
+        request.session_id, current_html, table_type
+    )
+    if prev_html is None:
+        return {"success": False, "message": "Nothing to undo", **_undo_availability(undo_state, table_type)}
+
+    await SessionManager.save_html(request.session_id, prev_html, table_type)
+    session.mark_edited()
+    await SessionManager.save_session(session)
+
+    return {"success": True, **_undo_availability(undo_state, table_type)}
+
+
+@router.post("/redo")
+async def redo(request: UndoRedoRequest):
+    """
+    Redo the last undone mutation.
+
+    Moves forward in the undo history, restoring the HTML to the state it was
+    in after the mutation that was most recently undone.
+    """
+    session = await SessionManager.load_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    table_type = 'meta' if session.has_metadata else 'cits'
+    current_html = await SessionManager.load_html(request.session_id, table_type)
+    if not current_html:
+        raise HTTPException(status_code=404, detail="HTML content not found")
+
+    next_html, undo_state = await SessionManager.pop_redo_snapshot(
+        request.session_id, current_html, table_type
+    )
+    if next_html is None:
+        return {"success": False, "message": "Nothing to redo", **_undo_availability(undo_state, table_type)}
+
+    await SessionManager.save_html(request.session_id, next_html, table_type)
+    session.mark_edited()
+    await SessionManager.save_session(session)
+
+    return {"success": True, **_undo_availability(undo_state, table_type)}

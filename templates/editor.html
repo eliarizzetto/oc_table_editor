@@ -26,6 +26,14 @@
                         Delete Draft
                     </button>
                 </div>
+                <div class="d-flex gap-2 mt-2">
+                    <button class="btn btn-outline-secondary btn-sm flex-fill" id="undoBtn" disabled title="Undo (Ctrl+Z)">
+                        ↩ Undo
+                    </button>
+                    <button class="btn btn-outline-secondary btn-sm flex-fill" id="redoBtn" disabled title="Redo (Ctrl+Y)">
+                        ↪ Redo
+                    </button>
+                </div>
             </div>
         </div>
         
@@ -154,6 +162,27 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('showEditedBtn').addEventListener('click', loadEditedOnly);
     document.getElementById('saveEditBtn').addEventListener('click', saveEdit);
     document.getElementById('addItemBtn').addEventListener('click', () => addItemToCell(currentItemId));
+    document.getElementById('undoBtn').addEventListener('click', undoEdit);
+    document.getElementById('redoBtn').addEventListener('click', redoEdit);
+
+    // ── Keyboard shortcuts ──────────────────────────────────────────────────
+    // Only intercept when no text-input / textarea has focus (so that the
+    // browser's native Ctrl+Z inside the modal text box keeps working).
+    document.addEventListener('keydown', function(e) {
+        const tag = document.activeElement && document.activeElement.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+        if (e.ctrlKey && !e.shiftKey && e.key === 'z') {
+            e.preventDefault();
+            undoEdit();
+        } else if (e.ctrlKey && (e.key === 'y' || (e.shiftKey && e.key === 'z'))) {
+            e.preventDefault();
+            redoEdit();
+        }
+    });
+
+    // Load initial undo/redo button state
+    updateUndoRedoButtons();
 });
 
 async function loadTable() {
@@ -360,6 +389,7 @@ async function deleteRow(rowId) {
         if (response.ok) {
             editModal.hide();
             showAlert('success', 'Row Deleted', 'The row has been removed from the table.');
+            updateUndoRedoButtons();
             loadTable();
             loadSessionInfo();
         } else {
@@ -382,6 +412,7 @@ async function clearCell(rowId, fieldName) {
         if (response.ok) {
             editModal.hide();
             showAlert('success', 'Field Cleared', `The "${fieldName}" field has been cleared.`);
+            updateUndoRedoButtons();
             loadTable();
             loadSessionInfo();
         } else {
@@ -459,6 +490,7 @@ async function saveEdit() {
         if (response.ok) {
             showAlert('success', 'Saved', 'Item updated successfully!');
             editModal.hide();
+            updateUndoRedoButtons();
             loadTable();
             loadSessionInfo();
         } else {
@@ -576,6 +608,72 @@ async function deleteDraft() {
             }, 1500);
         } else {
             throw new Error('Failed to delete draft');
+        }
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    }
+}
+
+// ── Undo / Redo ──────────────────────────────────────────────────────────────
+
+function updateUndoRedoButtons(canUndo, canRedo) {
+    // If called without arguments, fetch the state from the server
+    if (canUndo === undefined) {
+        fetch(`/api/edit/undo_state/${sessionId}`)
+            .then(r => r.ok ? r.json() : Promise.reject())
+            .then(d => {
+                document.getElementById('undoBtn').disabled = !d.can_undo;
+                document.getElementById('redoBtn').disabled = !d.can_redo;
+            })
+            .catch(() => {});
+        return;
+    }
+    document.getElementById('undoBtn').disabled = !canUndo;
+    document.getElementById('redoBtn').disabled = !canRedo;
+}
+
+async function undoEdit() {
+    try {
+        const response = await fetch('/api/edit/undo', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sessionId })
+        });
+        const data = await response.json();
+        if (response.ok) {
+            if (data.success) {
+                updateUndoRedoButtons(data.can_undo, data.can_redo);
+                loadTable();
+                loadSessionInfo();
+            } else {
+                showAlert('info', 'Undo', data.message || 'Nothing to undo.');
+            }
+        } else {
+            throw new Error(data.detail || 'Undo failed');
+        }
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    }
+}
+
+async function redoEdit() {
+    try {
+        const response = await fetch('/api/edit/redo', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sessionId })
+        });
+        const data = await response.json();
+        if (response.ok) {
+            if (data.success) {
+                updateUndoRedoButtons(data.can_undo, data.can_redo);
+                loadTable();
+                loadSessionInfo();
+            } else {
+                showAlert('info', 'Redo', data.message || 'Nothing to redo.');
+            }
+        } else {
+            throw new Error(data.detail || 'Redo failed');
         }
     } catch (error) {
         showAlert('error', 'Error', error.message);
