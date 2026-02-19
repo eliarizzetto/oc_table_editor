@@ -124,19 +124,30 @@ class HTMLParser:
         Returns:
             HTML string containing the filtered table
         """
+        from copy import copy as shallow_copy
+        
         soup = BeautifulSoup(html_content, 'html.parser')
         table = soup.find('table', id='table-data')
         
         if not table:
             raise ValueError("Table with id 'table-data' not found in HTML")
         
-        # Create a new table
-        new_table = soup.new_tag('table', **{'class': table['class'], 'id': 'table-data'})
+        # Get the class attribute safely
+        table_class = table.get('class', [])
+        if isinstance(table_class, list):
+            class_attr = ' '.join(table_class)
+        else:
+            class_attr = table_class
         
-        # Copy header
+        # Create a new table
+        new_table = soup.new_tag('table', attrs={'class': class_attr, 'id': 'table-data'})
+        
+        # Copy header using BeautifulSoup's decode/encode pattern for deep copy
         thead = table.find('thead')
         if thead:
-            new_table.append(thead.copy())
+            # Parse the thead HTML to create a fresh copy
+            thead_soup = BeautifulSoup(str(thead), 'html.parser')
+            new_table.append(thead_soup.find('thead'))
         
         # Copy only specified rows
         tbody = table.find('tbody')
@@ -147,7 +158,9 @@ class HTMLParser:
         
         for row in tbody.find_all('tr'):
             if row_idx in row_index_set:
-                new_tbody.append(row.copy())
+                # Parse the row HTML to create a fresh copy
+                row_soup = BeautifulSoup(str(row), 'html.parser')
+                new_tbody.append(row_soup.find('tr'))
             row_idx += 1
         
         new_table.append(new_tbody)

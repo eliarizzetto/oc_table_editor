@@ -63,7 +63,7 @@
                     <li>Use <em>+ Add another item</em> to append a new value to a multi-value cell</li>
                     <li>Grey background = edited item</li>
                     <li>Underline = has validation issues</li>
-                    <li>Click colored square for issue details</li>
+                    <li>Click colored square to filter by issue</li>
                     <li>Re-validate after editing</li>
                 </ul>
             </div>
@@ -80,6 +80,8 @@
                     <button class="btn btn-sm btn-outline-secondary" id="showEditedBtn">Show Edited</button>
                 </div>
             </div>
+            <!-- Filter banner (hidden by default) -->
+            <div id="filterBanner" class="filter-banner" style="display: none;"></div>
             <div class="card-body" id="tableContainer">
                 <div class="text-center py-5">
                     <div class="spinner-border" role="status">
@@ -140,6 +142,8 @@
 
 {% block extra_js %}
 <script>
+// Make sessionId globally accessible for editor.js
+window.currentSessionId = '{{ session_id }}';
 const sessionId = '{{ session_id }}';
 let currentItemId = null;
 let editModal = null;
@@ -187,6 +191,11 @@ document.addEventListener('DOMContentLoaded', function() {
 
 async function loadTable() {
     const container = document.getElementById('tableContainer');
+    
+    // Exit filtered view when loading full table
+    if (typeof exitFilteredView === 'function') {
+        exitFilteredView();
+    }
     
     try {
         const response = await fetch(`/api/edit/html/${sessionId}`);
@@ -390,7 +399,7 @@ async function deleteRow(rowId) {
             editModal.hide();
             showAlert('success', 'Row Deleted', 'The row has been removed from the table.');
             updateUndoRedoButtons();
-            loadTable();
+            reloadTable();
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to delete row');
@@ -413,7 +422,7 @@ async function clearCell(rowId, fieldName) {
             editModal.hide();
             showAlert('success', 'Field Cleared', `The "${fieldName}" field has been cleared.`);
             updateUndoRedoButtons();
-            loadTable();
+            reloadTable();
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to clear field');
@@ -433,7 +442,7 @@ async function initCell(rowId, fieldName) {
         });
         const data = await response.json();
         if (response.ok) {
-            loadTable();
+            reloadTable();
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to initialize cell');
@@ -459,7 +468,7 @@ async function addItemToCell(itemId) {
         if (response.ok) {
             editModal.hide();
             showAlert('success', 'Item Added', 'A new empty slot has been added. Click it to enter a value.');
-            loadTable();
+            reloadTable();
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to add item');
@@ -491,7 +500,7 @@ async function saveEdit() {
             showAlert('success', 'Saved', 'Item updated successfully!');
             editModal.hide();
             updateUndoRedoButtons();
-            loadTable();
+            reloadTable();
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to save');
@@ -643,7 +652,7 @@ async function undoEdit() {
         if (response.ok) {
             if (data.success) {
                 updateUndoRedoButtons(data.can_undo, data.can_redo);
-                loadTable();
+                reloadTable();
                 loadSessionInfo();
             } else {
                 showAlert('info', 'Undo', data.message || 'Nothing to undo.');
@@ -667,7 +676,7 @@ async function redoEdit() {
         if (response.ok) {
             if (data.success) {
                 updateUndoRedoButtons(data.can_undo, data.can_redo);
-                loadTable();
+                reloadTable();
                 loadSessionInfo();
             } else {
                 showAlert('info', 'Redo', data.message || 'Nothing to redo.');
