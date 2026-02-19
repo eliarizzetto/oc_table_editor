@@ -5,7 +5,11 @@
 {% block content %}
 <div class="row">
     <!-- Sidebar controls -->
-    <div class="col-md-2">
+    <div class="col-md-2 sidebar-container" id="sidebarContainer">
+        <button class="sidebar-toggle" id="sidebarToggle" title="Collapse sidebar">
+            «
+        </button>
+        <div id="sidebarContent">
         <div class="card">
             <div class="card-header">
                 <h6 class="mb-0">Actions</h6>
@@ -67,6 +71,7 @@
                     <li>Re-validate after editing</li>
                 </ul>
             </div>
+        </div>
         </div>
     </div>
     
@@ -187,6 +192,20 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // Load initial undo/redo button state
     updateUndoRedoButtons();
+    
+    // Sidebar toggle
+    document.getElementById('sidebarToggle').addEventListener('click', function() {
+        const sidebar = document.getElementById('sidebarContainer');
+        const toggleBtn = document.getElementById('sidebarToggle');
+        sidebar.classList.toggle('collapsed');
+        if (sidebar.classList.contains('collapsed')) {
+            toggleBtn.textContent = '»';
+            toggleBtn.title = 'Expand sidebar';
+        } else {
+            toggleBtn.textContent = '«';
+            toggleBtn.title = 'Collapse sidebar';
+        }
+    });
 });
 
 async function loadTable() {
