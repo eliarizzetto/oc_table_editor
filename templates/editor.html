@@ -327,10 +327,19 @@ async function loadSessionInfo() {
 }
 
 function setupEditHandlers() {
-    // 1. Mark empty .item-data spans with .empty-slot for CSS styling
-    document.querySelectorAll('.item-data').forEach(span => {
-        if (span.textContent.trim() === '') {
-            span.classList.add('empty-slot');
+    // 1. Remove empty item-containers that don't have validation errors
+    document.querySelectorAll('.item-container').forEach(container => {
+        const itemData = container.querySelector('.item-data');
+        if (itemData && itemData.textContent.trim() === '') {
+            // Check if this empty item has a validation error
+            const hasIssueIcon = container.querySelector('.issue-icon');
+            if (!hasIssueIcon) {
+                // No error - remove the entire empty item-container
+                container.remove();
+            } else {
+                // Has error - mark it with empty-slot class
+                itemData.classList.add('empty-slot');
+            }
         }
     });
 
@@ -379,19 +388,20 @@ function setupEditHandlers() {
         clearBtn.addEventListener('click', e => { e.stopPropagation(); clearCell(rowId, fieldName); });
         cell.appendChild(clearBtn);
 
-        // For multi-value fields, inject an add-item button after the last item
-        if (MULTI_VALUE_FIELDS.has(fieldName)) {
-            const containers = cell.querySelectorAll('.item-container');
-            
-            // For empty multi-value cells, inject a small "add first value" button
+        const containers = cell.querySelectorAll('.item-container');
+        const isMultiValue = MULTI_VALUE_FIELDS.has(fieldName);
+
+        if (isMultiValue) {
+            // For multi-value fields, inject add-item button
             if (containers.length === 0) {
+                // Empty multi-value cell - show "add first value" button
                 const addBtn = document.createElement('button');
                 addBtn.className = 'btn btn-sm btn-outline-secondary add-first-item-btn';
                 addBtn.textContent = '+ add value';
                 addBtn.addEventListener('click', e => { e.stopPropagation(); initCell(rowId, fieldName); });
                 cell.insertBefore(addBtn, clearBtn);
             } else {
-                // For cells with items, inject add-item button after the last item
+                // Multi-value cell with items - show "+ add" button after last item
                 const lastContainer = containers[containers.length - 1];
                 const addBtn = document.createElement('button');
                 addBtn.className = 'btn btn-sm btn-outline-secondary add-item-btn';
@@ -401,6 +411,15 @@ function setupEditHandlers() {
                     e.stopPropagation(); 
                     openAddItemModal(rowId, fieldName);
                 });
+                cell.insertBefore(addBtn, clearBtn);
+            }
+        } else {
+            // For single-value fields, show add button only if cell is empty
+            if (containers.length === 0) {
+                const addBtn = document.createElement('button');
+                addBtn.className = 'btn btn-sm btn-outline-secondary add-first-item-btn';
+                addBtn.textContent = '+ add value';
+                addBtn.addEventListener('click', e => { e.stopPropagation(); initCell(rowId, fieldName); });
                 cell.insertBefore(addBtn, clearBtn);
             }
         }

@@ -388,8 +388,10 @@ class HTMLParser:
         Remove an item-container from a multi-value cell and fix separators.
 
         Rules:
-        - If the container is the **only** item in the cell: clear its value
-          (set the item-data text to empty string).
+        - If the container is the **only** item in the cell and has a validation
+          error (has an issue-icon): remove the container completely.
+        - If the container is the **only** item in the cell and has no validation
+          error: clear its value (set item-data text to empty string).
         - If the container is **not the last** in the cell: remove the whole
           container (its own .sep child goes with it).
         - If the container **is the last** in the cell: first remove the .sep
@@ -414,11 +416,18 @@ class HTMLParser:
 
         siblings = [s for s in parent.find_all('span', class_='item-container', recursive=False)]
 
-        # Only one item in the cell — clear its value instead of removing
+        # Only one item in the cell
         if len(siblings) <= 1:
-            item_data = container.find('span', class_='item-data')
-            if item_data:
-                item_data.string = ''
+            # Check if it has a validation error (issue-icon)
+            has_issue = container.find('span', class_='issue-icon') is not None
+            if has_issue:
+                # Remove the container completely
+                container.decompose()
+            else:
+                # Just clear the value
+                item_data = container.find('span', class_='item-data')
+                if item_data:
+                    item_data.string = ''
             return str(soup)
 
         is_last = (siblings[-1] == container)

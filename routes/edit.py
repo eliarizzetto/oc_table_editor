@@ -373,8 +373,9 @@ async def delete_item(request: DeleteItemRequest):
     Delete a specific item from a multi-value cell.
 
     Removes the item-container with the given item_id.  If this is the only
-    item in the cell, the container is left empty (not removed).  If there
-    are multiple items, separators are adjusted appropriately.
+    item in the cell and it has no validation error, the container is left
+    empty.  If it has a validation error, the container is removed entirely.
+    If there are multiple items, separators are adjusted appropriately.
     """
     session = await SessionManager.load_session(request.session_id)
     if not session:
@@ -393,6 +394,12 @@ async def delete_item(request: DeleteItemRequest):
     updated_html = HTMLParser.remove_item(html_content, request.item_id)
 
     await SessionManager.save_html(request.session_id, updated_html, table_type)
+
+    # Remove edit tracking for the deleted item
+    edit_states = await SessionManager.load_edit_state(request.session_id)
+    if request.item_id in edit_states:
+        del edit_states[request.item_id]
+        await SessionManager.save_edit_state(request.session_id, edit_states)
 
     session.mark_edited()
     await SessionManager.save_session(session)
