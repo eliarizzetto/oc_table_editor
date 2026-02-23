@@ -300,8 +300,8 @@ class HTMLParser:
         Remove an item-container from a multi-value cell and fix separators.
 
         Rules:
-        - If the container is the **only** item in the cell: do nothing
-          (leave the empty item-data in place; caller decides what to do).
+        - If the container is the **only** item in the cell: clear its value
+          (set the item-data text to empty string).
         - If the container is **not the last** in the cell: remove the whole
           container (its own .sep child goes with it).
         - If the container **is the last** in the cell: first remove the .sep
@@ -326,8 +326,11 @@ class HTMLParser:
 
         siblings = [s for s in parent.find_all('span', class_='item-container', recursive=False)]
 
-        # Only one item in the cell — leave it; just return unchanged HTML
+        # Only one item in the cell — clear its value instead of removing
         if len(siblings) <= 1:
+            item_data = container.find('span', class_='item-data')
+            if item_data:
+                item_data.string = ''
             return str(soup)
 
         is_last = (siblings[-1] == container)
@@ -345,14 +348,14 @@ class HTMLParser:
         return str(soup)
 
     @staticmethod
-    def add_item(html_content: str, after_item_id: str, field_separator: str) -> tuple:
+    def add_item(html_content: str, after_item_id: str, field_separator: str, value: str = '') -> tuple:
         """
-        Append a new empty item-container to the same cell as after_item_id.
+        Append a new item-container to the same cell as after_item_id.
 
         The new container is always appended at the end of the cell.
-        A .sep span (containing field_separator) is added to the previously-last
-        container so that the separator appears between the old last value and the
-        new empty slot.
+        A .sep span (containing field_separator) is added to the
+        previously-last container so that the separator appears between the old
+        last value and the new item slot.
 
         Args:
             html_content:    HTML string containing the table.
@@ -360,6 +363,7 @@ class HTMLParser:
                              The new item is inserted after ALL existing containers
                              (append semantics regardless of which item was active).
             field_separator: The separator string to insert (e.g. ' ' or '; ').
+            value:           The value to set for the new item (default: empty string).
 
         Returns:
             Tuple (updated_html_string, new_item_id).
@@ -393,10 +397,10 @@ class HTMLParser:
             sep_tag.string = field_separator
             last_container.append(sep_tag)
 
-        # Build the new empty item-container
+        # Build new item-container with the provided value
         new_container = soup.new_tag('span', **{'class': 'item-container', 'id': new_item_id})
         new_item_data = soup.new_tag('span', **{'class': 'item-data', 'style': 'cursor: pointer;'})
-        new_item_data.string = ''
+        new_item_data.string = value
         new_container.append(new_item_data)
 
         # Insert after the last existing container

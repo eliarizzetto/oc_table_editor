@@ -63,8 +63,8 @@
             <div class="card-body p-2 small">
                 <ul class="mb-0 ps-3">
                     <li>Click on any text to edit it</li>
-                    <li>Clear a value to remove it from a multi-value cell</li>
-                    <li>Use <em>+ Add another item</em> to append a new value to a multi-value cell</li>
+                    <li>Hover on cells to see action buttons (add, clear, delete)</li>
+                    <li>Use <em>+ add</em> to append a new value to multi-value fields</li>
                     <li>Grey background = edited item</li>
                     <li>Underline = has validation issues</li>
                     <li>Click colored square to filter by issue</li>
@@ -117,17 +117,33 @@
                 <div class="form-text" id="itemInfo"></div>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-outline-danger btn-sm" id="deleteRowBtn" title="Delete the entire row containing this item">
-                    🗑 Delete row
-                </button>
-                <button type="button" class="btn btn-outline-secondary btn-sm ms-1" id="addItemBtn" style="display:none;">
-                    + Add another item
-                </button>
-                <button type="button" class="btn btn-outline-warning btn-sm ms-1 me-auto" id="clearCellBtn">
-                    ✕ Clear field
+                <button type="button" class="btn btn-outline-danger btn-sm me-auto" id="deleteItemBtn" title="Delete this specific item">
+                    🗑 Delete this item
                 </button>
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
                 <button type="button" class="btn btn-primary" id="saveEditBtn">Save</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Add item modal -->
+<div class="modal fade" id="addItemModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Add Item</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <label class="form-label" for="newItemValue">Value:</label>
+                <input type="text" class="form-control" id="newItemValue" placeholder="Enter value">
+                
+                <div class="form-text" id="addItemInfo"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" id="saveNewItemBtn">Add</button>
             </div>
         </div>
     </div>
@@ -152,10 +168,14 @@ window.currentSessionId = '{{ session_id }}';
 const sessionId = '{{ session_id }}';
 let currentItemId = null;
 let editModal = null;
+let addItemModal = null;
 let alertToast = null;
+let currentAddRowId = null;
+let currentAddFieldName = null;
 
 document.addEventListener('DOMContentLoaded', function() {
     editModal = new bootstrap.Modal(document.getElementById('editModal'));
+    addItemModal = new bootstrap.Modal(document.getElementById('addItemModal'));
     alertToast = new bootstrap.Toast(document.getElementById('alertToast'));
     
     // Load initial data
@@ -170,7 +190,8 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('showAllBtn').addEventListener('click', () => loadTable());
     document.getElementById('showEditedBtn').addEventListener('click', loadEditedOnly);
     document.getElementById('saveEditBtn').addEventListener('click', saveEdit);
-    document.getElementById('addItemBtn').addEventListener('click', () => addItemToCell(currentItemId));
+    document.getElementById('deleteItemBtn').addEventListener('click', () => deleteItem(currentItemId));
+    document.getElementById('saveNewItemBtn').addEventListener('click', saveNewItem);
     document.getElementById('undoBtn').addEventListener('click', undoEdit);
     document.getElementById('redoBtn').addEventListener('click', redoEdit);
 
@@ -339,7 +360,7 @@ function setupEditHandlers() {
         cell.appendChild(delBtn);
     });
 
-    // 4. Inject clear-cell buttons + "add first value" for empty multi-value cells
+    // 4. Inject clear-cell buttons and add-item buttons
     document.querySelectorAll('td.field-value').forEach(cell => {
         const classes = Array.from(cell.classList);
         const fvIdx = classes.indexOf('field-value');
@@ -357,14 +378,28 @@ function setupEditHandlers() {
         clearBtn.addEventListener('click', e => { e.stopPropagation(); clearCell(rowId, fieldName); });
         cell.appendChild(clearBtn);
 
-        // For empty multi-value cells, inject a small "add first value" button
+        // For multi-value fields, inject an add-item button after the last item
         if (MULTI_VALUE_FIELDS.has(fieldName)) {
             const containers = cell.querySelectorAll('.item-container');
+            
+            // For empty multi-value cells, inject a small "add first value" button
             if (containers.length === 0) {
                 const addBtn = document.createElement('button');
                 addBtn.className = 'btn btn-sm btn-outline-secondary add-first-item-btn';
                 addBtn.textContent = '+ add value';
                 addBtn.addEventListener('click', e => { e.stopPropagation(); initCell(rowId, fieldName); });
+                cell.insertBefore(addBtn, clearBtn);
+            } else {
+                // For cells with items, inject add-item button after the last item
+                const lastContainer = containers[containers.length - 1];
+                const addBtn = document.createElement('button');
+                addBtn.className = 'btn btn-sm btn-outline-secondary add-item-btn';
+                addBtn.textContent = '+ add';
+                addBtn.title = 'Add another item to this field';
+                addBtn.addEventListener('click', e => { 
+                    e.stopPropagation(); 
+                    openAddItemModal(rowId, fieldName);
+                });
                 cell.insertBefore(addBtn, clearBtn);
             }
         }
@@ -389,20 +424,81 @@ function openEditModal(currentValue, itemId) {
     document.getElementById('currentValue').textContent = currentValue;
     document.getElementById('newValue').value = currentValue;
     document.getElementById('itemInfo').textContent = `Item ID: ${itemId}`;
-
-    const parts = itemId.split('-');
-    const rowId = 'row' + parts[0];
-    const fieldName = fieldNameFromItemId(itemId);
-
-    // Show "Add another item" button only for multi-value fields
-    const addBtn = document.getElementById('addItemBtn');
-    addBtn.style.display = (fieldName && MULTI_VALUE_FIELDS.has(fieldName)) ? '' : 'none';
-
-    // Wire "Clear field" and "Delete row" buttons to the current item's context
-    document.getElementById('clearCellBtn').onclick = () => clearCell(rowId, fieldName);
-    document.getElementById('deleteRowBtn').onclick = () => deleteRow(rowId);
-
     editModal.show();
+}
+
+function openAddItemModal(rowId, fieldName) {
+    currentAddRowId = rowId;
+    currentAddFieldName = fieldName;
+    document.getElementById('newItemValue').value = '';
+    document.getElementById('addItemInfo').textContent = `Adding item to field "${fieldName}" in row ${rowId}`;
+    addItemModal.show();
+}
+
+async function saveNewItem() {
+    const newValue = document.getElementById('newItemValue').value.trim();
+    
+    // Validate that value is not empty
+    if (!newValue) {
+        showAlert('warning', 'Value Required', 'Please enter a value to add. Empty items are not allowed.');
+        return;
+    }
+    
+    try {
+        const response = await fetch('/api/edit/item/add', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                session_id: sessionId,
+                row_id: currentAddRowId,
+                field_name: currentAddFieldName,
+                new_value: newValue
+            })
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+            addItemModal.hide();
+            showAlert('success', 'Item Added', 'The new item has been added to the field.');
+            updateUndoRedoButtons();
+            reloadTable();
+            loadSessionInfo();
+        } else {
+            throw new Error(data.detail || 'Failed to add item');
+        }
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    }
+}
+
+async function deleteItem(itemId) {
+    if (!confirm(`Delete this item? This will remove only this specific item from the field.`)) return;
+    
+    try {
+        const response = await fetch('/api/edit/item', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                session_id: sessionId,
+                item_id: itemId
+            })
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+            editModal.hide();
+            showAlert('success', 'Item Deleted', 'The item has been removed from the field.');
+            updateUndoRedoButtons();
+            reloadTable();
+            loadSessionInfo();
+        } else {
+            throw new Error(data.detail || 'Failed to delete item');
+        }
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    }
 }
 
 async function deleteRow(rowId) {

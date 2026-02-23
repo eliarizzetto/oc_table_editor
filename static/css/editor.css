@@ -159,6 +159,26 @@ span.item-data:has(~ span.issue-icon.warning) {
     opacity: 1;
 }
 
+/* ── Add item button (for multi-value fields with existing items) ──────── */
+
+.add-item-btn {
+    font-size: 0.7em;
+    padding: 0 4px;
+    line-height: 1;
+    opacity: 0;               /* hidden until cell is hovered */
+    transition: opacity 0.15s;
+    vertical-align: middle;
+    margin-left: 3px;
+}
+
+td.field-value:hover .add-item-btn {
+    opacity: 0.5;
+}
+
+td.field-value:hover .add-item-btn:hover {
+    opacity: 1;
+}
+
 /* ── Delete-row button (injected into .row-number cell) ─────────────────── */
 
 .delete-row-btn {

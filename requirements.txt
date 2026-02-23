@@ -4,4 +4,4 @@ python-multipart==0.0.6
 jinja2==3.1.3
 beautifulsoup4==4.12.3
 aiofiles==23.2.1
-oc_validator
+# oc_validator  # aggiorna quando hai aggiornato il package di oc_validator su PiPy

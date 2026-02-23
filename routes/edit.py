@@ -65,9 +65,17 @@ class EditItemRequest(BaseModel):
     new_value: str
 
 
+class DeleteItemRequest(BaseModel):
+    session_id: str
+    item_id: str
+
+
 class AddItemRequest(BaseModel):
     session_id: str
-    item_id: str   # ID of any existing .item-container in the target cell
+    item_id: Optional[str] = None   # ID of an existing item (for backward compatibility)
+    row_id: Optional[str] = None    # Row ID for adding with value
+    field_name: Optional[str] = None  # Field name for adding with value
+    new_value: Optional[str] = None  # Value for the new item
 
 
 class RevalidateRequest(BaseModel):
@@ -219,45 +227,130 @@ async def edit_item(request: EditItemRequest):
 @router.post("/item/add")
 async def add_item_to_cell(request: AddItemRequest):
     """
-    Append a new empty item slot to a multi-value cell.
+    Append a new item to a multi-value cell.
 
-    Inserts a new empty .item-container at the end of the cell that contains
-    the referenced item_id, and adds the appropriate .sep span to the
-    previously-last container.  The caller should reload the table after
-    this call and click the new empty slot to fill it in.
+    Can add either an empty item (for editing later) or a value directly.
+    For adding with value, uses row_id and field_name parameters.
+    For adding empty item (backward compatibility), uses item_id parameter.
+
+    Inserts a new .item-container at the end of the cell and adds an
+    appropriate .sep span to the previously-last container. The caller should
+    reload the table after this call.
     """
     session = await SessionManager.load_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Validate that the field is a multi-value field
-    parts = request.item_id.split('-')
-    if len(parts) < 3:
-        raise HTTPException(status_code=400,
-                            detail=f"Invalid item_id format: '{request.item_id}'")
-    field_name = '-'.join(parts[1:-1])
-    if field_name not in HTMLParser.ITEM_SEPARATORS:
+    # Determine mode: adding with value or adding empty item
+    if request.new_value is not None and request.row_id and request.field_name:
+        # Adding with value directly
+        field_name = request.field_name
+        if field_name not in HTMLParser.ITEM_SEPARATORS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Field '{field_name}' is not a multi-value field"
+            )
+        separator = HTMLParser.ITEM_SEPARATORS[field_name]
+        
+        # Always operate on the individual (parseable) HTML
+        table_type = 'meta' if session.has_metadata else 'cits'
+
+        html_content = await SessionManager.load_html(request.session_id, table_type)
+        if not html_content:
+            raise HTTPException(status_code=404, detail="HTML content not found")
+
+        # Find any existing item in the cell to use as reference
+        # Try to find first item in the row-field combination
+        from bs4 import BeautifulSoup
+        
+        # Save snapshot for undo BEFORE applying the mutation
+        await SessionManager.push_undo_snapshot(request.session_id, html_content, table_type)
+
+        # Check if cell is empty
+        row_num = request.row_id.replace('row', '') if request.row_id.startswith('row') else request.row_id
+        soup = BeautifulSoup(html_content, 'html.parser')
+        row = soup.find('tr', id=request.row_id)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Row '{request.row_id}' not found")
+        
+        cell = None
+        for td in row.find_all('td', class_='field-value'):
+            if field_name in td.get('class', []):
+                cell = td
+                break
+        
+        if not cell:
+            raise HTTPException(status_code=404, detail=f"Field '{field_name}' not found in row")
+        
+        containers = cell.find_all('span', class_='item-container', recursive=False)
+        
+        if not containers:
+            # Cell is empty, use clear_cell to initialize
+            new_html, new_item_id = HTMLParser.clear_cell(
+                html_content, request.row_id, field_name
+            )
+            if not new_item_id:
+                raise HTTPException(status_code=404, detail="Failed to initialize cell")
+            # Update the empty item with the value
+            new_html = HTMLParser.update_item_value(new_html, new_item_id, request.new_value)
+        else:
+            # Cell has items, add new one after the last
+            ref_item_id = f"{row_num}-{field_name}-{len(containers)-1}"
+            
+            new_html, new_item_id = HTMLParser.add_item(
+                html_content, ref_item_id, separator, request.new_value
+            )
+            
+            if not new_item_id:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Failed to add item. Reference item '{ref_item_id}' not found"
+                )
+
+    elif request.item_id:
+        # Backward compatibility: adding empty item
+        parts = request.item_id.split('-')
+        if len(parts) < 3:
+            raise HTTPException(status_code=400,
+                                detail=f"Invalid item_id format: '{request.item_id}'")
+        field_name = '-'.join(parts[1:-1])
+        if field_name not in HTMLParser.ITEM_SEPARATORS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Field '{field_name}' is not a multi-value field"
+            )
+
+        separator = HTMLParser.ITEM_SEPARATORS[field_name]
+
+        # Always operate on the individual (parseable) HTML
+        table_type = 'meta' if session.has_metadata else 'cits'
+
+        html_content = await SessionManager.load_html(request.session_id, table_type)
+        if not html_content:
+            raise HTTPException(status_code=404, detail="HTML content not found")
+
+        # Save snapshot for undo BEFORE applying the mutation
+        await SessionManager.push_undo_snapshot(request.session_id, html_content, table_type)
+
+        new_html, new_item_id = HTMLParser.add_item(html_content, request.item_id, separator)
+        if not new_item_id:
+            raise HTTPException(status_code=404,
+                                detail=f"Item '{request.item_id}' not found in HTML")
+
+        await SessionManager.save_html(request.session_id, new_html, table_type)
+
+        session.mark_edited()
+        await SessionManager.save_session(session)
+
+        return {
+            "success": True,
+            "new_item_id": new_item_id
+        }
+    else:
         raise HTTPException(
             status_code=400,
-            detail=f"Field '{field_name}' is not a multi-value field"
+            detail="Must provide either (row_id, field_name, new_value) or item_id"
         )
-
-    separator = HTMLParser.ITEM_SEPARATORS[field_name]
-
-    # Always operate on the individual (parseable) HTML
-    table_type = 'meta' if session.has_metadata else 'cits'
-
-    html_content = await SessionManager.load_html(request.session_id, table_type)
-    if not html_content:
-        raise HTTPException(status_code=404, detail="HTML content not found")
-
-    # Save snapshot for undo BEFORE applying the mutation
-    await SessionManager.push_undo_snapshot(request.session_id, html_content, table_type)
-
-    new_html, new_item_id = HTMLParser.add_item(html_content, request.item_id, separator)
-    if not new_item_id:
-        raise HTTPException(status_code=404,
-                            detail=f"Item '{request.item_id}' not found in HTML")
 
     await SessionManager.save_html(request.session_id, new_html, table_type)
 
@@ -267,6 +360,42 @@ async def add_item_to_cell(request: AddItemRequest):
     return {
         "success": True,
         "new_item_id": new_item_id
+    }
+
+
+@router.delete("/item")
+async def delete_item(request: DeleteItemRequest):
+    """
+    Delete a specific item from a multi-value cell.
+
+    Removes the item-container with the given item_id.  If this is the only
+    item in the cell, the container is left empty (not removed).  If there
+    are multiple items, separators are adjusted appropriately.
+    """
+    session = await SessionManager.load_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Always operate on the individual (parseable) HTML
+    table_type = 'meta' if session.has_metadata else 'cits'
+
+    html_content = await SessionManager.load_html(request.session_id, table_type)
+    if not html_content:
+        raise HTTPException(status_code=404, detail="HTML content not found")
+
+    # Save snapshot for undo BEFORE applying mutation
+    await SessionManager.push_undo_snapshot(request.session_id, html_content, table_type)
+
+    updated_html = HTMLParser.remove_item(html_content, request.item_id)
+
+    await SessionManager.save_html(request.session_id, updated_html, table_type)
+
+    session.mark_edited()
+    await SessionManager.save_session(session)
+
+    return {
+        "success": True,
+        "item_id": request.item_id
     }
 
 
