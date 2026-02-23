@@ -93,6 +93,10 @@ class DeleteRowRequest(BaseModel):
     row_id: str   # e.g. "row5"
 
 
+class AddRowRequest(BaseModel):
+    session_id: str
+
+
 class ClearCellRequest(BaseModel):
     session_id: str
     row_id: str       # e.g. "row5"
@@ -426,6 +430,39 @@ async def delete_row(request: DeleteRowRequest):
     await SessionManager.save_session(session)
 
     return {"success": True, "row_id": request.row_id}
+
+
+@router.post("/row/add")
+async def add_row(request: AddRowRequest):
+    """
+    Add a new empty row to the table.
+
+    The new row is appended at the end of the table and contains empty
+    item-containers for each field. The caller should reload the table
+    after this call.
+    """
+    session = await SessionManager.load_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    table_type = 'meta' if session.has_metadata else 'cits'
+    html_content = await SessionManager.load_html(request.session_id, table_type)
+    if not html_content:
+        raise HTTPException(status_code=404, detail="HTML content not found")
+
+    # Save snapshot for undo BEFORE applying the mutation
+    await SessionManager.push_undo_snapshot(request.session_id, html_content, table_type)
+
+    updated_html, new_row_id = HTMLParser.add_row(html_content)
+    if not new_row_id:
+        raise HTTPException(status_code=500, detail="Failed to add new row")
+
+    await SessionManager.save_html(request.session_id, updated_html, table_type)
+
+    session.mark_edited()
+    await SessionManager.save_session(session)
+
+    return {"success": True, "row_id": new_row_id}
 
 
 @router.post("/cell/clear")

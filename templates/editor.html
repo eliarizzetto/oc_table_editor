@@ -65,6 +65,7 @@
                     <li>Click on any text to edit it</li>
                     <li>Hover on cells to see action buttons (add, clear, delete)</li>
                     <li>Use <em>+ add</em> to append a new value to multi-value fields</li>
+                    <li>Use <em>+ Add new row</em> at the bottom to add rows</li>
                     <li>Grey background = edited item</li>
                     <li>Underline = has validation issues</li>
                     <li>Click colored square to filter by issue</li>
@@ -404,6 +405,20 @@ function setupEditHandlers() {
             }
         }
     });
+
+    // 5. Inject "Add Row" button at the end of tbody
+    const table = document.getElementById('table-data');
+    if (table) {
+        const tbody = table.querySelector('tbody');
+        if (tbody) {
+            const addRowBtn = document.createElement('button');
+            addRowBtn.className = 'btn btn-sm btn-success add-row-btn';
+            addRowBtn.textContent = '+ Add new row';
+            addRowBtn.title = 'Add a new empty row to the table';
+            addRowBtn.addEventListener('click', e => { e.stopPropagation(); addNewRow(); });
+            tbody.appendChild(addRowBtn);
+        }
+    }
 }
 
 // Multi-value fields (must match HTMLParser.ITEM_SEPARATORS in html_parser.py)
@@ -587,6 +602,29 @@ async function addItemToCell(itemId) {
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to add item');
+        }
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
+    }
+}
+
+async function addNewRow() {
+    if (!confirm('Add a new empty row to the table?')) return;
+    
+    try {
+        const response = await fetch('/api/edit/row/add', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sessionId })
+        });
+        const data = await response.json();
+        if (response.ok) {
+            showAlert('success', 'Row Added', 'A new empty row has been added to the table.');
+            updateUndoRedoButtons();
+            reloadTable();
+            loadSessionInfo();
+        } else {
+            throw new Error(data.detail || 'Failed to add row');
         }
     } catch (error) {
         showAlert('error', 'Error', error.message);

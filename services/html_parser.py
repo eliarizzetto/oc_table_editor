@@ -244,6 +244,94 @@ class HTMLParser:
         return str(soup)
 
     @staticmethod
+    def add_row(html_content: str) -> tuple:
+        """
+        Add a new empty row to the end of the table.
+
+        The new row contains empty item-containers for each field based on
+        the table structure. Field names are extracted from the header row.
+
+        Args:
+            html_content: HTML string containing the table.
+
+        Returns:
+            Tuple ``(updated_html, new_row_id)`` where ``new_row_id`` is the
+            ``id`` of the newly created row (e.g., ``"row5"``).
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        table = soup.find('table', id='table-data')
+        
+        if not table:
+            return html_content, ''
+        
+        tbody = table.find('tbody')
+        if not tbody:
+            return html_content, ''
+        
+        # Get header row to extract field names
+        thead = table.find('thead')
+        if not thead:
+            return html_content, ''
+        
+        header_row = thead.find('tr')
+        if not header_row:
+            return html_content, ''
+        
+        headers = header_row.find_all('th')
+        if len(headers) < 2:  # At least row number + 1 field
+            return html_content, ''
+        
+        # Extract field names (skip first header which is row number)
+        field_names = []
+        for th in headers[1:]:
+            field_name = th.get_text(strip=True)
+            field_names.append(field_name)
+        
+        # Get the row number for the new row (find highest existing row number)
+        existing_rows = tbody.find_all('tr', id=True)
+        if not existing_rows:
+            row_number = 0
+        else:
+            row_numbers = []
+            for row in existing_rows:
+                row_id = row.get('id', '')
+                if row_id.startswith('row'):
+                    try:
+                        row_num = int(row_id.replace('row', ''))
+                        row_numbers.append(row_num)
+                    except ValueError:
+                        pass
+            row_number = max(row_numbers) + 1 if row_numbers else 0
+        
+        new_row_id = f'row{row_number}'
+        
+        # Create new row
+        new_row = soup.new_tag('tr', attrs={'id': new_row_id})
+        
+        # Add row-number cell
+        row_number_cell = soup.new_tag('td', attrs={'class': 'row-number'})
+        row_number_cell.string = str(row_number)
+        new_row.append(row_number_cell)
+        
+        # Add cells for each field
+        for idx, field_name in enumerate(field_names):
+            cell = soup.new_tag('td', attrs={'class': ['field-value', field_name]})
+            
+            # Create empty item-container for this field
+            item_container = soup.new_tag('span', attrs={'class': 'item-container', 'id': f'{row_number}-{field_name}-0'})
+            item_data = soup.new_tag('span', attrs={'class': 'item-data', 'style': 'cursor: pointer;'})
+            item_data.string = ''
+            item_container.append(item_data)
+            cell.append(item_container)
+            
+            new_row.append(cell)
+        
+        # Append new row to tbody (before any existing buttons at the end)
+        tbody.append(new_row)
+        
+        return str(soup), new_row_id
+
+    @staticmethod
     def clear_cell(html_content: str, row_id: str, field_name: str) -> tuple:
         """
         Clear all content from a cell, leaving exactly one empty item-container.

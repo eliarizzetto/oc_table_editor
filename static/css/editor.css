@@ -179,6 +179,13 @@ td.field-value:hover .add-item-btn:hover {
     opacity: 1;
 }
 
+/* ── Add row button (at the end of tbody) ──────────────────────────────── */
+
+.add-row-btn {
+    margin-top: 0.75rem;
+    width: 100%;
+}
+
 /* ── Delete-row button (injected into .row-number cell) ─────────────────── */
 
 .delete-row-btn {
