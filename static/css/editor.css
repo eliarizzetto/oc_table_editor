@@ -315,7 +315,7 @@ td.field-value:hover .clear-cell-btn:hover {
     height: 22px;
     padding: 1px 6px;
     border: none;
-    border-radius: 0.75;
+    border-radius: 0.25rem;
     background-color: #dee2e6;
     z-index: 100;
     font-size: 0.8em;
@@ -325,6 +325,7 @@ td.field-value:hover .clear-cell-btn:hover {
     cursor: pointer;
     transition: background-color 0.2s;
     display: block;
+    margin-bottom: 0.1rem;
 }
 
 .sidebar-toggle:hover {
@@ -336,7 +337,6 @@ td.field-value:hover .clear-cell-btn:hover {
     top: 0;
     width: 24px;
     height: 24px;
-    border-radius: 0.75;
     text-align: center;
     padding: 1px 0;
 }
