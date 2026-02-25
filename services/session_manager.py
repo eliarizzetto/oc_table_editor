@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, Optional
 from aiofiles import open as aio_open
 
-from models import Session, EditState, RowChangeState
+from models import Session, EditState, RowChangeState, DeletedItemState
 from config import TEMP_DIR
 
 
@@ -350,6 +350,66 @@ class SessionManager:
             return {
                 row_id: RowChangeState.from_dict(state_data)
                 for row_id, state_data in state_dict.items()
+            }
+        except Exception:
+            return {}
+    
+    # ---------------------------------------------------------------------------
+    # Deleted item state management (for ghost overlays)
+    # ---------------------------------------------------------------------------
+    
+    @staticmethod
+    async def save_deleted_item_state(
+        session_id: str, 
+        deleted_items: Dict[str, DeletedItemState]
+    ) -> None:
+        """
+        Save deleted item state to JSON file.
+        
+        Args:
+            session_id: Session identifier
+            deleted_items: Dictionary of item_id -> DeletedItemState
+        """
+        session_dir = TEMP_DIR / session_id
+        state_file = session_dir / 'deleted_item_state.json'
+        
+        # Convert DeletedItemState objects to dicts
+        state_dict = {
+            item_id: state.to_dict() 
+            for item_id, state in deleted_items.items()
+        }
+        
+        async with aio_open(state_file, 'w', encoding='utf-8') as f:
+            await f.write(json.dumps(state_dict, indent=2))
+    
+    @staticmethod
+    async def load_deleted_item_state(
+        session_id: str
+    ) -> Dict[str, DeletedItemState]:
+        """
+        Load deleted item state from JSON file.
+        
+        Args:
+            session_id: Session identifier
+            
+        Returns:
+            Dictionary of item_id -> DeletedItemState
+        """
+        state_file = TEMP_DIR / session_id / 'deleted_item_state.json'
+        
+        if not state_file.exists():
+            return {}
+        
+        try:
+            async with aio_open(state_file, 'r', encoding='utf-8') as f:
+                content = await f.read()
+            
+            state_dict = json.loads(content)
+            
+            # Convert dicts back to DeletedItemState objects
+            return {
+                item_id: DeletedItemState.from_dict(state_data)
+                for item_id, state_data in state_dict.items()
             }
         except Exception:
             return {}

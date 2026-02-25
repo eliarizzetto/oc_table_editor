@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from services import SessionManager, HTMLParser, ValidatorService, CSVExporter
-from models import Session, EditState, RowChangeState
+from models import Session, EditState, RowChangeState, DeletedItemState
 from config import TEMP_DIR
 
 # Add parent directory to path to import oc_validator
@@ -407,6 +407,25 @@ async def delete_item(request: DeleteItemRequest):
     if not html_content:
         raise HTTPException(status_code=404, detail="HTML content not found")
 
+    # Capture original value before deletion for ghost overlay
+    original_value = HTMLParser.get_field_data_by_item_id(html_content, request.item_id)
+    
+    # Parse item_id to get row_id and field_name
+    parts = request.item_id.split('-')
+    if len(parts) >= 3:
+        row_id = parts[0]
+        field_name = '-'.join(parts[1:-1])
+        
+        # Save deleted item state for ghost overlay
+        deleted_items = await SessionManager.load_deleted_item_state(request.session_id)
+        deleted_items[request.item_id] = DeletedItemState(
+            item_id=request.item_id,
+            original_value=original_value or '',
+            row_id=row_id,
+            field_name=field_name
+        )
+        await SessionManager.save_deleted_item_state(request.session_id, deleted_items)
+
     # Save snapshot for undo BEFORE applying mutation
     await SessionManager.push_undo_snapshot(request.session_id, html_content, table_type)
 
@@ -435,7 +454,7 @@ async def delete_row(request: DeleteRowRequest):
     Delete an entire table row from the individual HTML file.
 
     The row is identified by its ``<tr id="rowN">`` attribute.  After deletion
-    the user should re-validate to export the updated table without this row.
+    user should re-validate to export updated table without this row.
     """
     session = await SessionManager.load_session(request.session_id)
     if not session:
@@ -446,7 +465,28 @@ async def delete_row(request: DeleteRowRequest):
     if not html_content:
         raise HTTPException(status_code=404, detail="HTML content not found")
 
-    # Save snapshot for undo BEFORE applying the mutation
+    # Capture all item values in the row before deletion for ghost overlay
+    row_item_ids = HTMLParser.get_row_item_ids(html_content, request.row_id)
+    deleted_items = await SessionManager.load_deleted_item_state(request.session_id)
+    
+    for item_id in row_item_ids:
+        original_value = HTMLParser.get_field_data_by_item_id(html_content, item_id)
+        parts = item_id.split('-')
+        if len(parts) >= 3:
+            row_id = parts[0]
+            field_name = '-'.join(parts[1:-1])
+            
+            # Save deleted item state for ghost overlay
+            deleted_items[item_id] = DeletedItemState(
+                item_id=item_id,
+                original_value=original_value or '',
+                row_id=row_id,
+                field_name=field_name
+            )
+    
+    await SessionManager.save_deleted_item_state(request.session_id, deleted_items)
+
+    # Save snapshot for undo BEFORE applying mutation
     await SessionManager.push_undo_snapshot(request.session_id, html_content, table_type)
 
     updated_html = HTMLParser.delete_row(html_content, request.row_id)
@@ -790,6 +830,69 @@ async def get_edited_items(session_id: str):
     ]
 
     return {"edited_items": edited_items, "count": len(edited_items)}
+
+
+@router.get("/deleted/{session_id}")
+async def get_deleted_view(session_id: str):
+    """
+    Get HTML content with ghost overlays showing deleted items and rows.
+    
+    This endpoint compares the baseline HTML (after validation) with the current
+    HTML to identify deletions, then inserts ghost overlay elements at their
+    original positions.
+    
+    Returns:
+        HTML string with ghost overlays for deleted data
+    """
+    session = await SessionManager.load_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    table_type = _table_type_for_display(session)
+    if table_type is None:
+        raise HTTPException(status_code=400, detail="No data files found in session")
+
+    # Load current HTML
+    current_html = await SessionManager.load_html(session_id, table_type)
+    if not current_html:
+        raise HTTPException(status_code=404, detail="HTML content not found")
+
+    # Load baseline HTML (saved after validation)
+    baseline_html = await SessionManager.load_baseline_snapshot(session_id, table_type)
+    if not baseline_html:
+        # No baseline exists - return current HTML without ghost overlays
+        # This happens when no validation has been performed yet
+        return {"html": current_html, "has_ghosts": False}
+
+    # Identify deletions with values
+    deletions = HTMLParser.identify_deletions_with_values(baseline_html, current_html)
+    
+    # Combine with deleted item states from database
+    deleted_items_db = await SessionManager.load_deleted_item_state(session_id)
+    deleted_item_values = deletions.get('deleted_item_values', {})
+    
+    # Add values from database (captures items deleted before baseline)
+    for item_id, state in deleted_items_db.items():
+        if item_id not in deleted_item_values:
+            deleted_item_values[item_id] = state.original_value
+    
+    # If no deletions found, return original HTML
+    if not deletions.get('deleted_items') and not deletions.get('deleted_rows'):
+        return {"html": current_html, "has_ghosts": False}
+    
+    # Insert ghost overlays at original positions
+    html_with_ghosts = HTMLParser.insert_deleted_overlays(
+        current_html,
+        deletions,
+        deleted_item_values
+    )
+    
+    return {
+        "html": html_with_ghosts,
+        "has_ghosts": True,
+        "deleted_items_count": len(deletions.get('deleted_items', [])),
+        "deleted_rows_count": len(deletions.get('deleted_rows', []))
+    }
 
 
 @router.get("/session/{session_id}")

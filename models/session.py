@@ -6,6 +6,37 @@ import json
 
 
 @dataclass
+class DeletedItemState:
+    """Track the state of a deleted item with its original value."""
+    item_id: str
+    original_value: str
+    row_id: str
+    field_name: str
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            'item_id': self.item_id,
+            'original_value': self.original_value,
+            'row_id': self.row_id,
+            'field_name': self.field_name,
+            'timestamp': self.timestamp
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> 'DeletedItemState':
+        """Create instance from dictionary."""
+        return cls(
+            item_id=data['item_id'],
+            original_value=data['original_value'],
+            row_id=data['row_id'],
+            field_name=data['field_name'],
+            timestamp=data.get('timestamp', datetime.now().isoformat())
+        )
+
+
+@dataclass
 class EditState:
     """Track the state of a single edited item."""
     item_id: str

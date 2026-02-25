@@ -71,7 +71,7 @@
                     <li>Underline = has validation issues</li>
                     <li>Click colored square to filter by issue</li>
                     <li><em>Show Changes</em> = view only edited and added data</li>
-                    <li><em>Show Deleted</em> = view deleted data (coming soon)</li>
+                    <li><em>Show Deleted</em> = view deleted data as ghost elements with strikethrough</li>
                     <li>Re-validate after editing</li>
                 </ul>
             </div>
@@ -322,15 +322,39 @@ async function loadChangesOnly() {
 async function toggleDeletedView() {
     const btn = document.getElementById('showDeletedBtn');
     const isActive = btn.classList.contains('active');
+    const container = document.getElementById('tableContainer');
     
     if (isActive) {
         // Turn off deleted view
         btn.classList.remove('active');
         loadTable(); // Reload without ghost overlays
     } else {
-        // Turn on deleted view - would require backend API to compute deletions
-        // For now, show a message that this feature requires implementation
-        showAlert('info', 'Show Deleted', 'Deleted data visualization requires backend API endpoints. Baseline snapshot infrastructure is in place.');
+        // Turn on deleted view - fetch HTML with ghost overlays
+        try {
+            const response = await fetch(`/api/edit/deleted/${sessionId}`);
+            const data = await response.json();
+            
+            if (response.ok) {
+                if (data.has_ghosts) {
+                    // Display ghost overlays
+                    container.innerHTML = data.html;
+                    setupEditHandlers();
+                    initBootstrapWidgets();
+                    
+                    // Show information about deleted items
+                    const message = `Showing ${data.deleted_items_count} deleted item(s) and ${data.deleted_rows_count} deleted row(s). Deleted data appears with strikethrough and red color.`;
+                    showAlert('info', 'Deleted Data View', message);
+                } else {
+                    // No deletions found
+                    showAlert('info', 'No Deletions', 'No deleted items or rows found in this session. Delete some data and try again.');
+                }
+            } else {
+                throw new Error(data.detail || 'Failed to load deleted view');
+            }
+        } catch (error) {
+            showAlert('error', 'Error', error.message);
+        }
+        
         btn.classList.add('active');
     }
 }

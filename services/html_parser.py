@@ -680,17 +680,21 @@ class HTMLParser:
         return [row.get('id', '') for row in rows if row.get('id')]
     
     @staticmethod
-    def identify_deletions(baseline_html: str, current_html: str) -> Dict:
+    def identify_deletions_with_values(baseline_html: str, current_html: str) -> Dict:
         """
-        Compare baseline with current HTML to identify deleted items and rows.
+        Compare baseline with current HTML to identify deleted items and rows with their values.
         
         Args:
             baseline_html: Baseline HTML state (after validation)
             current_html: Current HTML state (may have deletions)
             
         Returns:
-            Dictionary with 'deleted_items' and 'deleted_rows' lists
-            e.g., {'deleted_items': ['0-id-1', '5-author-0'], 'deleted_rows': ['row3']}
+            Dictionary with 'deleted_items', 'deleted_rows', and 'deleted_item_values'
+            e.g., {
+                'deleted_items': ['0-id-1', '5-author-0'],
+                'deleted_rows': ['row3'],
+                'deleted_item_values': {'0-id-1': 'some value', '5-author-0': 'another value'}
+            }
         """
         baseline_soup = BeautifulSoup(baseline_html, 'html.parser')
         current_soup = BeautifulSoup(current_html, 'html.parser')
@@ -699,14 +703,14 @@ class HTMLParser:
         current_table = current_soup.find('table', id='table-data')
         
         if not baseline_table or not current_table:
-            return {'deleted_items': [], 'deleted_rows': []}
+            return {'deleted_items': [], 'deleted_rows': [], 'deleted_item_values': {}}
         
         # Get all rows from baseline
         baseline_tbody = baseline_table.find('tbody')
         current_tbody = current_table.find('tbody')
         
         if not baseline_tbody or not current_tbody:
-            return {'deleted_items': [], 'deleted_rows': []}
+            return {'deleted_items': [], 'deleted_rows': [], 'deleted_item_values': {}}
         
         # Identify deleted rows
         baseline_rows = {row.get('id', '') for row in baseline_tbody.find_all('tr', id=True)}
@@ -714,8 +718,9 @@ class HTMLParser:
         
         deleted_rows = list(baseline_rows - current_rows)
         
-        # Identify deleted items
+        # Identify deleted items and capture their values
         deleted_items = []
+        deleted_item_values = {}
         
         # Check each baseline row for deleted items
         for row_id in baseline_rows:
@@ -747,20 +752,63 @@ class HTMLParser:
             # Items in baseline but not in current are deleted
             row_deleted_items = list(baseline_items - current_items)
             deleted_items.extend(row_deleted_items)
+            
+            # Capture values of deleted items from baseline
+            for item_id in row_deleted_items:
+                container = baseline_row.find('span', id=item_id)
+                if container:
+                    item_data = container.find('span', class_='item-data')
+                    if item_data:
+                        deleted_item_values[item_id] = item_data.get_text(strip=False)
         
         return {
             'deleted_items': deleted_items,
-            'deleted_rows': deleted_rows
+            'deleted_rows': deleted_rows,
+            'deleted_item_values': deleted_item_values
         }
     
     @staticmethod
-    def insert_deleted_overlays(html_content: str, deletions: Dict) -> str:
+    def create_ghost_item_container(soup, item_id: str, value: str, is_multi_value: bool = False) -> Tag:
+        """
+        Create a ghost item-container element with appropriate styling.
+        
+        Args:
+            soup: BeautifulSoup instance for creating tags
+            item_id: ID for the ghost item-container
+            value: Original value of the deleted item
+            is_multi_value: Whether this item is part of a multi-value field
+            
+        Returns:
+            Tag element representing the ghost item-container
+        """
+        ghost_container = soup.new_tag('span', attrs={
+            'class': 'item-container deleted-ghost',
+            'id': f'ghost-{item_id}',
+            'data-ghost-item-id': item_id
+        })
+        
+        ghost_item_data = soup.new_tag('span', attrs={
+            'class': 'item-data',
+            'style': 'color: #842029; font-style: italic;'
+        })
+        ghost_item_data.string = value
+        ghost_container.append(ghost_item_data)
+        
+        return ghost_container
+    
+    @staticmethod
+    def insert_deleted_overlays(
+        html_content: str, 
+        deletions: Dict,
+        deleted_item_values: Dict[str, str]
+    ) -> str:
         """
         Insert ghost overlay elements for deleted data in their original positions.
         
         Args:
             html_content: Current HTML string
             deletions: Dictionary with 'deleted_items' and 'deleted_rows' lists
+            deleted_item_values: Dictionary mapping item_id to original value
             
         Returns:
             HTML string with ghost overlay elements inserted
@@ -775,8 +823,25 @@ class HTMLParser:
         if not tbody:
             return html_content
         
-        # Insert ghost rows for deleted rows
-        for row_id in deletions.get('deleted_rows', []):
+        # Get all current rows to determine insertion points
+        current_rows = tbody.find_all('tr', id=True)
+        current_row_indices = set()
+        for row in current_rows:
+            row_id = row.get('id', '')
+            if row_id and row_id.startswith('row'):
+                try:
+                    row_idx = int(row_id.replace('row', ''))
+                    current_row_indices.add(row_idx)
+                except ValueError:
+                    pass
+        
+        # Insert ghost rows for deleted rows at original positions
+        for row_id in sorted(deletions.get('deleted_rows', []), 
+                          key=lambda x: int(x.replace('row', '')) if x.replace('row', '').isdigit() else 0):
+            row_number = int(row_id.replace('row', '')) if row_id.startswith('row') and row_id.replace('row', '').isdigit() else -1
+            if row_number < 0:
+                continue
+            
             # Create a ghost row element
             ghost_row = soup.new_tag('tr', attrs={
                 'class': 'deleted',
@@ -796,24 +861,116 @@ class HTMLParser:
                 if header_row:
                     num_columns = len(header_row.find_all('th'))
                     
-                    # Add placeholder cells for remaining columns
-                    for _ in range(1, num_columns):
-                        cell = soup.new_tag('td', attrs={
-                            'class': 'field-value',
-                            'style': 'text-align: center; color: #842029; font-style: italic;'
-                        })
-                        cell.string = '(deleted row)'
+                    # Add cells with ghost items for each field
+                    for col_idx in range(1, num_columns):
+                        cell = soup.new_tag('td', attrs={'class': 'field-value'})
+                        
+                        # Find field name from header
+                        headers = header_row.find_all('th')
+                        if col_idx < len(headers):
+                            field_name = headers[col_idx].get_text(strip=True)
+                            
+                            # Check if any deleted items belong to this row and field
+                            for item_id in deletions.get('deleted_items', []):
+                                if item_id.startswith(row_id.replace('row', '')):
+                                    item_parts = item_id.split('-')
+                                    if len(item_parts) >= 3:
+                                        item_field = '-'.join(item_parts[1:-1])
+                                        if item_field == field_name:
+                                            # Create ghost item for this deleted item
+                                            value = deleted_item_values.get(item_id, '')
+                                            is_multi = field_name in HTMLParser.ITEM_SEPARATORS
+                                            ghost_item = HTMLParser.create_ghost_item_container(
+                                                soup, item_id, value, is_multi
+                                            )
+                                            cell.append(ghost_item)
+                            
+                            if not cell.find('span', class_='item-container'):
+                                # No deleted items for this cell, show placeholder
+                                ghost_cell = soup.new_tag('span', attrs={
+                                    'class': 'deleted-placeholder',
+                                    'style': 'color: #842029; font-style: italic;'
+                                })
+                                ghost_cell.string = '(deleted)'
+                                cell.append(ghost_cell)
+                        
                         ghost_row.append(cell)
             
-            # Insert ghost row at the end (for simplicity)
-            # In a more sophisticated implementation, we could insert at original position
-            tbody.append(ghost_row)
+            # Find insertion point - insert after the row with the highest index less than this row's index
+            insertion_point = None
+            for current_row in current_rows:
+                current_idx = current_row.get('id', '')
+                if current_idx.startswith('row') and current_idx.replace('row', '').isdigit():
+                    current_num = int(current_idx.replace('row', ''))
+                    if current_num > row_number:
+                        break
+                    insertion_point = current_row
+            
+            # Insert ghost row at the correct position
+            if insertion_point:
+                insertion_point.insert_after(ghost_row)
+            else:
+                # Insert at the beginning if no insertion point found
+                tbody.insert(0, ghost_row)
         
-        # Note: Item-level ghost overlays are more complex and require
-        # tracking original positions. For now, we focus on row-level deletions.
-        # If item-level tracking is needed, it would require:
-        # 1. Parsing baseline to get original cell structure
-        # 2. Inserting ghost item-containers at original positions
-        # 3. Using CSS positioning for overlays
+        # Insert ghost items for deleted items within existing rows
+        for item_id in deletions.get('deleted_items', []):
+            # Parse item_id to get row_id and field_name
+            parts = item_id.split('-')
+            if len(parts) < 3:
+                continue
+            
+            row_num = parts[0]
+            if not row_num.isdigit():
+                continue
+            row_id = f'row{row_num}'
+            field_name = '-'.join(parts[1:-1])
+            
+            # Skip if row is deleted (handled above)
+            if row_id in deletions.get('deleted_rows', []):
+                continue
+            
+            # Find the row in current HTML
+            current_row = tbody.find('tr', id=row_id)
+            if not current_row:
+                continue
+            
+            # Find the cell for this field
+            cell = None
+            for td in current_row.find_all('td', class_='field-value'):
+                if field_name in td.get('class', []):
+                    cell = td
+                    break
+            
+            if not cell:
+                continue
+            
+            # Get value and create ghost item
+            value = deleted_item_values.get(item_id, '')
+            is_multi = field_name in HTMLParser.ITEM_SEPARATORS
+            
+            # Determine insertion point based on item index
+            item_index = int(parts[-1]) if parts[-1].isdigit() else -1
+            
+            # Get all existing item-containers in this cell
+            existing_containers = cell.find_all('span', class_='item-container', recursive=False)
+            
+            # Insert ghost item at original position
+            ghost_item = HTMLParser.create_ghost_item_container(soup, item_id, value, is_multi)
+            
+            # Insert at correct position based on index
+            inserted = False
+            for idx, container in enumerate(existing_containers):
+                container_parts = container.get('id', '').split('-')
+                if len(container_parts) >= 3 and container_parts[-1].isdigit():
+                    existing_idx = int(container_parts[-1])
+                    if existing_idx > item_index:
+                        container.insert_before(ghost_item)
+                        inserted = True
+                        break
+            
+            if not inserted:
+                # Append at end if insertion point not found
+                cell.append(ghost_item)
         
         return str(soup)

@@ -11,7 +11,7 @@ A web application for editing validated CSV tables (metadata and citations) with
 - **Three-State Change Tracking**: 
   - **Edited items**: Grey background (modified existing data)
   - **Added items/rows**: Green background (newly created data)
-  - **Deleted data**: Red strikethrough overlay (removed data - coming soon)
+  - **Deleted data**: Red strikethrough overlay with original values (removed data)
 - **Change Filters**: 
   - "Show All": Display complete table
   - "Show Changes": View only edited and added data

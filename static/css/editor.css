@@ -100,6 +100,25 @@ tr.deleted td {
     color: #842029;
 }
 
+/* Ghost item containers - for deleted items shown in ghost view */
+.item-data.deleted-ghost {
+    opacity: 0.6;
+    cursor: not-allowed;
+    text-decoration: line-through;
+}
+
+.item-container.deleted-ghost {
+    pointer-events: none; /* Make unclickable */
+}
+
+/* Ghost placeholder for deleted cells with no items */
+.deleted-placeholder {
+    opacity: 0.6;
+    font-style: italic;
+    color: #842029;
+    pointer-events: none;
+}
+
 /* Toggle button styling for "Show Deleted" */
 #showDeletedBtn {
     transition: all 0.2s;
