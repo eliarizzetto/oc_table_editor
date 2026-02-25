@@ -849,9 +849,9 @@ class HTMLParser:
                 'data-ghost-row-id': row_id
             })
             
-            # Add a row-number cell
+            # Add a row-number cell with the original row number
             row_number_cell = soup.new_tag('td', attrs={'class': 'row-number'})
-            row_number_cell.string = '×'  # Mark as deleted
+            row_number_cell.string = str(row_number)
             ghost_row.append(row_number_cell)
             
             # Get the number of columns from the header
@@ -870,22 +870,28 @@ class HTMLParser:
                         if col_idx < len(headers):
                             field_name = headers[col_idx].get_text(strip=True)
                             
-                            # Check if any deleted items belong to this row and field
-                            for item_id in deletions.get('deleted_items', []):
-                                if item_id.startswith(row_id.replace('row', '')):
-                                    item_parts = item_id.split('-')
-                                    if len(item_parts) >= 3:
-                                        item_field = '-'.join(item_parts[1:-1])
-                                        if item_field == field_name:
-                                            # Create ghost item for this deleted item
-                                            value = deleted_item_values.get(item_id, '')
-                                            is_multi = field_name in HTMLParser.ITEM_SEPARATORS
-                                            ghost_item = HTMLParser.create_ghost_item_container(
-                                                soup, item_id, value, is_multi
-                                            )
-                                            cell.append(ghost_item)
+                            # Look through deleted_item_values for items belonging to this row and field
+                            # This handles both individual deleted items and items from fully deleted rows
+                            row_num = row_id.replace('row', '')
+                            found_items = False
                             
-                            if not cell.find('span', class_='item-container'):
+                            for item_id, value in deleted_item_values.items():
+                                # Check if this item belongs to the deleted row and field
+                                item_parts = item_id.split('-')
+                                if len(item_parts) >= 3:
+                                    item_row_num = item_parts[0]
+                                    item_field = '-'.join(item_parts[1:-1])
+                                    
+                                    if item_row_num == row_num and item_field == field_name:
+                                        # Create ghost item for this deleted item
+                                        is_multi = field_name in HTMLParser.ITEM_SEPARATORS
+                                        ghost_item = HTMLParser.create_ghost_item_container(
+                                            soup, item_id, value, is_multi
+                                        )
+                                        cell.append(ghost_item)
+                                        found_items = True
+                            
+                            if not found_items:
                                 # No deleted items for this cell, show placeholder
                                 ghost_cell = soup.new_tag('span', attrs={
                                     'class': 'deleted-placeholder',
