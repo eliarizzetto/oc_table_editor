@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from services import SessionManager, HTMLParser, ValidatorService, CSVExporter
-from models import Session, EditState
+from models import Session, EditState, RowChangeState
 from config import TEMP_DIR
 
 # Add parent directory to path to import oc_validator
@@ -154,6 +154,16 @@ async def get_html(session_id: str):
     if edit_states:
         edited_ids = [item_id for item_id, state in edit_states.items() if state.edited]
         html_content = HTMLParser.apply_edit_tracking(html_content, edited_ids)
+        
+        # Apply added tracking (green background on added items)
+        added_item_ids = [item_id for item_id, state in edit_states.items() if state.added]
+        
+        # Load row change state for added rows
+        row_change_states = await SessionManager.load_row_change_state(session_id)
+        added_row_ids = [row_id for row_id, state in row_change_states.items() if state.added]
+        
+        if added_item_ids or added_row_ids:
+            html_content = HTMLParser.apply_added_tracking(html_content, added_item_ids, added_row_ids)
 
     return {"html": html_content}
 
@@ -308,6 +318,17 @@ async def add_item_to_cell(request: AddItemRequest):
                     )
 
         await SessionManager.save_html(request.session_id, new_html, table_type)
+
+        # Mark the new item as added
+        edit_states = await SessionManager.load_edit_state(request.session_id)
+        edit_states[new_item_id] = EditState(
+            item_id=new_item_id,
+            original_value='',
+            edited_value=request.new_value,
+            added=True,
+            edited=False
+        )
+        await SessionManager.save_edit_state(request.session_id, edit_states)
 
         session.mark_edited()
         await SessionManager.save_session(session)
@@ -464,6 +485,15 @@ async def add_row(request: AddRowRequest):
 
     await SessionManager.save_html(request.session_id, updated_html, table_type)
 
+    # Mark the new row as added
+    row_change_states = await SessionManager.load_row_change_state(request.session_id)
+    row_change_states[new_row_id] = RowChangeState(
+        row_id=new_row_id,
+        added=True,
+        deleted=False
+    )
+    await SessionManager.save_row_change_state(request.session_id, row_change_states)
+
     session.mark_edited()
     await SessionManager.save_session(session)
 
@@ -613,6 +643,10 @@ async def revalidate(request: RevalidateRequest):
                 merged_content = f.read()
             await SessionManager.save_html(request.session_id, merged_content, 'display')
 
+            # Update baseline snapshots for deletion detection
+            await SessionManager.save_baseline_snapshot(request.session_id, new_meta_html, 'meta')
+            await SessionManager.save_baseline_snapshot(request.session_id, new_cits_html, 'cits')
+
             # Update session report paths
             session.meta_report_path = meta_report_path
             session.cits_report_path = cits_report_path
@@ -671,6 +705,9 @@ async def revalidate(request: RevalidateRequest):
             # dropped — re-validation is the canonical "accept and re-check"
             # action; edited items are no longer specially marked afterwards).
             await SessionManager.save_html(request.session_id, new_html, table_type)
+
+            # Update baseline snapshot for deletion detection
+            await SessionManager.save_baseline_snapshot(request.session_id, new_html, table_type)
 
             # Update session report path
             if session.has_metadata:

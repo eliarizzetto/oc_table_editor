@@ -12,6 +12,7 @@ class EditState:
     original_value: str
     edited_value: str
     edited: bool = False
+    added: bool = False  # Track if this item was newly added
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
     
     def to_dict(self) -> dict:
@@ -21,6 +22,7 @@ class EditState:
             'original_value': self.original_value,
             'edited_value': self.edited_value,
             'edited': self.edited,
+            'added': self.added,
             'timestamp': self.timestamp
         }
     
@@ -32,6 +34,35 @@ class EditState:
             original_value=data['original_value'],
             edited_value=data['edited_value'],
             edited=data.get('edited', False),
+            added=data.get('added', False),
+            timestamp=data.get('timestamp', datetime.now().isoformat())
+        )
+
+
+@dataclass
+class RowChangeState:
+    """Track change state for entire rows."""
+    row_id: str
+    added: bool = False  # Track if this row was newly added
+    deleted: bool = False  # Track if this row was deleted
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            'row_id': self.row_id,
+            'added': self.added,
+            'deleted': self.deleted,
+            'timestamp': self.timestamp
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> 'RowChangeState':
+        """Create instance from dictionary."""
+        return cls(
+            row_id=data['row_id'],
+            added=data.get('added', False),
+            deleted=data.get('deleted', False),
             timestamp=data.get('timestamp', datetime.now().isoformat())
         )
 

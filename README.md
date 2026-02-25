@@ -8,7 +8,16 @@ A web application for editing validated CSV tables (metadata and citations) with
 - **Validation Pipeline**: Full validation using oc_validator (wellformedness, syntax, existence, semantics, duplicates, closure)
 - **HTML Editor**: Interactive editing of validated data with validation feedback
 - **Individual Span Editing**: Edit each data element or separator independently
-- **Edit Tracking**: Visual indication of modified data (grey background)
+- **Three-State Change Tracking**: 
+  - **Edited items**: Grey background (modified existing data)
+  - **Added items/rows**: Green background (newly created data)
+  - **Deleted data**: Red strikethrough overlay (removed data - coming soon)
+- **Change Filters**: 
+  - "Show All": Display complete table
+  - "Show Changes": View only edited and added data
+  - "Show Deleted": View deleted data (coming soon)
+- **Row and Item Operations**: Add/delete rows, add/delete items, clear cells
+- **Undo/Redo**: Full undo/redo support with keyboard shortcuts (Ctrl+Z, Ctrl+Y)
 - **CSV Export**: Export edited data back to original CSV format
 - **Draft Management**: Save and restore editing sessions
 - **Local Browser**: Runs entirely in browser (static file mode)
@@ -79,13 +88,22 @@ This generates HTML files that can be opened directly in a browser without a run
 ## Usage
 
 1. **Upload**: Upload CSV files (metadata or citations, single or paired)
-2. **Validate**: Click "Validate" to run the validation pipeline
-3. **Edit**: Click on any span (data or separator) to edit:
-   - Click data spans to edit the content
-   - Click separator spans to change the separator
-   - Yellow background indicates edited content
-4. **Export**: Click "Export CSV" to download the edited data in CSV format
-5. **Save Draft**: Click "Save Draft" to save your editing session
+2. **Validate**: Click "Re-Validate" to run the validation pipeline
+3. **Edit**: Click on any data element to edit:
+   - Click on text to edit the content
+   - Hover over cells to see action buttons (add, clear, delete)
+   - Use "+ add" to append values to multi-value fields
+   - Use "+ Add new row" to add new empty rows
+4. **Track Changes**:
+   - **Grey background**: Edited items (modified existing data)
+   - **Green background**: Added items or rows (newly created data)
+   - Use filters to view specific changes:
+     - "Show All": Display complete table
+     - "Show Changes": View only edited and added data
+     - "Show Deleted": View deleted data (coming soon)
+5. **Undo/Redo**: Use Ctrl+Z (undo) and Ctrl+Y (redo) or the sidebar buttons
+6. **Export**: Click "Export CSV" to download the edited data in CSV format
+7. **Save Draft**: Click "Save Draft" to save your editing session
 
 ## Validation Feedback
 

@@ -74,6 +74,43 @@ body {
     background-color: #c8cdd6;
 }
 
+/* Added items - light green background */
+.item-data.added {
+    background-color: #d1e7dd;
+    color: #0f5132;
+}
+
+.item-data.added:hover {
+    background-color: #c3e6cb;
+}
+
+/* Added rows - light green background on entire row */
+tr.added {
+    background-color: #d1e7dd;
+}
+
+/* Deleted rows - light red background with strikethrough */
+tr.deleted {
+    background-color: #f8d7da;
+    opacity: 0.7;
+}
+
+tr.deleted td {
+    text-decoration: line-through;
+    color: #842029;
+}
+
+/* Toggle button styling for "Show Deleted" */
+#showDeletedBtn {
+    transition: all 0.2s;
+}
+
+#showDeletedBtn.active {
+    background-color: #f8d7da;
+    color: #842029;
+    border-color: #f5c2c7;
+}
+
 /* Issue icons */
 .issue-icon {
     display: inline-block;

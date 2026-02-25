@@ -67,8 +67,11 @@
                     <li>Use <em>+ add</em> to append a new value to multi-value fields</li>
                     <li>Use <em>+ Add new row</em> at the bottom to add rows</li>
                     <li>Grey background = edited item</li>
+                    <li>Green background = added item or row</li>
                     <li>Underline = has validation issues</li>
                     <li>Click colored square to filter by issue</li>
+                    <li><em>Show Changes</em> = view only edited and added data</li>
+                    <li><em>Show Deleted</em> = view deleted data (coming soon)</li>
                     <li>Re-validate after editing</li>
                 </ul>
             </div>
@@ -83,7 +86,8 @@
                 <h5 class="mb-0">Validation Results</h5>
                 <div>
                     <button class="btn btn-sm btn-outline-secondary" id="showAllBtn">Show All</button>
-                    <button class="btn btn-sm btn-outline-secondary" id="showEditedBtn">Show Edited</button>
+                    <button class="btn btn-sm btn-outline-secondary" id="showEditedBtn">Show Changes</button>
+                    <button class="btn btn-sm btn-outline-secondary" id="showDeletedBtn">Show Deleted</button>
                 </div>
             </div>
             <!-- Filter banner (hidden by default) -->
@@ -189,7 +193,8 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('saveDraftBtn').addEventListener('click', saveDraft);
     document.getElementById('deleteDraftBtn').addEventListener('click', deleteDraft);
     document.getElementById('showAllBtn').addEventListener('click', () => loadTable());
-    document.getElementById('showEditedBtn').addEventListener('click', loadEditedOnly);
+    document.getElementById('showEditedBtn').addEventListener('click', loadChangesOnly);
+    document.getElementById('showDeletedBtn').addEventListener('click', toggleDeletedView);
     document.getElementById('saveEditBtn').addEventListener('click', saveEdit);
     document.getElementById('deleteItemBtn').addEventListener('click', () => deleteItem(currentItemId));
     document.getElementById('saveNewItemBtn').addEventListener('click', saveNewItem);
@@ -254,7 +259,7 @@ async function loadTable() {
     }
 }
 
-async function loadEditedOnly() {
+async function loadChangesOnly() {
     const container = document.getElementById('tableContainer');
     
     try {
@@ -263,7 +268,7 @@ async function loadEditedOnly() {
         
         if (!response.ok) throw new Error('Failed to load session');
         
-        // Get HTML and filter for edited items
+        // Get HTML and filter for edited and added items
         const htmlResponse = await fetch(`/api/edit/html/${sessionId}`);
         const htmlData = await htmlResponse.json();
         
@@ -275,27 +280,32 @@ async function loadEditedOnly() {
         
         if (!table) throw new Error('Table not found');
         
-        // Filter rows to show only edited items
+        // Filter rows to show only edited or added items
         const tbody = table.querySelector('tbody');
-        const editedItemIds = new Set();
         
         // Get edited items from session
+        const editedItemIds = new Set();
+        const addedItemIds = new Set();
         const editStateResponse = await fetch('/api/edit/edited/' + sessionId);
         if (editStateResponse.ok) {
             const editData = await editStateResponse.json();
-            editData.edited_items.forEach(item => editedItemIds.add(item.item_id));
+            editData.edited_items.forEach(item => {
+                editedItemIds.add(item.item_id);
+            });
         }
         
-        if (editedItemIds.size === 0) {
-            showAlert('info', 'No Edits', 'No items have been edited yet.');
+        if (editedItemIds.size === 0 && addedItemIds.size === 0) {
+            showAlert('info', 'No Changes', 'No items have been edited or added yet.');
             return;
         }
         
-        // Filter rows containing edited items
+        // Filter rows containing edited or added items
         const rows = Array.from(tbody.querySelectorAll('tr'));
         rows.forEach(row => {
             const editedSpan = row.querySelector('.item-data.edited');
-            if (!editedSpan) {
+            const addedSpan = row.querySelector('.item-data.added');
+            const addedRow = row.classList.contains('added');
+            if (!editedSpan && !addedSpan && !addedRow) {
                 row.style.display = 'none';
             }
         });
@@ -306,6 +316,22 @@ async function loadEditedOnly() {
         
     } catch (error) {
         showAlert('error', 'Error', error.message);
+    }
+}
+
+async function toggleDeletedView() {
+    const btn = document.getElementById('showDeletedBtn');
+    const isActive = btn.classList.contains('active');
+    
+    if (isActive) {
+        // Turn off deleted view
+        btn.classList.remove('active');
+        loadTable(); // Reload without ghost overlays
+    } else {
+        // Turn on deleted view - would require backend API to compute deletions
+        // For now, show a message that this feature requires implementation
+        showAlert('info', 'Show Deleted', 'Deleted data visualization requires backend API endpoints. Baseline snapshot infrastructure is in place.');
+        btn.classList.add('active');
     }
 }
 

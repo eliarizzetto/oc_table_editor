@@ -572,3 +572,248 @@ class HTMLParser:
                     item['class'] = ' '.join(classes_list) if classes_list else None
         
         return str(soup)
+    
+    @staticmethod
+    def apply_added_tracking(
+        html_content: str, 
+        added_item_ids: List[str], 
+        added_row_ids: List[str]
+    ) -> str:
+        """
+        Apply green highlighting to added items and rows.
+        
+        Args:
+            html_content: Original HTML string
+            added_item_ids: List of item IDs that have been added
+                            (IDs of .item-container spans)
+            added_row_ids: List of row IDs that have been added
+                           (IDs of <tr> elements)
+            
+        Returns:
+            HTML string with added tracking applied
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Apply green background to added items
+        for item_id in added_item_ids:
+            container = soup.find('span', id=item_id)
+            if container:
+                # item-data is a direct child of the item-container
+                item_data = container.find('span', class_='item-data')
+                if item_data:
+                    existing_classes = item_data.get('class', [])
+                    if isinstance(existing_classes, list):
+                        if 'added' not in existing_classes:
+                            existing_classes.append('added')
+                        item_data['class'] = existing_classes
+                    else:
+                        # Handle string class attribute
+                        classes_list = existing_classes.split()
+                        if 'added' not in classes_list:
+                            classes_list.append('added')
+                        item_data['class'] = ' '.join(classes_list)
+        
+        # Apply green background to added rows
+        for row_id in added_row_ids:
+            row = soup.find('tr', id=row_id)
+            if row:
+                existing_classes = row.get('class', [])
+                if isinstance(existing_classes, list):
+                    if 'added' not in existing_classes:
+                        existing_classes.append('added')
+                    row['class'] = existing_classes
+                else:
+                    # Handle string class attribute
+                    classes_list = existing_classes.split()
+                    if 'added' not in classes_list:
+                        classes_list.append('added')
+                    row['class'] = ' '.join(classes_list)
+        
+        return str(soup)
+    
+    @staticmethod
+    def get_row_item_ids(html_content: str, row_id: str) -> List[str]:
+        """
+        Get all item-container IDs for a specific row.
+        
+        Args:
+            html_content: HTML string containing the table
+            row_id: Row identifier (e.g., 'row5')
+            
+        Returns:
+            List of item-container IDs in the row
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        row = soup.find('tr', id=row_id)
+        
+        if not row:
+            return []
+        
+        # Find all item-containers in this row
+        item_containers = row.find_all('span', class_='item-container', recursive=True)
+        
+        return [container.get('id', '') for container in item_containers if container.get('id')]
+    
+    @staticmethod
+    def get_all_row_ids(html_content: str) -> List[str]:
+        """
+        Get all row IDs from the table.
+        
+        Args:
+            html_content: HTML string containing the table
+            
+        Returns:
+            List of row IDs
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        table = soup.find('table', id='table-data')
+        
+        if not table:
+            return []
+        
+        tbody = table.find('tbody')
+        if not tbody:
+            return []
+        
+        rows = tbody.find_all('tr', id=True)
+        
+        return [row.get('id', '') for row in rows if row.get('id')]
+    
+    @staticmethod
+    def identify_deletions(baseline_html: str, current_html: str) -> Dict:
+        """
+        Compare baseline with current HTML to identify deleted items and rows.
+        
+        Args:
+            baseline_html: Baseline HTML state (after validation)
+            current_html: Current HTML state (may have deletions)
+            
+        Returns:
+            Dictionary with 'deleted_items' and 'deleted_rows' lists
+            e.g., {'deleted_items': ['0-id-1', '5-author-0'], 'deleted_rows': ['row3']}
+        """
+        baseline_soup = BeautifulSoup(baseline_html, 'html.parser')
+        current_soup = BeautifulSoup(current_html, 'html.parser')
+        
+        baseline_table = baseline_soup.find('table', id='table-data')
+        current_table = current_soup.find('table', id='table-data')
+        
+        if not baseline_table or not current_table:
+            return {'deleted_items': [], 'deleted_rows': []}
+        
+        # Get all rows from baseline
+        baseline_tbody = baseline_table.find('tbody')
+        current_tbody = current_table.find('tbody')
+        
+        if not baseline_tbody or not current_tbody:
+            return {'deleted_items': [], 'deleted_rows': []}
+        
+        # Identify deleted rows
+        baseline_rows = {row.get('id', '') for row in baseline_tbody.find_all('tr', id=True)}
+        current_rows = {row.get('id', '') for row in current_tbody.find_all('tr', id=True)}
+        
+        deleted_rows = list(baseline_rows - current_rows)
+        
+        # Identify deleted items
+        deleted_items = []
+        
+        # Check each baseline row for deleted items
+        for row_id in baseline_rows:
+            # Skip rows that are entirely deleted
+            if row_id in deleted_rows:
+                continue
+            
+            # Find the row in both baseline and current
+            baseline_row = baseline_tbody.find('tr', id=row_id)
+            current_row = current_tbody.find('tr', id=row_id)
+            
+            if not baseline_row or not current_row:
+                continue
+            
+            # Get all item-containers from baseline row
+            baseline_items = {
+                container.get('id', '') 
+                for container in baseline_row.find_all('span', class_='item-container', recursive=True)
+                if container.get('id')
+            }
+            
+            # Get all item-containers from current row
+            current_items = {
+                container.get('id', '') 
+                for container in current_row.find_all('span', class_='item-container', recursive=True)
+                if container.get('id')
+            }
+            
+            # Items in baseline but not in current are deleted
+            row_deleted_items = list(baseline_items - current_items)
+            deleted_items.extend(row_deleted_items)
+        
+        return {
+            'deleted_items': deleted_items,
+            'deleted_rows': deleted_rows
+        }
+    
+    @staticmethod
+    def insert_deleted_overlays(html_content: str, deletions: Dict) -> str:
+        """
+        Insert ghost overlay elements for deleted data in their original positions.
+        
+        Args:
+            html_content: Current HTML string
+            deletions: Dictionary with 'deleted_items' and 'deleted_rows' lists
+            
+        Returns:
+            HTML string with ghost overlay elements inserted
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        table = soup.find('table', id='table-data')
+        
+        if not table:
+            return html_content
+        
+        tbody = table.find('tbody')
+        if not tbody:
+            return html_content
+        
+        # Insert ghost rows for deleted rows
+        for row_id in deletions.get('deleted_rows', []):
+            # Create a ghost row element
+            ghost_row = soup.new_tag('tr', attrs={
+                'class': 'deleted',
+                'id': f'ghost-{row_id}',
+                'data-ghost-row-id': row_id
+            })
+            
+            # Add a row-number cell
+            row_number_cell = soup.new_tag('td', attrs={'class': 'row-number'})
+            row_number_cell.string = '×'  # Mark as deleted
+            ghost_row.append(row_number_cell)
+            
+            # Get the number of columns from the header
+            thead = table.find('thead')
+            if thead:
+                header_row = thead.find('tr')
+                if header_row:
+                    num_columns = len(header_row.find_all('th'))
+                    
+                    # Add placeholder cells for remaining columns
+                    for _ in range(1, num_columns):
+                        cell = soup.new_tag('td', attrs={
+                            'class': 'field-value',
+                            'style': 'text-align: center; color: #842029; font-style: italic;'
+                        })
+                        cell.string = '(deleted row)'
+                        ghost_row.append(cell)
+            
+            # Insert ghost row at the end (for simplicity)
+            # In a more sophisticated implementation, we could insert at original position
+            tbody.append(ghost_row)
+        
+        # Note: Item-level ghost overlays are more complex and require
+        # tracking original positions. For now, we focus on row-level deletions.
+        # If item-level tracking is needed, it would require:
+        # 1. Parsing baseline to get original cell structure
+        # 2. Inserting ghost item-containers at original positions
+        # 3. Using CSS positioning for overlays
+        
+        return str(soup)

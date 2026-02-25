@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, Optional
 from aiofiles import open as aio_open
 
-from models import Session, EditState
+from models import Session, EditState, RowChangeState
 from config import TEMP_DIR
 
 
@@ -240,6 +240,121 @@ class SessionManager:
         return json.loads(content)
     
     # ---------------------------------------------------------------------------
+    # Baseline snapshot management (for deletion detection)
+    # ---------------------------------------------------------------------------
+    
+    @staticmethod
+    def _baseline_filename(table_type: str) -> str:
+        """Return the on-disk filename for baseline snapshots."""
+        return f"baseline_{table_type}.html"
+    
+    @staticmethod
+    async def save_baseline_snapshot(session_id: str, html_content: str, table_type: str) -> None:
+        """
+        Save the baseline HTML state after validation for diff comparison.
+        
+        This baseline is used to identify deleted items and rows by comparing
+        the current HTML state with this saved baseline.
+        
+        Args:
+            session_id: Session identifier
+            html_content: HTML content to save as baseline
+            table_type: 'meta' or 'cits'
+        """
+        session_dir = TEMP_DIR / session_id
+        baseline_file = session_dir / SessionManager._baseline_filename(table_type)
+        
+        async with aio_open(baseline_file, 'w', encoding='utf-8') as f:
+            await f.write(html_content)
+    
+    @staticmethod
+    async def load_baseline_snapshot(session_id: str, table_type: str) -> Optional[str]:
+        """
+        Load the baseline HTML state for a session.
+        
+        Args:
+            session_id: Session identifier
+            table_type: 'meta' or 'cits'
+            
+        Returns:
+            Baseline HTML content as string or None if not found
+        """
+        baseline_file = TEMP_DIR / session_id / SessionManager._baseline_filename(table_type)
+        
+        if not baseline_file.exists():
+            return None
+        
+        if baseline_file.stat().st_size == 0:
+            return None
+        
+        try:
+            async with aio_open(baseline_file, 'r', encoding='utf-8') as f:
+                content = await f.read()
+                return content
+        except Exception:
+            return None
+    
+    # ---------------------------------------------------------------------------
+    # Row change state management (added/deleted row tracking)
+    # ---------------------------------------------------------------------------
+    
+    @staticmethod
+    async def save_row_change_state(
+        session_id: str, 
+        row_changes: Dict[str, RowChangeState]
+    ) -> None:
+        """
+        Save row-level change tracking state to JSON file.
+        
+        Args:
+            session_id: Session identifier
+            row_changes: Dictionary of row_id -> RowChangeState
+        """
+        session_dir = TEMP_DIR / session_id
+        state_file = session_dir / 'row_change_state.json'
+        
+        # Convert RowChangeState objects to dicts
+        state_dict = {
+            row_id: state.to_dict() 
+            for row_id, state in row_changes.items()
+        }
+        
+        async with aio_open(state_file, 'w', encoding='utf-8') as f:
+            await f.write(json.dumps(state_dict, indent=2))
+    
+    @staticmethod
+    async def load_row_change_state(
+        session_id: str
+    ) -> Dict[str, RowChangeState]:
+        """
+        Load row-level change tracking state from JSON file.
+        
+        Args:
+            session_id: Session identifier
+            
+        Returns:
+            Dictionary of row_id -> RowChangeState
+        """
+        state_file = TEMP_DIR / session_id / 'row_change_state.json'
+        
+        if not state_file.exists():
+            return {}
+        
+        try:
+            async with aio_open(state_file, 'r', encoding='utf-8') as f:
+                content = await f.read()
+            
+            state_dict = json.loads(content)
+            
+            # Convert dicts back to RowChangeState objects
+            return {
+                row_id: RowChangeState.from_dict(state_data)
+                for row_id, state_data in state_dict.items()
+            }
+        except Exception:
+            return {}
+    
+    # ---------------------------------------------------------------------------
     # Undo / Redo snapshot management
     # ---------------------------------------------------------------------------
 
@@ -278,6 +393,8 @@ class SessionManager:
         Must be called **before** applying a mutation so that undo restores this
         exact pre-mutation state.  Clears the redo stack (forward history is lost
         when a new edit is made).
+        
+        Also saves edit_state and row_change_state to fully restore tracking state.
         """
         undo_dir = SessionManager._undo_dir(session_id)
         undo_dir.mkdir(parents=True, exist_ok=True)
@@ -288,15 +405,39 @@ class SessionManager:
         # Clear redo snapshots
         for idx in ts.get('redo', []):
             (undo_dir / f"{table_type}_{idx}.html").unlink(missing_ok=True)
+            (undo_dir / f"{table_type}_{idx}_edit_state.json").unlink(missing_ok=True)
+            (undo_dir / f"{table_type}_{idx}_row_change_state.json").unlink(missing_ok=True)
         ts['redo'] = []
 
         undo_stack: list = ts.get('undo', [])
 
         # Choose a monotonically increasing index
         new_idx = (max(undo_stack) + 1) if undo_stack else 0
+        
+        # Save HTML snapshot
         snapshot_path = undo_dir / f"{table_type}_{new_idx}.html"
         async with aio_open(snapshot_path, 'w', encoding='utf-8') as f:
             await f.write(html_content)
+        
+        # Save edit_state snapshot
+        edit_states = await SessionManager.load_edit_state(session_id)
+        edit_state_path = undo_dir / f"{table_type}_{new_idx}_edit_state.json"
+        edit_state_dict = {
+            item_id: state.to_dict() 
+            for item_id, state in edit_states.items()
+        }
+        async with aio_open(edit_state_path, 'w', encoding='utf-8') as f:
+            await f.write(json.dumps(edit_state_dict, indent=2))
+        
+        # Save row_change_state snapshot
+        row_change_states = await SessionManager.load_row_change_state(session_id)
+        row_change_state_path = undo_dir / f"{table_type}_{new_idx}_row_change_state.json"
+        row_change_state_dict = {
+            row_id: state.to_dict() 
+            for row_id, state in row_change_states.items()
+        }
+        async with aio_open(row_change_state_path, 'w', encoding='utf-8') as f:
+            await f.write(json.dumps(row_change_state_dict, indent=2))
 
         undo_stack.append(new_idx)
 
@@ -304,6 +445,8 @@ class SessionManager:
         while len(undo_stack) > SessionManager.MAX_UNDO_DEPTH:
             oldest = undo_stack.pop(0)
             (undo_dir / f"{table_type}_{oldest}.html").unlink(missing_ok=True)
+            (undo_dir / f"{table_type}_{oldest}_edit_state.json").unlink(missing_ok=True)
+            (undo_dir / f"{table_type}_{oldest}_row_change_state.json").unlink(missing_ok=True)
 
         ts['undo'] = undo_stack
         state[table_type] = ts
@@ -314,10 +457,12 @@ class SessionManager:
         session_id: str, current_html: str, table_type: str
     ):
         """
-        Undo: restore the previous snapshot.
+        Undo: restore to previous snapshot.
 
         Pushes ``current_html`` onto the redo stack so the action can be
         redone.
+        
+        Also restores edit_state and row_change_state from the snapshot.
 
         Returns ``(previous_html, undo_state_dict)`` or ``(None, state)`` if
         there is nothing to undo.
@@ -342,6 +487,32 @@ class SessionManager:
         async with aio_open(snapshot_path, 'r', encoding='utf-8') as f:
             prev_html = await f.read()
 
+        # Restore edit_state from snapshot
+        edit_state_path = undo_dir / f"{table_type}_{prev_idx}_edit_state.json"
+        if edit_state_path.exists():
+            async with aio_open(edit_state_path, 'r', encoding='utf-8') as f:
+                edit_state_dict = json.loads(await f.read())
+            
+            # Convert dicts back to EditState objects
+            edit_states = {
+                item_id: EditState.from_dict(state_data)
+                for item_id, state_data in edit_state_dict.items()
+            }
+            await SessionManager.save_edit_state(session_id, edit_states)
+
+        # Restore row_change_state from snapshot
+        row_change_state_path = undo_dir / f"{table_type}_{prev_idx}_row_change_state.json"
+        if row_change_state_path.exists():
+            async with aio_open(row_change_state_path, 'r', encoding='utf-8') as f:
+                row_change_state_dict = json.loads(await f.read())
+            
+            # Convert dicts back to RowChangeState objects
+            row_change_states = {
+                row_id: RowChangeState.from_dict(state_data)
+                for row_id, state_data in row_change_state_dict.items()
+            }
+            await SessionManager.save_row_change_state(session_id, row_change_states)
+
         # Save current HTML onto redo stack
         redo_stack: list = ts.get('redo', [])
         all_existing = undo_stack + redo_stack
@@ -363,9 +534,11 @@ class SessionManager:
         session_id: str, current_html: str, table_type: str
     ):
         """
-        Redo: restore the next snapshot.
+        Redo: restore to next snapshot.
 
         Pushes ``current_html`` back onto the undo stack.
+        
+        Also restores edit_state and row_change_state from the snapshot.
 
         Returns ``(next_html, undo_state_dict)`` or ``(None, state)`` if there
         is nothing to redo.
@@ -389,6 +562,32 @@ class SessionManager:
 
         async with aio_open(snapshot_path, 'r', encoding='utf-8') as f:
             next_html = await f.read()
+
+        # Restore edit_state from snapshot
+        edit_state_path = undo_dir / f"{table_type}_{next_idx}_edit_state.json"
+        if edit_state_path.exists():
+            async with aio_open(edit_state_path, 'r', encoding='utf-8') as f:
+                edit_state_dict = json.loads(await f.read())
+            
+            # Convert dicts back to EditState objects
+            edit_states = {
+                item_id: EditState.from_dict(state_data)
+                for item_id, state_data in edit_state_dict.items()
+            }
+            await SessionManager.save_edit_state(session_id, edit_states)
+
+        # Restore row_change_state from snapshot
+        row_change_state_path = undo_dir / f"{table_type}_{next_idx}_row_change_state.json"
+        if row_change_state_path.exists():
+            async with aio_open(row_change_state_path, 'r', encoding='utf-8') as f:
+                row_change_state_dict = json.loads(await f.read())
+            
+            # Convert dicts back to RowChangeState objects
+            row_change_states = {
+                row_id: RowChangeState.from_dict(state_data)
+                for row_id, state_data in row_change_state_dict.items()
+            }
+            await SessionManager.save_row_change_state(session_id, row_change_states)
 
         # Push current HTML back onto undo stack
         undo_stack: list = ts.get('undo', [])

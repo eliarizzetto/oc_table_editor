@@ -161,6 +161,10 @@ async def upload_files(
             session.meta_html_path = str(meta_table_path)
             session.cits_html_path = str(cits_table_path)
 
+            # Save baseline snapshots for deletion detection
+            await SessionManager.save_baseline_snapshot(session_id, meta_html_content, 'meta')
+            await SessionManager.save_baseline_snapshot(session_id, cits_html_content, 'cits')
+
         elif has_metadata:
             # ── Single metadata table ───────────────────────────────────────
             meta_errors, meta_report_path = ValidatorService.validate_metadata(
@@ -181,6 +185,9 @@ async def upload_files(
 
             session.meta_html_path = str(meta_table_path)
 
+            # Save baseline snapshot for deletion detection
+            await SessionManager.save_baseline_snapshot(session_id, meta_html_content, 'meta')
+
         elif has_citations:
             # ── Single citations table ──────────────────────────────────────
             cits_errors, cits_report_path = ValidatorService.validate_citations(
@@ -200,6 +207,9 @@ async def upload_files(
             await SessionManager.save_html(session_id, cits_html_content, 'cits')
 
             session.cits_html_path = str(cits_table_path)
+
+            # Save baseline snapshot for deletion detection
+            await SessionManager.save_baseline_snapshot(session_id, cits_html_content, 'cits')
 
         # Mark as validated and persist session
         session.mark_validated()
