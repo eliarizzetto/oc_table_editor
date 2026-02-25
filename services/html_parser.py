@@ -409,6 +409,50 @@ class HTMLParser:
         return str(soup)
 
     @staticmethod
+    def get_cell_state(html_content: str, row_id: str, field_name: str) -> tuple:
+        """
+        Get the state of a cell in the table.
+
+        Args:
+            html_content: HTML string containing the table.
+            row_id:       ``id`` attribute of the parent ``<tr>``
+                          (e.g. ``"row5"``).
+            field_name:   Name of the field / column (e.g. ``"id"``, ``"author"``).
+
+        Returns:
+            Tuple ``(has_value, container_count)`` where:
+            - ``has_value`` is True if any item-container has non-empty content
+            - ``container_count`` is the number of item-containers in the cell
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        row = soup.find('tr', id=row_id)
+        if not row:
+            return False, 0
+
+        # Locate the cell by its "field-value {field_name}" class pair
+        cell = None
+        for td in row.find_all('td', class_='field-value'):
+            if field_name in td.get('class', []):
+                cell = td
+                break
+
+        if not cell:
+            return False, 0
+
+        # Get all item-containers
+        containers = cell.find_all('span', class_='item-container', recursive=False)
+        
+        # Check if any container has a non-empty value
+        has_value = False
+        for container in containers:
+            item_data = container.find('span', class_='item-data')
+            if item_data and item_data.get_text(strip=True):
+                has_value = True
+                break
+        
+        return has_value, len(containers)
+
+    @staticmethod
     def add_item(html_content: str, after_item_id: str, field_separator: str, value: str = '') -> tuple:
         """
         Append a new item-container to the same cell as after_item_id.

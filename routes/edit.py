@@ -267,32 +267,10 @@ async def add_item_to_cell(request: AddItemRequest):
         # Save snapshot for undo BEFORE applying the mutation
         await SessionManager.push_undo_snapshot(request.session_id, html_content, table_type)
 
-        # Parse HTML to check cell state
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html_content, 'html.parser')
-        row = soup.find('tr', id=request.row_id)
-        if not row:
-            raise HTTPException(status_code=404, detail=f"Row '{request.row_id}' not found")
-        
-        cell = None
-        for td in row.find_all('td', class_='field-value'):
-            if field_name in td.get('class', []):
-                cell = td
-                break
-        
-        if not cell:
-            raise HTTPException(status_code=404, detail=f"Field '{field_name}' not found in row")
-        
-        # Check if cell is empty by looking for any non-empty item-containers
-        containers = cell.find_all('span', class_='item-container', recursive=False)
-        
-        # Check if any container has a non-empty value
-        has_value = False
-        for container in containers:
-            item_data = container.find('span', class_='item-data')
-            if item_data and item_data.get_text(strip=True):
-                has_value = True
-                break
+        # Use HTMLParser helper to check cell state
+        has_value, container_count = HTMLParser.get_cell_state(
+            html_content, request.row_id, field_name
+        )
         
         if not has_value:
             # Path 1: Empty cell (any field type) → clear_cell + update_item_value
@@ -317,7 +295,7 @@ async def add_item_to_cell(request: AddItemRequest):
                 # Path 3: Non-empty multi-value field → add_item with separator
                 # Append new value after the last existing item
                 row_num = request.row_id.replace('row', '') if request.row_id.startswith('row') else request.row_id
-                ref_item_id = f"{row_num}-{field_name}-{len(containers)-1}"
+                ref_item_id = f"{row_num}-{field_name}-{container_count-1}"
                 
                 new_html, new_item_id = HTMLParser.add_item(
                     html_content, ref_item_id, separator, request.new_value
