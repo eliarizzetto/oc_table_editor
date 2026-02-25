@@ -231,15 +231,18 @@ async def edit_item(request: EditItemRequest):
 @router.post("/item/add")
 async def add_item_to_cell(request: AddItemRequest):
     """
-    Append a new item to a multi-value cell.
+    Add a new item to a cell.
 
+    Supports adding values to both single-value and multi-value fields:
+    - Empty cells (any field type): Initializes the cell with the value
+    - Non-empty multi-value fields: Appends the value with appropriate separator
+    - Non-empty single-value fields: Raises error (defensive, UI prevents this)
+    
     Can add either an empty item (for editing later) or a value directly.
     For adding with value, uses row_id and field_name parameters.
     For adding empty item (backward compatibility), uses item_id parameter.
 
-    Inserts a new .item-container at the end of the cell and adds an
-    appropriate .sep span to the previously-last container. The caller should
-    reload the table after this call.
+    The caller should reload the table after this call.
     """
     session = await SessionManager.load_session(request.session_id)
     if not session:
@@ -249,12 +252,10 @@ async def add_item_to_cell(request: AddItemRequest):
     if request.new_value is not None and request.row_id and request.field_name:
         # Adding with value directly
         field_name = request.field_name
-        if field_name not in HTMLParser.ITEM_SEPARATORS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Field '{field_name}' is not a multi-value field"
-            )
-        separator = HTMLParser.ITEM_SEPARATORS[field_name]
+        
+        # Determine if field is multi-value or single-value
+        is_multi_value = field_name in HTMLParser.ITEM_SEPARATORS
+        separator = HTMLParser.ITEM_SEPARATORS.get(field_name, None)
         
         # Always operate on the individual (parseable) HTML
         table_type = 'meta' if session.has_metadata else 'cits'
@@ -263,15 +264,11 @@ async def add_item_to_cell(request: AddItemRequest):
         if not html_content:
             raise HTTPException(status_code=404, detail="HTML content not found")
 
-        # Find any existing item in the cell to use as reference
-        # Try to find first item in the row-field combination
-        from bs4 import BeautifulSoup
-        
         # Save snapshot for undo BEFORE applying the mutation
         await SessionManager.push_undo_snapshot(request.session_id, html_content, table_type)
 
-        # Check if cell is empty
-        row_num = request.row_id.replace('row', '') if request.row_id.startswith('row') else request.row_id
+        # Parse HTML to check cell state
+        from bs4 import BeautifulSoup
         soup = BeautifulSoup(html_content, 'html.parser')
         row = soup.find('tr', id=request.row_id)
         if not row:
@@ -286,10 +283,21 @@ async def add_item_to_cell(request: AddItemRequest):
         if not cell:
             raise HTTPException(status_code=404, detail=f"Field '{field_name}' not found in row")
         
+        # Check if cell is empty by looking for any non-empty item-containers
         containers = cell.find_all('span', class_='item-container', recursive=False)
         
-        if not containers:
-            # Cell is empty, use clear_cell to initialize
+        # Check if any container has a non-empty value
+        has_value = False
+        for container in containers:
+            item_data = container.find('span', class_='item-data')
+            if item_data and item_data.get_text(strip=True):
+                has_value = True
+                break
+        
+        if not has_value:
+            # Path 1: Empty cell (any field type) → clear_cell + update_item_value
+            # Initialize the cell and set the value
+            # First clear any existing empty containers, then set the value
             new_html, new_item_id = HTMLParser.clear_cell(
                 html_content, request.row_id, field_name
             )
@@ -298,26 +306,48 @@ async def add_item_to_cell(request: AddItemRequest):
             # Update the empty item with the value
             new_html = HTMLParser.update_item_value(new_html, new_item_id, request.new_value)
         else:
-            # Cell has items, add new one after the last
-            ref_item_id = f"{row_num}-{field_name}-{len(containers)-1}"
-            
-            new_html, new_item_id = HTMLParser.add_item(
-                html_content, ref_item_id, separator, request.new_value
-            )
-            
-            if not new_item_id:
+            # Cell has existing values
+            if not is_multi_value:
+                # Path 2: Non-empty single-value field → raise error (defensive)
                 raise HTTPException(
-                    status_code=404,
-                    detail=f"Failed to add item. Reference item '{ref_item_id}' not found"
+                    status_code=400,
+                    detail=f"Cannot add to single-value field '{field_name}' that already has a value"
                 )
+            else:
+                # Path 3: Non-empty multi-value field → add_item with separator
+                # Append new value after the last existing item
+                row_num = request.row_id.replace('row', '') if request.row_id.startswith('row') else request.row_id
+                ref_item_id = f"{row_num}-{field_name}-{len(containers)-1}"
+                
+                new_html, new_item_id = HTMLParser.add_item(
+                    html_content, ref_item_id, separator, request.new_value
+                )
+                
+                if not new_item_id:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Failed to add item. Reference item '{ref_item_id}' not found"
+                    )
+
+        await SessionManager.save_html(request.session_id, new_html, table_type)
+
+        session.mark_edited()
+        await SessionManager.save_session(session)
+
+        return {
+            "success": True,
+            "new_item_id": new_item_id
+        }
 
     elif request.item_id:
-        # Backward compatibility: adding empty item
+        # Path 4: Backward compatibility - adding empty item to multi-value field
         parts = request.item_id.split('-')
         if len(parts) < 3:
             raise HTTPException(status_code=400,
                                 detail=f"Invalid item_id format: '{request.item_id}'")
         field_name = '-'.join(parts[1:-1])
+        
+        # This path is only for multi-value fields (backward compatibility)
         if field_name not in HTMLParser.ITEM_SEPARATORS:
             raise HTTPException(
                 status_code=400,
@@ -355,16 +385,6 @@ async def add_item_to_cell(request: AddItemRequest):
             status_code=400,
             detail="Must provide either (row_id, field_name, new_value) or item_id"
         )
-
-    await SessionManager.save_html(request.session_id, new_html, table_type)
-
-    session.mark_edited()
-    await SessionManager.save_session(session)
-
-    return {
-        "success": True,
-        "new_item_id": new_item_id
-    }
 
 
 @router.delete("/item")
