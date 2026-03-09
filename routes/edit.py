@@ -548,6 +548,9 @@ async def clear_cell_route(request: ClearCellRequest):
     Works for both multi-value and single-value fields.  Also serves as the
     "initialise" endpoint for cells that currently have no item-containers at
     all (e.g. a field that was empty in the original CSV).
+    
+    This function now tracks cleared items for ghost overlays, similar to
+    DeleteItemRequest and DeleteRowRequest, ensuring consistent change tracking.
     """
     session = await SessionManager.load_session(request.session_id)
     if not session:
@@ -557,6 +560,30 @@ async def clear_cell_route(request: ClearCellRequest):
     html_content = await SessionManager.load_html(request.session_id, table_type)
     if not html_content:
         raise HTTPException(status_code=404, detail="HTML content not found")
+
+    # Get all item-container IDs in the cell before clearing
+    cell_item_ids = HTMLParser.get_cell_item_ids(
+        html_content, request.row_id, request.field_name
+    )
+    
+    # Save deleted item states for ghost overlay (similar to DeleteItemRequest)
+    deleted_items = await SessionManager.load_deleted_item_state(request.session_id)
+    for item_id in cell_item_ids:
+        original_value = HTMLParser.get_field_data_by_item_id(html_content, item_id)
+        parts = item_id.split('-')
+        if len(parts) >= 3:
+            row_id = parts[0]
+            field_name = '-'.join(parts[1:-1])
+            
+            # Save deleted item state for ghost overlay
+            deleted_items[item_id] = DeletedItemState(
+                item_id=item_id,
+                original_value=original_value or '',
+                row_id=row_id,
+                field_name=field_name
+            )
+    
+    await SessionManager.save_deleted_item_state(request.session_id, deleted_items)
 
     # Save snapshot for undo BEFORE applying the mutation
     await SessionManager.push_undo_snapshot(request.session_id, html_content, table_type)
@@ -571,6 +598,13 @@ async def clear_cell_route(request: ClearCellRequest):
         )
 
     await SessionManager.save_html(request.session_id, new_html, table_type)
+
+    # Remove edit tracking for all cleared items (similar to DeleteItemRequest)
+    edit_states = await SessionManager.load_edit_state(request.session_id)
+    for item_id in cell_item_ids:
+        if item_id in edit_states:
+            del edit_states[item_id]
+    await SessionManager.save_edit_state(request.session_id, edit_states)
 
     session.mark_edited()
     await SessionManager.save_session(session)

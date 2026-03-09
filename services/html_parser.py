@@ -655,6 +655,40 @@ class HTMLParser:
         return [container.get('id', '') for container in item_containers if container.get('id')]
     
     @staticmethod
+    def get_cell_item_ids(html_content: str, row_id: str, field_name: str) -> List[str]:
+        """
+        Get all item-container IDs for a specific cell.
+        
+        Args:
+            html_content: HTML string containing the table
+            row_id: Row identifier (e.g., 'row5')
+            field_name: Name of the field / column (e.g., 'id', 'author')
+            
+        Returns:
+            List of item-container IDs in the cell
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        row = soup.find('tr', id=row_id)
+        
+        if not row:
+            return []
+        
+        # Locate the cell by its "field-value {field_name}" class pair
+        cell = None
+        for td in row.find_all('td', class_='field-value'):
+            if field_name in td.get('class', []):
+                cell = td
+                break
+        
+        if not cell:
+            return []
+        
+        # Find all item-containers in this cell
+        item_containers = cell.find_all('span', class_='item-container', recursive=False)
+        
+        return [container.get('id', '') for container in item_containers if container.get('id')]
+    
+    @staticmethod
     def get_all_row_ids(html_content: str) -> List[str]:
         """
         Get all row IDs from the table.
@@ -760,6 +794,26 @@ class HTMLParser:
                     item_data = container.find('span', class_='item-data')
                     if item_data:
                         deleted_item_values[item_id] = item_data.get_text(strip=False)
+            
+            # Check for value-based deletions (same ID but value cleared)
+            # This handles single-value fields where clear_cell reuses the same ID
+            common_items = baseline_items & current_items
+            for item_id in common_items:
+                baseline_container = baseline_row.find('span', id=item_id)
+                current_container = current_row.find('span', id=item_id)
+                
+                if baseline_container and current_container:
+                    baseline_data = baseline_container.find('span', class_='item-data')
+                    current_data = current_container.find('span', class_='item-data')
+                    
+                    if baseline_data and current_data:
+                        baseline_value = baseline_data.get_text(strip=False)
+                        current_value = current_data.get_text(strip=False)
+                        
+                        # If baseline had value but current is empty → treat as deletion
+                        if baseline_value.strip() and not current_value.strip():
+                            deleted_items.append(item_id)
+                            deleted_item_values[item_id] = baseline_value
         
         return {
             'deleted_items': deleted_items,
