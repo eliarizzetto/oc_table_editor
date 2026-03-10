@@ -46,6 +46,7 @@ body {
 }
 
 #table-data .row-number {
+    position: relative;       /* make the cell a positioning context */
     background-color: #e9ecef;
     font-weight: bold;
     text-align: center;
@@ -204,43 +205,6 @@ span.item-data:has(~ span.issue-icon.warning) {
     background-color: #f8f9fa;
 }
 
-/* ── "Add first value" placeholder in cells with no containers ──────────── */
-
-.add-first-item-btn {
-    font-size: 0.78em;
-    padding: 1px 6px;
-    line-height: 1.5;
-    opacity: 0;               /* hidden until cell is hovered */
-    transition: opacity 0.15s;
-}
-
-td.field-value:hover .add-first-item-btn {
-    opacity: 0.5;
-}
-
-td.field-value:hover .add-first-item-btn:hover {
-    opacity: 1;
-}
-
-/* ── Add item button (for multi-value fields with existing items) ──────── */
-
-.add-item-btn {
-    font-size: 0.7em;
-    padding: 0 4px;
-    line-height: 1;
-    opacity: 0;               /* hidden until cell is hovered */
-    transition: opacity 0.15s;
-    vertical-align: middle;
-    margin-left: 3px;
-}
-
-td.field-value:hover .add-item-btn {
-    opacity: 0.5;
-}
-
-td.field-value:hover .add-item-btn:hover {
-    opacity: 1;
-}
 
 /* ── Add row button (at the end of tbody) ──────────────────────────────── */
 
@@ -249,46 +213,6 @@ td.field-value:hover .add-item-btn:hover {
     width: 100%;
 }
 
-/* ── Delete-row button (injected into .row-number cell) ─────────────────── */
-
-.delete-row-btn {
-    font-size: 0.7em;
-    padding: 0 2px;
-    line-height: 1;
-    opacity: 0;               /* hidden until row is hovered */
-    transition: opacity 0.15s;
-    vertical-align: middle;
-    margin-left: 2px;
-}
-
-tr:hover .delete-row-btn {
-    opacity: 0.6;
-}
-
-tr:hover .delete-row-btn:hover {
-    opacity: 1;
-}
-
-/* ── Clear-cell button (injected into each .field-value cell) ───────────── */
-
-.clear-cell-btn {
-    font-size: 0.7em;
-    padding: 0 2px;
-    line-height: 1;
-    opacity: 0;               /* hidden until cell is hovered */
-    transition: opacity 0.15s;
-    vertical-align: middle;
-    margin-left: 3px;
-    white-space: nowrap;
-}
-
-td.field-value:hover .clear-cell-btn {
-    opacity: 0.5;
-}
-
-td.field-value:hover .clear-cell-btn:hover {
-    opacity: 1;
-}
 
 /* Modal */
 .modal-dialog {
@@ -398,3 +322,60 @@ td.field-value:hover .clear-cell-btn:hover {
     text-align: center;
     padding: 1px 0;
 }
+
+.table-action {
+    font-size: 0.8em;
+    padding: 0.2em 0.2em;
+    line-height: 1.1;
+    border: 1px solid #ced4da;
+    border-radius: 2px;
+    background: white;
+    color: #6c757d;
+    cursor: pointer;
+    vertical-align: middle;
+    opacity: 0;
+    transition: opacity 0.15s, background 0.15s;
+}
+
+.table-action:hover {
+    background: #f1f3f5;
+    color: #212529;
+}
+
+td.field-value:hover .table-action {
+    opacity: 0.7;
+}
+
+td.field-value:hover .table-action:hover {
+    opacity: 1;
+}
+
+.add-item-btn:hover, .add-first-item.btn:hover {
+    background-color: rgba(0, 128, 0, 0.582);
+}
+
+.clear-cell-btn:hover {
+    background-color: rgba(255, 0, 0, 0.486);
+}
+
+td.row-number .delete-row-btn {
+    display: block;
+    margin: 2px auto 0 auto;
+}
+
+tr:hover .delete-row-btn {
+    opacity: 0.7;
+}
+
+.delete-row-btn:hover {
+    background-color: rgba(255, 0, 0, 0.63);
+    opacity: 1;
+}
+
+.add-row-btn {
+    line-height: 1.1;
+    border: 1px solid #ced4da;
+    border-radius: 2px;
+    background-color: rgba(0, 128, 0, 0.74);
+}
+
