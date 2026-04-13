@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from services import SessionManager, HTMLParser, ValidatorService, CSVExporter
+from services.validator_service import load_jsonl_report
 from models import Session, EditState, RowChangeState, DeletedItemState
 from config import TEMP_DIR
 
@@ -23,7 +24,7 @@ router = APIRouter()
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _generate_html(csv_fp: str, report_fp: str, out_fp: str, errors: list) -> None:
+def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool) -> None:
     """
     Generate an HTML visualisation for a validated CSV table.
 
@@ -32,7 +33,7 @@ def _generate_html(csv_fp: str, report_fp: str, out_fp: str, errors: list) -> No
     relative path that does not exist in this project).  We detect this and
     delegate to ``ValidatorService._make_no_errors_html`` instead.
     """
-    if not errors:
+    if is_valid:
         ValidatorService._make_no_errors_html(out_fp, csv_fp)
     else:
         make_gui(csv_fp, report_fp, out_fp)
@@ -683,7 +684,7 @@ async def revalidate(request: RevalidateRequest):
                 f.write(cits_csv_content)
 
             # Run paired validation via ClosureValidator
-            meta_errors, cits_errors, meta_report_path, cits_report_path = \
+            meta_is_valid, cits_is_valid, meta_report_path, cits_report_path = \
                 ValidatorService.validate_pair(
                     meta_csv_path=str(temp_meta_csv),
                     cits_csv_path=str(temp_cits_csv),
@@ -697,9 +698,9 @@ async def revalidate(request: RevalidateRequest):
             cits_table_path = session_dir / 'cits_table.html'
 
             _generate_html(str(temp_meta_csv), meta_report_path,
-                           str(meta_table_path), meta_errors)
+                           str(meta_table_path), meta_is_valid)
             _generate_html(str(temp_cits_csv), cits_report_path,
-                           str(cits_table_path), cits_errors)
+                           str(cits_table_path), cits_is_valid)
 
             with open(meta_table_path, 'r', encoding='utf-8') as f:
                 new_meta_html = f.read()
@@ -725,7 +726,7 @@ async def revalidate(request: RevalidateRequest):
             session.meta_report_path = meta_report_path
             session.cits_report_path = cits_report_path
 
-            total_error_count = len(meta_errors) + len(cits_errors)
+            total_error_count = len(load_jsonl_report(meta_report_path)) + len(load_jsonl_report(cits_report_path))
 
             # Clean up temp files
             temp_meta_csv.unlink(missing_ok=True)
@@ -757,11 +758,11 @@ async def revalidate(request: RevalidateRequest):
             with open(temp_csv_path, 'w', encoding='utf-8') as f:
                 f.write(csv_content)
 
-            # Run validation — returns (errors, report_path) directly.
+            # Run validation — returns (is_valid, report_path) directly.
             # The report_path is taken from validator.output_fp_json, so it is
             # always the file that was *just* written, regardless of how many
             # previous runs have created incrementing suffixes in the directory.
-            errors, report_path = ValidatorService.validate_single(
+            is_valid, report_path = ValidatorService.validate_single(
                 csv_path=str(temp_csv_path),
                 output_dir=str(session_dir),
                 verify_id_existence=verify_id
@@ -770,7 +771,7 @@ async def revalidate(request: RevalidateRequest):
             # Generate new HTML using the freshly written report
             temp_html_path = session_dir / 'temp_revalidate.html'
             _generate_html(str(temp_csv_path), report_path,
-                           str(temp_html_path), errors)
+                           str(temp_html_path), is_valid)
 
             with open(temp_html_path, 'r', encoding='utf-8') as f:
                 new_html = f.read()
@@ -789,7 +790,7 @@ async def revalidate(request: RevalidateRequest):
             else:
                 session.cits_report_path = report_path
 
-            total_error_count = len(errors)
+            total_error_count = len(load_jsonl_report(report_path))
 
             # Clean up temp files
             temp_csv_path.unlink(missing_ok=True)

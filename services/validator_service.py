@@ -1,14 +1,37 @@
 """Service for running validation using oc_validator."""
+import json
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
-import json
 
 # Add parent directory to path to import oc_validator
 parent_dir = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(parent_dir))
 
 from oc_validator.main import Validator, ClosureValidator
+
+
+def load_jsonl_report(jsonl_path: str) -> list[dict]:
+    """
+    Load a JSON-Lines validation report into a single in-memory list.
+
+    Reads each line of the ``.jsonl`` file produced by ``oc_validator`` and
+    returns the collected error dictionaries.
+
+    Args:
+        jsonl_path: Path to the ``.jsonl`` validation report file.
+
+    Returns:
+        A list of error dictionaries.  Empty if the file does not exist or
+        contains no valid JSON lines.
+    """
+    errors: list[dict] = []
+    with open(jsonl_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                errors.append(json.loads(line))
+    return errors
 
 
 class ValidatorService:
@@ -47,7 +70,7 @@ class ValidatorService:
             f.write(html)
 
     @staticmethod
-    def validate_single(csv_path: str, output_dir: str, verify_id_existence: bool = False) -> Tuple[list, str]:
+    def validate_single(csv_path: str, output_dir: str, verify_id_existence: bool = False) -> Tuple[bool, str]:
         """
         Validate a single CSV file (metadata OR citations — auto-detected).
 
@@ -57,7 +80,7 @@ class ValidatorService:
             verify_id_existence: Whether to check ID existence via external APIs.
 
         Returns:
-            Tuple of (error_list, report_json_path).
+            Tuple of (is_valid, report_jsonl_path).
         """
         validator = Validator(
             csv_doc=csv_path,
@@ -65,11 +88,11 @@ class ValidatorService:
             use_meta_endpoint=False,
             verify_id_existence=verify_id_existence
         )
-        errors = validator.validate()
-        return errors, validator.output_fp_json
+        is_valid = validator.validate()
+        return is_valid, validator.output_fp_json
 
     @staticmethod
-    def validate_metadata(csv_path: str, output_dir: str, verify_id_existence: bool = False) -> Tuple[list, str]:
+    def validate_metadata(csv_path: str, output_dir: str, verify_id_existence: bool = False) -> Tuple[bool, str]:
         """
         Validate a metadata CSV file.
 
@@ -79,12 +102,12 @@ class ValidatorService:
             verify_id_existence: Whether to check ID existence via external APIs.
 
         Returns:
-            Tuple of (error_list, report_json_path).
+            Tuple of (is_valid, report_jsonl_path).
         """
         return ValidatorService.validate_single(csv_path, output_dir, verify_id_existence)
 
     @staticmethod
-    def validate_citations(csv_path: str, output_dir: str, verify_id_existence: bool = False) -> Tuple[list, str]:
+    def validate_citations(csv_path: str, output_dir: str, verify_id_existence: bool = False) -> Tuple[bool, str]:
         """
         Validate a citations CSV file.
 
@@ -94,7 +117,7 @@ class ValidatorService:
             verify_id_existence: Whether to check ID existence via external APIs.
 
         Returns:
-            Tuple of (error_list, report_json_path).
+            Tuple of (is_valid, report_jsonl_path).
         """
         return ValidatorService.validate_single(csv_path, output_dir, verify_id_existence)
 
@@ -105,7 +128,7 @@ class ValidatorService:
         meta_output_dir: str,
         cits_output_dir: str,
         verify_id_existence: bool = False
-    ) -> Tuple[list, list, str, str]:
+    ) -> Tuple[bool, bool, str, str]:
         """
         Validate paired metadata and citations CSV files using ClosureValidator.
 
@@ -117,17 +140,17 @@ class ValidatorService:
             verify_id_existence: Whether to check ID existence via external APIs.
 
         Returns:
-            Tuple of (meta_errors, cits_errors, meta_report_json_path, cits_report_json_path).
+            Tuple of (meta_is_valid, cits_is_valid, meta_report_jsonl_path, cits_report_jsonl_path).
         """
         validator = ClosureValidator(
-            meta_csv_doc=meta_csv_path,
-            meta_output_dir=meta_output_dir,
-            cits_csv_doc=cits_csv_path,
-            cits_output_dir=cits_output_dir,
+            meta_in=meta_csv_path,
+            meta_out_dir=meta_output_dir,
+            cits_in=cits_csv_path,
+            cits_out_dir=cits_output_dir,
             meta_kwargs={'verify_id_existence': verify_id_existence},
             cits_kwargs={'verify_id_existence': verify_id_existence}
         )
-        meta_errors, cits_errors = validator.validate()
+        meta_is_valid, cits_is_valid = validator.validate()
         meta_report_path = validator.meta_validator.output_fp_json
         cits_report_path = validator.cits_validator.output_fp_json
-        return meta_errors, cits_errors, meta_report_path, cits_report_path
+        return meta_is_valid, cits_is_valid, meta_report_path, cits_report_path

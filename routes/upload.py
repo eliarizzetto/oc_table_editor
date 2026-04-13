@@ -18,7 +18,7 @@ from oc_validator.interface.gui import make_gui, merge_html_files
 router = APIRouter()
 
 
-def _generate_html(csv_fp: str, report_fp: str, out_fp: str, errors: list) -> None:
+def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool) -> None:
     """
     Generate an HTML visualisation for a validated CSV table.
 
@@ -30,12 +30,11 @@ def _generate_html(csv_fp: str, report_fp: str, out_fp: str, errors: list) -> No
 
     Args:
         csv_fp:    Path to the original CSV file.
-        report_fp: Path to the JSON validation report.
+        report_fp: Path to the JSON-Lines validation report.
         out_fp:    Destination HTML file path.
-        errors:    The list of errors returned by the validator (used to decide
-                   which code path to take).
+        is_valid:  Whether the validation passed (True = no errors).
     """
-    if not errors:
+    if is_valid:
         ValidatorService._make_no_errors_html(out_fp, csv_fp)
     else:
         make_gui(csv_fp, report_fp, out_fp)
@@ -117,7 +116,7 @@ async def upload_files(
     try:
         if has_metadata and has_citations:
             # ── Paired validation via ClosureValidator ──────────────────────
-            meta_errors, cits_errors, meta_report_path, cits_report_path = \
+            meta_is_valid, cits_is_valid, meta_report_path, cits_report_path = \
                 ValidatorService.validate_pair(
                     meta_csv_path=session.meta_csv_path,
                     cits_csv_path=session.cits_csv_path,
@@ -135,9 +134,9 @@ async def upload_files(
             cits_table_path = session_dir / 'cits_table.html'
 
             _generate_html(session.meta_csv_path, meta_report_path,
-                            str(meta_table_path), meta_errors)
+                            str(meta_table_path), meta_is_valid)
             _generate_html(session.cits_csv_path, cits_report_path,
-                            str(cits_table_path), cits_errors)
+                            str(cits_table_path), cits_is_valid)
 
             # Save individual tables through session manager (meta_table.html,
             # cits_table.html) so that re-validation can parse them later.
@@ -167,7 +166,7 @@ async def upload_files(
 
         elif has_metadata:
             # ── Single metadata table ───────────────────────────────────────
-            meta_errors, meta_report_path = ValidatorService.validate_metadata(
+            meta_is_valid, meta_report_path = ValidatorService.validate_metadata(
                 csv_path=session.meta_csv_path,
                 output_dir=str(session_dir),
                 verify_id_existence=verify_id_existence
@@ -177,7 +176,7 @@ async def upload_files(
 
             meta_table_path = session_dir / 'meta_table.html'
             _generate_html(session.meta_csv_path, meta_report_path,
-                            str(meta_table_path), meta_errors)
+                            str(meta_table_path), meta_is_valid)
 
             with open(meta_table_path, 'r', encoding='utf-8') as f:
                 meta_html_content = f.read()
@@ -190,7 +189,7 @@ async def upload_files(
 
         elif has_citations:
             # ── Single citations table ──────────────────────────────────────
-            cits_errors, cits_report_path = ValidatorService.validate_citations(
+            cits_is_valid, cits_report_path = ValidatorService.validate_citations(
                 csv_path=session.cits_csv_path,
                 output_dir=str(session_dir),
                 verify_id_existence=verify_id_existence
@@ -200,7 +199,7 @@ async def upload_files(
 
             cits_table_path = session_dir / 'cits_table.html'
             _generate_html(session.cits_csv_path, cits_report_path,
-                            str(cits_table_path), cits_errors)
+                            str(cits_table_path), cits_is_valid)
 
             with open(cits_table_path, 'r', encoding='utf-8') as f:
                 cits_html_content = f.read()
