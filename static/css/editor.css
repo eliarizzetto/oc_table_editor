@@ -16,7 +16,7 @@ body {
 
 /* Table styles */
 #table-data {
-    font-size: 0.72em;
+    font-size: 0.8em;
     width: 100%;
     table-layout: fixed;
 }
@@ -324,17 +324,23 @@ span.item-data:has(~ span.issue-icon.warning) {
 }
 
 .table-action {
-    font-size: 0.8em;
-    padding: 0.2em 0.2em;
-    line-height: 1.1;
+    width: 1.5em;
+    height: 1.5em;
+    font-size: 1rem;
+    padding: 0;
     border: 1px solid #ced4da;
     border-radius: 2px;
     background: white;
     color: #6c757d;
     cursor: pointer;
-    vertical-align: middle;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
     opacity: 0;
     transition: opacity 0.15s, background 0.15s;
+    margin: 0.2em;
 }
 
 .table-action:hover {
@@ -350,7 +356,7 @@ td.field-value:hover .table-action:hover {
     opacity: 1;
 }
 
-.add-item-btn:hover, .add-first-item.btn:hover {
+.add-item-btn:hover, .add-first-item-btn:hover {
     background-color: rgba(0, 128, 0, 0.582);
 }
 
@@ -378,4 +384,3 @@ tr:hover .delete-row-btn {
     border-radius: 2px;
     background-color: rgba(0, 128, 0, 0.74);
 }
-
