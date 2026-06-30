@@ -1,12 +1,7 @@
 """Service for running validation using oc_validator."""
 import json
-import sys
 from pathlib import Path
 from typing import Optional, Tuple
-
-# Add parent directory to path to import oc_validator
-parent_dir = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(parent_dir))
 
 from oc_validator.main import Validator, ClosureValidator
 

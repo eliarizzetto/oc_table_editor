@@ -2,17 +2,11 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Dict, List, Optional
-import sys
-from pathlib import Path
 
 from services import SessionManager, HTMLParser, ValidatorService, CSVExporter
 from services.validator_service import load_jsonl_report
 from models import Session, EditState, RowChangeState, DeletedItemState
 from config import TEMP_DIR
-
-# Add parent directory to path to import oc_validator
-parent_dir = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(parent_dir))
 
 # Import oc_validator interface for HTML generation and merging
 from oc_validator.interface.gui import make_gui, merge_html_files

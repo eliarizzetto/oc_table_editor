@@ -4,15 +4,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 from io import StringIO
-import sys
-from pathlib import Path
 
 from services import SessionManager, HTMLParser, CSVExporter
 from models import Session
-
-# Add parent directory to path to import oc_validator
-parent_dir = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(parent_dir))
 
 router = APIRouter()
 

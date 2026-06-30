@@ -1,5 +1,4 @@
 """OC Table Editor - Main application entry point."""
-import sys
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -7,10 +6,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from contextlib import asynccontextmanager
 import aiofiles
-
-# Add parent directory to path to import oc_validator
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(parent_dir))
 
 from config import (
     SESSION_DIR,
