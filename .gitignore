@@ -213,3 +213,6 @@ storage/
 # for sessions
 temp/
 tmp/
+
+# Claude code
+.claude
