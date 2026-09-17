@@ -1,31 +1,32 @@
-"""Edit operations routes.
+"""Edit operations routes — event-sourced.
 
-All mutations are row-scoped and run against the in-memory document cache
-(``services.session_document``): the session's parsed tree is mutated once
-and only the affected ``<tr>`` is re-serialised and spliced into the
-canonical HTML string.  Responses additionally carry ``row_html`` /
-``row_id`` so the frontend can patch a single row in place (Phase B) instead
-of reloading the whole table.
+Mutations append normalized events to the session's change journal
+(``services/journal.py``) and return the affected row's HTML (computed by
+``services/view_builder.py`` from the immutable baseline + replayed events)
+so the frontend can patch a single ``<tr>`` in place.  No route parses a
+whole document or writes a 12 MB file: the only full parses happen inside
+upload/revalidate (artifact building), and the only big writes happen on
+Save (commit) and revalidate.
 """
 import asyncio
-
+import json
 from pathlib import Path
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Dict, List, Optional
-from bs4 import BeautifulSoup
+from typing import List, Optional
 
 from services import SessionManager, HTMLParser, ValidatorService, CSVExporter
-from services.session_document import (
-    SpliceError,
-    SessionDocument,
-    compose_display,
-    document_cache,
-    find_row_bounds,
-    next_row_id_in_str,
-)
+from services.journal import ChangeJournal
+from services.session_document import compose_display, document_cache
 from services.validator_service import load_jsonl_report
-from models import Session, EditState, RowChangeState, DeletedItemState
+from services.view_builder import (
+    TableView,
+    build_generation_artifacts,
+    load_journal_view,
+    load_table_state,
+)
+from models import Session
 from config import TEMP_DIR
 
 # Import oc_validator interface for HTML generation and merging
@@ -54,20 +55,8 @@ def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool) -> 
 
 
 def _editable_table_type(session: Session) -> str:
-    """The table HTML that mutations operate on ('meta' or 'cits')."""
+    """The table the journal edits ('meta' or 'cits')."""
     return 'meta' if session.has_metadata else 'cits'
-
-
-async def _get_editable_doc(session_id: str, session: Session) -> SessionDocument:
-    """Load the editable document for a session or raise 404.
-
-    Caller must hold the session lock.
-    """
-    table_type = _editable_table_type(session)
-    doc = await document_cache.get_document(session_id, table_type)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="HTML content not found")
-    return doc
 
 
 def _row_id_for_item(item_id: str) -> str:
@@ -75,28 +64,46 @@ def _row_id_for_item(item_id: str) -> str:
     return f"row{item_id.split('-')[0]}"
 
 
-def _mark_tracked_rows(html_content: str, edited_ids: List[str],
-                       added_ids: List[str], added_row_ids: List[str]) -> str:
-    """Apply edited/added tracking classes to the served HTML via row splices.
+def _field_for_item(item_id: str) -> str:
+    parts = item_id.split('-')
+    return '-'.join(parts[1:-1]) if len(parts) >= 3 else ''
 
-    Rows whose anchor cannot be found are skipped (mirrors the tolerant
-    'if container:' behaviour of the old full-document tracking pass).
+
+async def _load_view(session_id: str, session: Session):
+    """Load (journal, view, table_state) for the editable table.
+
+    Caller must hold the session lock.  Raises 404 when the baseline
+    (base) is missing.
     """
-    rows_to_mark = ({_row_id_for_item(i) for i in edited_ids}
-                    | {_row_id_for_item(i) for i in added_ids}
-                    | set(added_row_ids))
-    for row_id in rows_to_mark:
-        try:
-            start, end = find_row_bounds(html_content, row_id)
-        except SpliceError:
-            continue
-        marked = HTMLParser.apply_tracking_to_row_html(
-            html_content[start:end], edited_ids, added_ids,
-            row_id in added_row_ids
-        )
-        if marked != html_content[start:end]:
-            html_content = html_content[:start] + marked + html_content[end:]
-    return html_content
+    loaded = await load_journal_view(session_id, _editable_table_type(session))
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="HTML content not found")
+    return loaded
+
+
+def _recompute(state: dict, journal: ChangeJournal) -> TableView:
+    return TableView(state['base_html'], state['artifacts'],
+                     journal.applied_events)
+
+
+def _base_item_values(state: dict) -> dict:
+    """Flat {item_id: value} of the baseline, for original-value lookups."""
+    out = {}
+    for fields in state['artifacts'].get('rows', {}).values():
+        for items in fields.values():
+            for item_id, value in items:
+                out[item_id] = value
+    return out
+
+
+def _cleanup_legacy_state_files(session_id: str) -> None:
+    """Remove pre-journal tracking files if a session still carries them."""
+    session_dir = TEMP_DIR / session_id
+    for name in ('edit_state.json', 'row_change_state.json',
+                 'deleted_item_state.json', 'undo_state.json'):
+        (session_dir / name).unlink(missing_ok=True)
+    import shutil
+    shutil.rmtree(session_dir / 'undo', ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +158,10 @@ class UndoRedoRequest(BaseModel):
     session_id: str
 
 
+class CommitRequest(BaseModel):
+    session_id: str
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -158,45 +169,25 @@ class UndoRedoRequest(BaseModel):
 @router.get("/html/{session_id}")
 async def get_html(session_id: str):
     """
-    Get current HTML content for a session.
+    Get the current table HTML for a session (baseline + journal events).
 
-    For paired sessions (metadata + citations) the display document is
-    *derived* on the fly from the two canonical tables (the merged
-    ``meta_html.html`` file is only written at upload/revalidate for
-    compatibility), so edits and undo/redo are always reflected immediately.
+    For paired sessions the display document is derived on the fly from the
+    meta view and the citations base, so edits, added rows, and undo/redo
+    are always reflected immediately.
     """
     session = await SessionManager.load_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if session.has_metadata and session.has_citations:
-        meta_doc = await document_cache.get_document(session_id, 'meta')
-        cits_doc = await document_cache.get_document(session_id, 'cits')
-        if meta_doc is None or cits_doc is None:
-            raise HTTPException(status_code=404, detail="HTML content not found")
-        html_content = compose_display(meta_doc.canonical, cits_doc.canonical)
-    elif session.has_metadata:
-        doc = await document_cache.get_document(session_id, 'meta')
-        if doc is None:
-            raise HTTPException(status_code=404, detail="HTML content not found")
-        html_content = doc.canonical
-    else:
-        doc = await document_cache.get_document(session_id, 'cits')
-        if doc is None:
-            raise HTTPException(status_code=404, detail="HTML content not found")
-        html_content = doc.canonical
-
-    # Apply edit-tracking highlights (grey background on edited items,
-    # green on added items/rows) via row splices — no full re-parse.
-    edit_states = await SessionManager.load_edit_state(session_id)
-    row_change_states = await SessionManager.load_row_change_state(session_id)
-    edited_ids = [i for i, s in edit_states.items() if s.edited]
-    added_ids = [i for i, s in edit_states.items() if s.added]
-    added_row_ids = [r for r, s in row_change_states.items() if s.added]
-    if edited_ids or added_ids or added_row_ids:
-        html_content = _mark_tracked_rows(
-            html_content, edited_ids, added_ids, added_row_ids
-        )
+    async with document_cache.session_lock(session_id):
+        journal, view, state = await _load_view(session_id, session)
+        if session.has_metadata and session.has_citations:
+            cits_state = await load_table_state(session_id, 'cits')
+            if cits_state is None:
+                raise HTTPException(status_code=404, detail="HTML content not found")
+            html_content = compose_display(view.html, cits_state['base_html'])
+        else:
+            html_content = view.html
 
     return {"html": html_content}
 
@@ -204,13 +195,8 @@ async def get_html(session_id: str):
 @router.post("/item")
 async def edit_item(request: EditItemRequest):
     """
-    Edit a single item in the table.
-
-    The edit is applied to the *individual* table HTML (``meta_table.html``
-    for metadata, ``cits_table.html`` for citations).  For paired sessions
-    the served display is derived from the individual tables, so the change
-    is visible immediately.  The response carries the updated ``row_html``
-    so the frontend can patch the row in place.
+    Edit a single item — appends a ``set_item`` (or ``remove_item`` when a
+    multi-value item is emptied, mirroring the auto-remove behaviour) event.
     """
     session = await SessionManager.load_session(request.session_id)
     if not session:
@@ -218,95 +204,53 @@ async def edit_item(request: EditItemRequest):
 
     table_type = _editable_table_type(session)
     row_id = _row_id_for_item(request.item_id)
+    field_name = _field_for_item(request.item_id)
 
     async with document_cache.session_lock(request.session_id):
-        doc = await _get_editable_doc(request.session_id, session)
-        try:
-            soup = await doc.ensure_soup()
+        journal, view, state = await _load_view(request.session_id, session)
+        bs, row = view.row_soup(row_id)
+        if row is None:
+            raise HTTPException(status_code=404,
+                                detail=f"Item '{request.item_id}' not found")
 
-            original_value = HTMLParser.get_item_value_from_soup(soup, request.item_id)
-            if original_value is None:
-                raise HTTPException(status_code=404,
-                                    detail=f"Item '{request.item_id}' not found")
+        original_value = HTMLParser.get_item_value_from_soup(bs, request.item_id)
+        if original_value is None:
+            raise HTTPException(status_code=404,
+                                detail=f"Item '{request.item_id}' not found")
 
-            pre_row_html = doc.row_html_or_none(row_id)
-            if pre_row_html is None:
-                raise HTTPException(status_code=500,
-                                    detail=f"Row '{row_id}' not found in document")
-
-            # Snapshot for undo BEFORE applying the mutation
-            await SessionManager.push_undo_row_snapshot(
-                request.session_id, table_type, row_id, pre_row_html
-            )
-
-            HTMLParser.update_item_value_in_soup(soup, request.item_id, request.new_value)
-
-            # Auto-remove empty items from multi-value fields so that no stray
-            # separators are left in the HTML (and therefore in the exported CSV).
-            _MULTI_VALUE_FIELDS = set(HTMLParser.ITEM_SEPARATORS.keys())
-            parts = request.item_id.split('-')
-            if len(parts) >= 3:
-                field_name = '-'.join(parts[1:-1])
-                if field_name in _MULTI_VALUE_FIELDS and request.new_value.strip() == '':
-                    HTMLParser.remove_item_in_soup(soup, request.item_id)
-
-            new_row_html = doc.commit_row(row_id)
-            await doc.persist()
-        except HTTPException:
-            raise
-        except Exception:
-            # Tree and canonical string may have diverged — rebuild from disk
-            document_cache.drop_document(request.session_id, table_type)
-            raise
-
-        # Track the edit
-        edit_states = await SessionManager.load_edit_state(request.session_id)
-        if request.item_id not in edit_states:
-            edit_states[request.item_id] = EditState(
-                item_id=request.item_id,
-                original_value=original_value,
-                edited_value=request.new_value,
-                edited=True
-            )
+        is_multi_value = field_name in HTMLParser.ITEM_SEPARATORS
+        if is_multi_value and request.new_value.strip() == '':
+            # Edit-to-empty on a multi-value field is a removal (no stray
+            # separators in the exported CSV; ghost semantics rely on it).
+            await journal.append('remove_item', row=row_id,
+                                 item=request.item_id, field=field_name)
         else:
-            edit_states[request.item_id].edited_value = request.new_value
-            edit_states[request.item_id].edited = True
-        await SessionManager.save_edit_state(request.session_id, edit_states)
+            await journal.append('set_item', row=row_id,
+                                 item=request.item_id, field=field_name,
+                                 value=request.new_value)
 
+        new_view = _recompute(state, journal)
         session.mark_edited()
         await SessionManager.save_session(session)
 
-    row_html_out = HTMLParser.apply_tracking_to_row_html(
-        new_row_html, [request.item_id], [], False
-    )
     return {
         "success": True,
         "original_value": original_value,
         "new_value": request.new_value,
         "row_id": row_id,
-        "row_html": row_html_out
+        "row_html": new_view.row_html(row_id)
     }
 
 
 @router.post("/item/add")
 async def add_item_to_cell(request: AddItemRequest):
     """
-    Add a new item to a cell.
-
-    Supports adding values to both single-value and multi-value fields:
-    - Empty cells (any field type): Initializes the cell with the value
-    - Non-empty multi-value fields: Appends the value with appropriate separator
-    - Non-empty single-value fields: Raises error (defensive, UI prevents this)
-
-    Can add either an empty item (for editing later) or a value directly.
-    For adding with value, uses row_id and field_name parameters.
-    For adding empty item (backward compatibility), uses item_id parameter.
+    Add a new item to a cell — appends an ``init_cell`` (empty cell) or
+    ``append_item`` (non-empty multi-value cell) event.
     """
     session = await SessionManager.load_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-
-    table_type = _editable_table_type(session)
 
     if request.new_value is not None and request.row_id and request.field_name:
         # ── Adding with value directly ─────────────────────────────────────
@@ -314,132 +258,78 @@ async def add_item_to_cell(request: AddItemRequest):
         is_multi_value = field_name in HTMLParser.ITEM_SEPARATORS
 
         async with document_cache.session_lock(request.session_id):
-            doc = await _get_editable_doc(request.session_id, session)
-            try:
-                soup = await doc.ensure_soup()
-                row = soup.find('tr', id=request.row_id)
-                if row is None:
+            journal, view, state = await _load_view(request.session_id, session)
+            bs, row = view.row_soup(request.row_id)
+            if row is None:
+                raise HTTPException(status_code=404,
+                                    detail=f"Row '{request.row_id}' not found")
+
+            has_value, _ = HTMLParser.get_cell_state_in_row(row, field_name)
+
+            if not has_value:
+                new_item_id = f"{request.row_id[3:]}-{field_name}-0"
+                await journal.append('init_cell', row=request.row_id,
+                                     field=field_name, value=request.new_value)
+            elif not is_multi_value:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot add to single-value field '{field_name}' "
+                           f"that already has a value"
+                )
+            else:
+                new_item_id = HTMLParser.next_item_id_in_cell(row, field_name)
+                if not new_item_id:
                     raise HTTPException(status_code=404,
-                                        detail=f"Row '{request.row_id}' not found")
+                                        detail=f"Field '{field_name}' not found")
+                await journal.append('append_item', row=request.row_id,
+                                     field=field_name, value=request.new_value)
 
-                has_value, _container_count = HTMLParser.get_cell_state_in_row(
-                    row, field_name
-                )
-
-                pre_row_html = doc.row_html_or_none(request.row_id)
-                if pre_row_html is None:
-                    raise HTTPException(status_code=500,
-                                        detail=f"Row '{request.row_id}' not found in document")
-
-                await SessionManager.push_undo_row_snapshot(
-                    request.session_id, table_type, request.row_id, pre_row_html
-                )
-
-                if not has_value:
-                    # Path 1: Empty cell (any field type) → clear_cell + set value
-                    new_item_id = HTMLParser.clear_cell_in_soup(soup, row, field_name)
-                    if not new_item_id:
-                        raise HTTPException(status_code=404, detail="Failed to initialize cell")
-                    HTMLParser.update_item_value_in_soup(soup, new_item_id, request.new_value)
-                elif not is_multi_value:
-                    # Path 2: Non-empty single-value field → error (defensive)
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Cannot add to single-value field '{field_name}' that already has a value"
-                    )
-                else:
-                    # Path 3: Non-empty multi-value field → append with separator
-                    new_item_id = HTMLParser.add_item_in_cell(
-                        soup, row, field_name, request.new_value
-                    )
-
-                new_row_html = doc.commit_row(request.row_id)
-                await doc.persist()
-            except HTTPException:
-                raise
-            except Exception:
-                document_cache.drop_document(request.session_id, table_type)
-                raise
-
-            # Mark the new item as added
-            edit_states = await SessionManager.load_edit_state(request.session_id)
-            edit_states[new_item_id] = EditState(
-                item_id=new_item_id,
-                original_value='',
-                edited_value=request.new_value,
-                added=True,
-                edited=False
-            )
-            await SessionManager.save_edit_state(request.session_id, edit_states)
-
+            new_view = _recompute(state, journal)
             session.mark_edited()
             await SessionManager.save_session(session)
 
-        row_html_out = HTMLParser.apply_tracking_to_row_html(
-            new_row_html, [], [new_item_id], False
-        )
         return {
             "success": True,
             "new_item_id": new_item_id,
             "row_id": request.row_id,
-            "row_html": row_html_out
+            "row_html": new_view.row_html(request.row_id)
         }
 
     elif request.item_id:
-        # ── Path 4: Backward compatibility - adding empty item ────────────
+        # ── Backward compatibility: adding an empty item ───────────────────
         parts = request.item_id.split('-')
         if len(parts) < 3:
             raise HTTPException(status_code=400,
                                 detail=f"Invalid item_id format: '{request.item_id}'")
         field_name = '-'.join(parts[1:-1])
-
         if field_name not in HTMLParser.ITEM_SEPARATORS:
             raise HTTPException(
                 status_code=400,
                 detail=f"Field '{field_name}' is not a multi-value field"
             )
-
         row_id = _row_id_for_item(request.item_id)
 
         async with document_cache.session_lock(request.session_id):
-            doc = await _get_editable_doc(request.session_id, session)
-            try:
-                soup = await doc.ensure_soup()
-                row = soup.find('tr', id=row_id)
-                if row is None:
-                    raise HTTPException(status_code=404,
-                                        detail=f"Item '{request.item_id}' not found in HTML")
-
-                pre_row_html = doc.row_html_or_none(row_id)
-                if pre_row_html is None:
-                    raise HTTPException(status_code=500,
-                                        detail=f"Row '{row_id}' not found in document")
-
-                await SessionManager.push_undo_row_snapshot(
-                    request.session_id, table_type, row_id, pre_row_html
-                )
-
-                new_item_id = HTMLParser.add_item_in_cell(soup, row, field_name, '')
-
-                new_row_html = doc.commit_row(row_id)
-                await doc.persist()
-            except HTTPException:
-                raise
-            except Exception:
-                document_cache.drop_document(request.session_id, table_type)
-                raise
-
+            journal, view, state = await _load_view(request.session_id, session)
+            bs, row = view.row_soup(row_id)
+            if row is None:
+                raise HTTPException(status_code=404,
+                                    detail=f"Item '{request.item_id}' not found in HTML")
+            new_item_id = HTMLParser.next_item_id_in_cell(row, field_name)
+            if not new_item_id:
+                raise HTTPException(status_code=404,
+                                    detail=f"Item '{request.item_id}' not found in HTML")
+            await journal.append('append_item', row=row_id,
+                                 field=field_name, value='')
+            new_view = _recompute(state, journal)
             session.mark_edited()
             await SessionManager.save_session(session)
 
-        row_html_out = HTMLParser.apply_tracking_to_row_html(
-            new_row_html, [], [new_item_id], False
-        )
         return {
             "success": True,
             "new_item_id": new_item_id,
             "row_id": row_id,
-            "row_html": row_html_out
+            "row_html": new_view.row_html(row_id)
         }
     else:
         raise HTTPException(
@@ -450,66 +340,33 @@ async def add_item_to_cell(request: AddItemRequest):
 
 @router.delete("/item")
 async def delete_item(request: DeleteItemRequest):
-    """
-    Delete a specific item from a multi-value cell.
-
-    Removes the item-container with the given item_id.  If there are multiple
-    items, separator cosmetics are handled by the frontend row replacement.
-    """
+    """Delete a specific item from a multi-value cell (``remove_item``)."""
     session = await SessionManager.load_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    table_type = _editable_table_type(session)
     row_id = _row_id_for_item(request.item_id)
+    field_name = _field_for_item(request.item_id)
 
     async with document_cache.session_lock(request.session_id):
-        doc = await _get_editable_doc(request.session_id, session)
-        try:
-            soup = await doc.ensure_soup()
+        journal, view, state = await _load_view(request.session_id, session)
+        bs, row = view.row_soup(row_id)
+        if row is None:
+            raise HTTPException(status_code=404,
+                                detail=f"Item '{request.item_id}' not found")
+        if HTMLParser.get_item_value_from_soup(bs, request.item_id) is None:
+            # Already absent — success no-op (matches the historical
+            # lenient behaviour of remove_item).
+            return {
+                "success": True,
+                "item_id": request.item_id,
+                "row_id": row_id,
+                "row_html": view.row_html(row_id)
+            }
 
-            # Capture original value before deletion for ghost overlay
-            original_value = HTMLParser.get_item_value_from_soup(soup, request.item_id)
-
-            # Parse item_id to get row_id and field_name
-            parts = request.item_id.split('-')
-            if len(parts) >= 3:
-                # Save deleted item state for ghost overlay (before the
-                # mutation, so the undo snapshot captures the pre-delete state)
-                deleted_items = await SessionManager.load_deleted_item_state(request.session_id)
-                deleted_items[request.item_id] = DeletedItemState(
-                    item_id=request.item_id,
-                    original_value=original_value or '',
-                    row_id=parts[0],
-                    field_name='-'.join(parts[1:-1])
-                )
-                await SessionManager.save_deleted_item_state(request.session_id, deleted_items)
-
-            pre_row_html = doc.row_html_or_none(row_id)
-            if pre_row_html is None:
-                raise HTTPException(status_code=500,
-                                    detail=f"Row '{row_id}' not found in document")
-
-            await SessionManager.push_undo_row_snapshot(
-                request.session_id, table_type, row_id, pre_row_html
-            )
-
-            HTMLParser.remove_item_in_soup(soup, request.item_id)
-
-            new_row_html = doc.commit_row(row_id)
-            await doc.persist()
-        except HTTPException:
-            raise
-        except Exception:
-            document_cache.drop_document(request.session_id, table_type)
-            raise
-
-        # Remove edit tracking for the deleted item
-        edit_states = await SessionManager.load_edit_state(request.session_id)
-        if request.item_id in edit_states:
-            del edit_states[request.item_id]
-            await SessionManager.save_edit_state(request.session_id, edit_states)
-
+        await journal.append('remove_item', row=row_id,
+                             item=request.item_id, field=field_name)
+        new_view = _recompute(state, journal)
         session.mark_edited()
         await SessionManager.save_session(session)
 
@@ -517,69 +374,24 @@ async def delete_item(request: DeleteItemRequest):
         "success": True,
         "item_id": request.item_id,
         "row_id": row_id,
-        "row_html": new_row_html
+        "row_html": new_view.row_html(row_id)
     }
 
 
 @router.post("/row/delete")
 async def delete_row(request: DeleteRowRequest):
-    """
-    Delete an entire table row from the individual HTML file.
-
-    The row is identified by its ``<tr id="rowN">`` attribute.  After deletion
-    user should re-validate to export updated table without this row.
-    """
+    """Delete an entire table row (``delete_row``)."""
     session = await SessionManager.load_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    table_type = _editable_table_type(session)
-
     async with document_cache.session_lock(request.session_id):
-        doc = await _get_editable_doc(request.session_id, session)
-        try:
-            soup = await doc.ensure_soup()
-            row = soup.find('tr', id=request.row_id)
-            if row is None:
-                # Nothing to delete — behave as a success no-op (the row is
-                # already gone; the frontend removes its <tr> locally too).
-                return {"success": True, "row_id": request.row_id, "removed": False}
+        journal, view, state = await _load_view(request.session_id, session)
+        if request.row_id not in view.row_ids:
+            # Already gone — success no-op.
+            return {"success": True, "row_id": request.row_id, "removed": False}
 
-            # Capture all item values in the row before deletion (single pass)
-            row_items = HTMLParser.get_row_items_with_values(row)
-            deleted_items = await SessionManager.load_deleted_item_state(request.session_id)
-            parts_by_item = {}
-            for item_id in row_items:
-                parts = item_id.split('-')
-                if len(parts) >= 3:
-                    parts_by_item[item_id] = parts
-                    deleted_items[item_id] = DeletedItemState(
-                        item_id=item_id,
-                        original_value=row_items[item_id] or '',
-                        row_id=parts[0],
-                        field_name='-'.join(parts[1:-1])
-                    )
-            await SessionManager.save_deleted_item_state(request.session_id, deleted_items)
-
-            pre_row_html = doc.row_html_or_none(request.row_id)
-            if pre_row_html is None:
-                raise HTTPException(status_code=500,
-                                    detail=f"Row '{request.row_id}' not found in document")
-            next_row_id = next_row_id_in_str(doc.canonical, request.row_id)
-
-            await SessionManager.push_undo_row_snapshot(
-                request.session_id, table_type, request.row_id,
-                pre_row_html, next_row_id
-            )
-
-            doc.commit_row_removal(request.row_id)
-            await doc.persist()
-        except HTTPException:
-            raise
-        except Exception:
-            document_cache.drop_document(request.session_id, table_type)
-            raise
-
+        await journal.append('delete_row', row=request.row_id)
         session.mark_edited()
         await SessionManager.save_session(session)
 
@@ -588,172 +400,178 @@ async def delete_row(request: DeleteRowRequest):
 
 @router.post("/row/add")
 async def add_row(request: AddRowRequest):
-    """
-    Add a new empty row to the table.
-
-    The new row is appended at the end of the table and contains empty
-    item-containers for each field.  The response carries the new row's HTML
-    (with the 'added' highlight) so the frontend can insert it in place.
-    """
+    """Add a new empty row at the end of the table (``add_row``)."""
     session = await SessionManager.load_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    table_type = _editable_table_type(session)
-
     async with document_cache.session_lock(request.session_id):
-        doc = await _get_editable_doc(request.session_id, session)
-        try:
-            soup = await doc.ensure_soup()
-
-            new_row_id = HTMLParser.add_row_to_soup(soup)
-            if not new_row_id:
-                raise HTTPException(status_code=500, detail="Failed to add new row")
-
-            # Undo entry for an added row: the row did not exist before
-            # (pre_row_html=None → undo removes it again)
-            await SessionManager.push_undo_row_snapshot(
-                request.session_id, table_type, new_row_id, None, None
-            )
-
-            new_row_html = doc.commit_row_append(new_row_id)
-            await doc.persist()
-        except HTTPException:
-            raise
-        except Exception:
-            document_cache.drop_document(request.session_id, table_type)
-            raise
-
-        # Mark the new row as added
-        row_change_states = await SessionManager.load_row_change_state(request.session_id)
-        row_change_states[new_row_id] = RowChangeState(
-            row_id=new_row_id,
-            added=True,
-            deleted=False
-        )
-        await SessionManager.save_row_change_state(request.session_id, row_change_states)
-
+        journal, view, state = await _load_view(request.session_id, session)
+        if not state['artifacts'].get('has_table'):
+            raise HTTPException(status_code=500, detail="Failed to add new row")
+        new_row_id = view.next_add_row_id()
+        await journal.append('add_row', row=new_row_id)
+        new_view = _recompute(state, journal)
         session.mark_edited()
         await SessionManager.save_session(session)
 
-    row_html_out = HTMLParser.apply_tracking_to_row_html(
-        new_row_html, [], [], True
-    )
     return {
         "success": True,
         "row_id": new_row_id,
-        "row_html": row_html_out
+        "row_html": new_view.row_html(new_row_id)
     }
 
 
 @router.post("/cell/clear")
 async def clear_cell_route(request: ClearCellRequest):
+    """Clear all values from a cell, leaving one empty item-container."""
+    session = await SessionManager.load_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    async with document_cache.session_lock(request.session_id):
+        journal, view, state = await _load_view(request.session_id, session)
+        bs, row = view.row_soup(request.row_id)
+        if row is None or HTMLParser._get_cell_in_row(row, request.field_name) is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Cell '{request.field_name}' not found in row '{request.row_id}'"
+            )
+
+        await journal.append('clear_cell', row=request.row_id,
+                             field=request.field_name)
+        new_view = _recompute(state, journal)
+        session.mark_edited()
+        await SessionManager.save_session(session)
+
+    new_item_id = f"{request.row_id[3:]}-{request.field_name}-0"
+    return {
+        "success": True,
+        "new_item_id": new_item_id,
+        "row_id": request.row_id,
+        "row_html": new_view.row_html(request.row_id)
+    }
+
+
+# ---------------------------------------------------------------------------
+# Undo / Redo
+# ---------------------------------------------------------------------------
+
+@router.get("/undo_state/{session_id}")
+async def get_undo_state(session_id: str):
+    """Return whether undo and redo are currently available for this session."""
+    session = await SessionManager.load_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    async with document_cache.session_lock(session_id):
+        journal, _view, _state = await _load_view(session_id, session)
+        return {"can_undo": journal.can_undo, "can_redo": journal.can_redo}
+
+
+@router.post("/undo")
+async def undo(request: UndoRedoRequest):
+    """Undo the last mutation: move the journal cursor back one event."""
+    session = await SessionManager.load_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    async with document_cache.session_lock(request.session_id):
+        journal, _view, state = await _load_view(request.session_id, session)
+        ev = await journal.undo()
+        if ev is None:
+            return {"success": False, "message": "Nothing to undo",
+                    "can_undo": journal.can_undo, "can_redo": journal.can_redo}
+        new_view = _recompute(state, journal)
+        payload = _patch_payload(ev, new_view, journal)
+        session.mark_edited()
+        await SessionManager.save_session(session)
+
+    return {"success": True, "can_undo": journal.can_undo,
+            "can_redo": journal.can_redo, **payload}
+
+
+@router.post("/redo")
+async def redo(request: UndoRedoRequest):
+    """Redo the last undone mutation: move the journal cursor forward."""
+    session = await SessionManager.load_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    async with document_cache.session_lock(request.session_id):
+        journal, _view, state = await _load_view(request.session_id, session)
+        ev = await journal.redo()
+        if ev is None:
+            return {"success": False, "message": "Nothing to redo",
+                    "can_undo": journal.can_undo, "can_redo": journal.can_redo}
+        new_view = _recompute(state, journal)
+        payload = _patch_payload(ev, new_view, journal)
+        session.mark_edited()
+        await SessionManager.save_session(session)
+
+    return {"success": True, "can_undo": journal.can_undo,
+            "can_redo": journal.can_redo, **payload}
+
+
+def _patch_payload(ev: dict, view: TableView, journal: ChangeJournal) -> dict:
+    """Frontend patch descriptor for an undone/redone row event."""
+    rid = ev['row']
+    if ev['op'] in ('add_row', 'delete_row'):
+        mode = 'insert' if rid in view.row_ids else 'remove'
+    else:
+        mode = 'replace'
+    payload = {"mode": mode, "row_id": rid}
+    if mode == 'replace':
+        payload["row_html"] = view.row_html(rid)
+    elif mode == 'insert':
+        payload["row_html"] = view.row_html(rid)
+        payload["insert_before_row_id"] = view.next_row_id_after(rid)
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Commit (Save)
+# ---------------------------------------------------------------------------
+
+@router.post("/commit")
+async def commit(request: CommitRequest):
     """
-    Clear all values from a single cell, leaving one empty item-container.
-
-    Works for both multi-value and single-value fields.  Also serves as the
-    "initialise" endpoint for cells that currently have no item-containers at
-    all (e.g. a field that was empty in the original CSV).
-
-    Tracks cleared items for ghost overlays, like delete-item/delete-row.
+    Save: materialize the current view (baseline + events ≤ cursor) into the
+    table file(s).  The journal and undo history are preserved — undo still
+    steps back past the save.
     """
     session = await SessionManager.load_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
     table_type = _editable_table_type(session)
-
     async with document_cache.session_lock(request.session_id):
-        doc = await _get_editable_doc(request.session_id, session)
-        try:
-            soup = await doc.ensure_soup()
-            row = soup.find('tr', id=request.row_id)
-            if row is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Cell '{request.field_name}' not found in row '{request.row_id}'"
-                )
+        journal, view, state = await _load_view(request.session_id, session)
+        await SessionManager.save_html(request.session_id, view.html, table_type)
+        if session.has_metadata and session.has_citations:
+            cits_state = await load_table_state(request.session_id, 'cits')
+            if cits_state is not None:
+                display = compose_display(view.html, cits_state['base_html'])
+                await SessionManager.save_html(request.session_id, display, 'display')
+        await journal.mark_saved()
 
-            # Get all item ids/values in the cell before clearing (single pass)
-            cell_items = HTMLParser.get_cell_items_with_values(row, request.field_name)
-            deleted_items = await SessionManager.load_deleted_item_state(request.session_id)
-            for item_id, value in cell_items.items():
-                parts = item_id.split('-')
-                if len(parts) >= 3:
-                    deleted_items[item_id] = DeletedItemState(
-                        item_id=item_id,
-                        original_value=value or '',
-                        row_id=parts[0],
-                        field_name='-'.join(parts[1:-1])
-                    )
-            await SessionManager.save_deleted_item_state(request.session_id, deleted_items)
+    return {"success": True, "saved": True}
 
-            pre_row_html = doc.row_html_or_none(request.row_id)
-            if pre_row_html is None:
-                raise HTTPException(status_code=500,
-                                    detail=f"Row '{request.row_id}' not found in document")
 
-            await SessionManager.push_undo_row_snapshot(
-                request.session_id, table_type, request.row_id, pre_row_html
-            )
-
-            new_item_id = HTMLParser.clear_cell_in_soup(soup, row, request.field_name)
-            if not new_item_id:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Cell '{request.field_name}' not found in row '{request.row_id}'"
-                )
-
-            new_row_html = doc.commit_row(request.row_id)
-            await doc.persist()
-        except HTTPException:
-            raise
-        except Exception:
-            document_cache.drop_document(request.session_id, table_type)
-            raise
-
-        # Remove edit tracking for all cleared items
-        edit_states = await SessionManager.load_edit_state(request.session_id)
-        for item_id in cell_items:
-            if item_id in edit_states:
-                del edit_states[item_id]
-        await SessionManager.save_edit_state(request.session_id, edit_states)
-
-        session.mark_edited()
-        await SessionManager.save_session(session)
-
-    return {
-        "success": True,
-        "new_item_id": new_item_id,
-        "row_id": request.row_id,
-        "row_html": new_row_html
-    }
-
+# ---------------------------------------------------------------------------
+# Revalidate
+# ---------------------------------------------------------------------------
 
 @router.post("/revalidate")
 async def revalidate(request: RevalidateRequest):
     """
-    Re-run validation on the current (possibly edited) table data and regenerate
-    the HTML view so that issue squares and the error-count headline reflect the
-    latest validation results.
+    Re-run validation on the current (possibly edited) table data and
+    regenerate the HTML so issue squares reflect the latest results.
 
-    For single-table sessions:
-      1. Load the individual HTML (``meta_table.html`` or ``cits_table.html``).
-      2. Parse it back to rows and export a temporary CSV.
-      3. Run ``ValidatorService.validate_single`` on the temp CSV.
-      4. Use the *returned* report path to call ``_generate_html``.
-      5. Save the new HTML back to the individual file (via ``save_html``,
-         which also refreshes the document cache).
-
-    For paired sessions (metadata + citations):
-      1. Load both individual HTMLs.
-      2. Parse and export each to a separate temp CSV.
-      3. Run ``ValidatorService.validate_pair`` (ClosureValidator).
-      4. Regenerate both individual HTMLs from their respective new reports.
-      5. Merge the two individual HTMLs and save the result as the display file.
-
-    CPU-heavy steps (validator + ``make_gui``) run in a worker thread so the
-    event loop stays responsive.
+    Rows come from the journal replay (view.rows_for_export) — no HTML
+    parsing.  After regeneration the new baselines become the next
+    generation's base, artifacts are rebuilt (one threaded parse), and the
+    journal resets: undo history does not survive a revalidate (row ids are
+    renumbered by ``make_gui``, so cross-generation undo was never sound).
     """
     session = await SessionManager.load_session(request.session_id)
     if not session:
@@ -769,38 +587,30 @@ async def revalidate(request: RevalidateRequest):
         try:
             if session.has_metadata and session.has_citations:
                 # ── Paired re-validation ────────────────────────────────────
-                meta_doc = await document_cache.get_document(request.session_id, 'meta')
-                cits_doc = await document_cache.get_document(request.session_id, 'cits')
-                if meta_doc is None or cits_doc is None:
-                    raise HTTPException(status_code=404,
-                                        detail="Individual table HTML not found")
+                journal, meta_view, meta_state = await _load_view(
+                    request.session_id, session)
+                meta_rows = (meta_view.rows_for_export()
+                             if meta_state['artifacts'].get('has_table') else None)
 
-                try:
-                    meta_rows = await asyncio.to_thread(
-                        HTMLParser.parse_table_from_soup,
-                        await meta_doc.ensure_soup()
-                    )
-                    cits_rows = await asyncio.to_thread(
-                        HTMLParser.parse_table_from_soup,
-                        await cits_doc.ensure_soup()
-                    )
-                except ValueError:
-                    # A zero-error table renders without a <table> element
-                    # (see _make_no_errors_html) — it cannot have been edited,
-                    # so its data is unchanged: feed the original CSV back in.
-                    meta_rows = None
-                    cits_rows = None
+                cits_state = await load_table_state(request.session_id, 'cits')
+                if cits_state is None:
+                    raise HTTPException(status_code=404,
+                                        detail="Citations baseline not found")
+                cits_rows = None
+                if cits_state['artifacts'].get('has_table'):
+                    # Citations are not editable — base rows are current.
+                    cits_view = TableView(cits_state['base_html'],
+                                          cits_state['artifacts'], [])
+                    cits_rows = cits_view.rows_for_export()
 
                 if meta_rows is not None and not meta_rows:
                     raise ValueError("No data found in metadata HTML table")
                 if cits_rows is not None and not cits_rows:
                     raise ValueError("No data found in citations HTML table")
 
-                # Export edited rows back to temporary CSV files (or reuse the
-                # original CSV for table-less — i.e. unedited/valid — sides)
+                # Rows → CSV (reuse the original CSV when a side is table-less)
                 temp_meta_csv = session_dir / 'temp_meta_revalidate.csv'
                 temp_cits_csv = session_dir / 'temp_cits_revalidate.csv'
-
                 if meta_rows is not None:
                     meta_csv_content = await asyncio.to_thread(
                         CSVExporter.rows_to_csv, meta_rows, session.meta_csv_path)
@@ -808,7 +618,6 @@ async def revalidate(request: RevalidateRequest):
                         f.write(meta_csv_content)
                 else:
                     temp_meta_csv = Path(session.meta_csv_path)
-
                 if cits_rows is not None:
                     cits_csv_content = await asyncio.to_thread(
                         CSVExporter.rows_to_csv, cits_rows, session.cits_csv_path)
@@ -817,7 +626,6 @@ async def revalidate(request: RevalidateRequest):
                 else:
                     temp_cits_csv = Path(session.cits_csv_path)
 
-                # Run paired validation via ClosureValidator (CPU-bound → thread)
                 meta_is_valid, cits_is_valid, meta_report_path, cits_report_path = \
                     await asyncio.to_thread(
                         ValidatorService.validate_pair,
@@ -828,10 +636,8 @@ async def revalidate(request: RevalidateRequest):
                         verify_id_existence=verify_id
                     )
 
-                # Regenerate individual HTML files
                 meta_table_path = session_dir / 'meta_table.html'
                 cits_table_path = session_dir / 'cits_table.html'
-
                 await asyncio.to_thread(_generate_html, str(temp_meta_csv),
                                         meta_report_path, str(meta_table_path),
                                         meta_is_valid)
@@ -847,8 +653,6 @@ async def revalidate(request: RevalidateRequest):
                 await SessionManager.save_html(request.session_id, new_meta_html, 'meta')
                 await SessionManager.save_html(request.session_id, new_cits_html, 'cits')
 
-                # Re-merge and save as display file (compatibility; the served
-                # display is derived, but keep the merged file on disk)
                 merged_path = session_dir / 'meta_html.html'
                 await asyncio.to_thread(merge_html_files, str(meta_table_path),
                                         str(cits_table_path), str(merged_path))
@@ -856,18 +660,19 @@ async def revalidate(request: RevalidateRequest):
                     merged_content = f.read()
                 await SessionManager.save_html(request.session_id, merged_content, 'display')
 
-                # Update baseline snapshots for deletion detection
-                await SessionManager.save_baseline_snapshot(request.session_id, new_meta_html, 'meta')
-                await SessionManager.save_baseline_snapshot(request.session_id, new_cits_html, 'cits')
+                await SessionManager.save_baseline_snapshot(
+                    request.session_id, new_meta_html, 'meta')
+                await SessionManager.save_baseline_snapshot(
+                    request.session_id, new_cits_html, 'cits')
+                gen_meta = await build_generation_artifacts(request.session_id, 'meta')
+                await build_generation_artifacts(request.session_id, 'cits')
+                await journal.reset(gen_meta, 'meta')
 
-                # Update session report paths
                 session.meta_report_path = meta_report_path
                 session.cits_report_path = cits_report_path
-
                 total_error_count = (len(load_jsonl_report(meta_report_path))
                                      + len(load_jsonl_report(cits_report_path)))
 
-                # Clean up temp files (never the reused original CSVs)
                 if temp_meta_csv.name.startswith('temp_'):
                     temp_meta_csv.unlink(missing_ok=True)
                 if temp_cits_csv.name.startswith('temp_'):
@@ -876,33 +681,24 @@ async def revalidate(request: RevalidateRequest):
             else:
                 # ── Single-table re-validation ──────────────────────────────
                 table_type = _editable_table_type(session)
-                doc = await document_cache.get_document(request.session_id, table_type)
-                if doc is None:
-                    raise HTTPException(status_code=404, detail="HTML content not found")
-
-                try:
-                    rows_data = await asyncio.to_thread(
-                        HTMLParser.parse_table_from_soup,
-                        await doc.ensure_soup()
-                    )
-                except Exception as e:
-                    raise ValueError(f"Failed to parse HTML table: {e}")
-
-                if not rows_data:
+                journal, view, state = await _load_view(request.session_id, session)
+                rows_data = (view.rows_for_export()
+                             if state['artifacts'].get('has_table') else None)
+                if rows_data is not None and not rows_data:
                     raise ValueError("No data found in HTML table")
 
                 original_csv_path = (session.meta_csv_path if session.has_metadata
                                      else session.cits_csv_path)
-                csv_content = await asyncio.to_thread(
-                    CSVExporter.rows_to_csv, rows_data, original_csv_path)
+                if rows_data is not None:
+                    csv_content = await asyncio.to_thread(
+                        CSVExporter.rows_to_csv, rows_data, original_csv_path)
+                    temp_csv_path = session_dir / 'temp_revalidate.csv'
+                    with open(temp_csv_path, 'w', encoding='utf-8', newline='') as f:
+                        f.write(csv_content)
+                else:
+                    # Table-less (fully valid) document: data unchanged.
+                    temp_csv_path = Path(original_csv_path)
 
-                temp_csv_path = session_dir / 'temp_revalidate.csv'
-                with open(temp_csv_path, 'w', encoding='utf-8', newline='') as f:
-                    f.write(csv_content)
-
-                # Run validation (CPU-bound → thread).  The report path is
-                # taken from validator.output_fp_json, so it is always the
-                # file that was *just* written.
                 is_valid, report_path = await asyncio.to_thread(
                     ValidatorService.validate_single,
                     csv_path=str(temp_csv_path),
@@ -910,35 +706,31 @@ async def revalidate(request: RevalidateRequest):
                     verify_id_existence=verify_id
                 )
 
-                # Generate new HTML using the freshly written report
                 temp_html_path = session_dir / 'temp_revalidate.html'
                 await asyncio.to_thread(_generate_html, str(temp_csv_path),
                                         report_path, str(temp_html_path), is_valid)
-
                 with open(temp_html_path, 'r', encoding='utf-8', newline='') as f:
                     new_html = f.read()
 
-                # Save updated individual HTML (grey highlights intentionally
-                # dropped — re-validation is the canonical "accept and re-check"
-                # action; edited items are no longer specially marked afterwards).
                 await SessionManager.save_html(request.session_id, new_html, table_type)
+                await SessionManager.save_baseline_snapshot(
+                    request.session_id, new_html, table_type)
+                generation = await build_generation_artifacts(
+                    request.session_id, table_type)
+                await journal.reset(generation, table_type)
 
-                # Update baseline snapshot for deletion detection
-                await SessionManager.save_baseline_snapshot(request.session_id, new_html, table_type)
-
-                # Update session report path
                 if session.has_metadata:
                     session.meta_report_path = report_path
                 else:
                     session.cits_report_path = report_path
-
                 total_error_count = len(load_jsonl_report(report_path))
 
-                # Clean up temp files
-                temp_csv_path.unlink(missing_ok=True)
+                if temp_csv_path.name.startswith('temp_'):
+                    temp_csv_path.unlink(missing_ok=True)
                 temp_html_path.unlink(missing_ok=True)
 
-            # Mark session as validated (clears has_edits_since_validation)
+            _cleanup_legacy_state_files(request.session_id)
+
             session.mark_validated()
             session.verify_id_existence = verify_id
             await SessionManager.save_session(session)
@@ -957,59 +749,66 @@ async def revalidate(request: RevalidateRequest):
             raise HTTPException(status_code=500, detail=f"Re-validation failed: {str(e)}")
 
 
+# ---------------------------------------------------------------------------
+# Views
+# ---------------------------------------------------------------------------
+
 @router.post("/filtered-rows")
 async def get_filtered_rows(request: GetFilteredRowsRequest):
     """
-    Get an HTML table fragment containing only the rows involved in a specific
-    validation issue.
+    HTML table fragment with only the rows involved in a validation issue.
+
+    Rows come from the (base-built) issue index minus journal row-deletions,
+    sliced by stored offsets and replayed with their events — selected by
+    row id, never by position (fixes the historical position/id divergence
+    after row add/delete).
     """
     session = await SessionManager.load_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Issue filtering scopes to the first table (same as the old behaviour on
-    # the merged display file, whose first table is the metadata table).
-    table_type = _editable_table_type(session)
-
     async with document_cache.session_lock(request.session_id):
-        doc = await document_cache.get_document(request.session_id, table_type)
-        if doc is None:
+        journal, view, state = await _load_view(request.session_id, session)
+        artifacts = state['artifacts']
+        if not artifacts.get('has_table'):
             raise HTTPException(status_code=404, detail="HTML content not found")
-        soup = await doc.ensure_soup()
-        row_indices = HTMLParser.get_rows_by_issue_in_soup(soup, request.issue_id)
-        filtered_html = HTMLParser.build_filtered_table_html(soup, row_indices)
-
-    edit_states = await SessionManager.load_edit_state(request.session_id)
-    if edit_states:
-        edited_ids = [item_id for item_id, state in edit_states.items() if state.edited]
-        if edited_ids:
-            filtered_html = _mark_tracked_rows(filtered_html, edited_ids, [], [])
+        row_ids = [r for r in artifacts['issue_index'].get(request.issue_id, [])
+                   if r in view.row_ids]
+        parts = [artifacts['table_open_tag'], artifacts['thead_html'], '<tbody>']
+        parts.extend(view.row_html(r) or '' for r in row_ids)
+        parts.append('</tbody></table>')
+        filtered_html = ''.join(parts)
 
     return {
         "html": filtered_html,
-        "row_indices": row_indices,
+        "row_indices": [int(r[3:]) for r in row_ids if r[3:].isdigit()],
         "issue_id": request.issue_id
     }
 
 
 @router.get("/edited/{session_id}")
 async def get_edited_items(session_id: str):
-    """Get list of edited items for a session."""
+    """List of edited items (original + current values), from the journal."""
     session = await SessionManager.load_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    edit_states = await SessionManager.load_edit_state(session_id)
-
-    edited_items = [
-        {
-            "item_id": item_id,
-            "original_value": state.original_value,
-            "edited_value": state.edited_value
-        }
-        for item_id, state in edit_states.items()
-        if state.edited
-    ]
+    async with document_cache.session_lock(session_id):
+        journal, view, state = await _load_view(session_id, session)
+        last_set = {}
+        for ev in journal.applied_events:
+            if ev['op'] == 'set_item':
+                last_set[ev['item']] = ev['value']
+        base_values = _base_item_values(state)
+        edited_items = [
+            {
+                "item_id": item_id,
+                "original_value": base_values.get(item_id, ''),
+                "edited_value": value
+            }
+            for item_id, value in last_set.items()
+            if item_id in view.edited_item_ids
+        ]
 
     return {"edited_items": edited_items, "count": len(edited_items)}
 
@@ -1017,84 +816,51 @@ async def get_edited_items(session_id: str):
 @router.get("/deleted/{session_id}")
 async def get_deleted_view(session_id: str):
     """
-    Get HTML content with ghost overlays showing deleted items and rows.
+    HTML with ghost overlays for deleted items/rows — derived from the
+    journal (per-row base-vs-view diff), never a baseline re-parse.
 
-    Compares the baseline (post-validation) tree with the current tree, then
-    splices ghost elements into a copy of the current canonical string (the
-    cached tree itself is never mutated by a view).
-
-    Note: for paired sessions the display baseline was never persisted by any
-    code path, so — as before this optimisation — ghost overlays are only
-    available for single-table sessions.
+    Paired sessions keep the historical behaviour of returning no ghosts
+    (the merged display baseline was never persisted by any code path).
     """
     session = await SessionManager.load_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if session.has_metadata and session.has_citations:
-        # Paired: same historical behaviour — no persisted display baseline,
-        # so no ghost overlays.
-        meta_doc = await document_cache.get_document(session_id, 'meta')
-        cits_doc = await document_cache.get_document(session_id, 'cits')
-        if meta_doc is None or cits_doc is None:
-            raise HTTPException(status_code=404, detail="HTML content not found")
-        return {"html": compose_display(meta_doc.canonical, cits_doc.canonical),
-                "has_ghosts": False}
-
-    table_type = _editable_table_type(session)
-
     async with document_cache.session_lock(session_id):
-        doc = await document_cache.get_document(session_id, table_type)
-        if doc is None:
-            raise HTTPException(status_code=404, detail="HTML content not found")
+        journal, view, state = await _load_view(session_id, session)
 
-        baseline_doc = await document_cache.get_document(
-            session_id, f'baseline_{table_type}')
-        if baseline_doc is None:
-            # No baseline exists - return current HTML without ghost overlays
-            # (happens when no validation has been performed yet)
-            return {"html": doc.canonical, "has_ghosts": False}
+        if session.has_metadata and session.has_citations:
+            cits_state = await load_table_state(session_id, 'cits')
+            if cits_state is None:
+                raise HTTPException(status_code=404, detail="HTML content not found")
+            return {"html": compose_display(view.html, cits_state['base_html']),
+                    "has_ghosts": False}
 
-        await doc.ensure_soup()
-        await baseline_doc.ensure_soup()
-        current_html = doc.canonical  # read after ensure (may canonicalize)
-
-        # Identify deletions with values (O(rows + items))
-        deletions = await asyncio.to_thread(
-            HTMLParser.identify_deletions_fast, baseline_doc.soup, doc.soup
-        )
-
-        # Combine with deleted item states from the tracking store
-        deleted_items_db = await SessionManager.load_deleted_item_state(session_id)
-        deleted_item_values = deletions.get('deleted_item_values', {})
-        for item_id, state in deleted_items_db.items():
-            if item_id not in deleted_item_values:
-                deleted_item_values[item_id] = state.original_value
-
-        if not deletions.get('deleted_items') and not deletions.get('deleted_rows'):
-            return {"html": current_html, "has_ghosts": False}
-
-        html_with_ghosts = HTMLParser.insert_deleted_overlays_fast(
-            current_html, doc.soup, deletions, deleted_item_values
-        )
+        html_with_ghosts, n_items, n_rows = view.build_ghost_html()
+        if n_items == 0 and n_rows == 0:
+            return {"html": view.html, "has_ghosts": False}
 
     return {
         "html": html_with_ghosts,
         "has_ghosts": True,
-        "deleted_items_count": len(deletions.get('deleted_items', [])),
-        "deleted_rows_count": len(deletions.get('deleted_rows', []))
+        "deleted_items_count": n_items,
+        "deleted_rows_count": n_rows
     }
 
 
 @router.get("/session/{session_id}")
 async def get_session(session_id: str):
-    """Get session information."""
+    """Session information (counts, unsaved-changes flag, undo availability)."""
     session = await SessionManager.load_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    edit_states = await SessionManager.load_edit_state(session_id)
-    edited_count = sum(1 for state in edit_states.values() if state.edited)
+    async with document_cache.session_lock(session_id):
+        journal, view, _state = await _load_view(session_id, session)
+        edited_count = len(view.edited_item_ids)
+        unsaved = journal.has_unsaved_changes
+        can_undo = journal.can_undo
+        can_redo = journal.can_redo
 
     return {
         "session_id": session.session_id,
@@ -1103,83 +869,8 @@ async def get_session(session_id: str):
         "verify_id_existence": session.verify_id_existence,
         "has_edits_since_validation": session.has_edits_since_validation,
         "edited_items_count": edited_count,
+        "unsaved_changes": unsaved,
+        "can_undo": can_undo,
+        "can_redo": can_redo,
         "last_validated_at": session.last_validated_at
     }
-
-
-# ---------------------------------------------------------------------------
-# Undo / Redo endpoints
-# ---------------------------------------------------------------------------
-
-@router.get("/undo_state/{session_id}")
-async def get_undo_state(session_id: str):
-    """Return whether undo and redo are currently available for this session."""
-    session = await SessionManager.load_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    table_type = _editable_table_type(session)
-    return await SessionManager.get_undo_availability(session_id, table_type)
-
-
-@router.post("/undo")
-async def undo(request: UndoRedoRequest):
-    """
-    Undo the last mutation (row-level snapshot restore).
-
-    Restores the affected ``<tr>`` to its pre-mutation state and rolls back
-    the tracking sidecars (edit_state, row_change_state, deleted_item_state).
-    The post-mutation image is pushed onto the redo stack.
-    """
-    session = await SessionManager.load_session(request.session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    table_type = _editable_table_type(session)
-
-    async with document_cache.session_lock(request.session_id):
-        doc = await document_cache.get_document(request.session_id, table_type)
-        if doc is None:
-            raise HTTPException(status_code=404, detail="HTML content not found")
-
-        entry = await SessionManager.pop_undo_row_snapshot(
-            request.session_id, table_type, doc
-        )
-        if entry is None:
-            avail = await SessionManager.get_undo_availability(request.session_id, table_type)
-            return {"success": False, "message": "Nothing to undo", **avail}
-
-        session.mark_edited()
-        await SessionManager.save_session(session)
-        avail = await SessionManager.get_undo_availability(request.session_id, table_type)
-
-    return {"success": True, **avail}
-
-
-@router.post("/redo")
-async def redo(request: UndoRedoRequest):
-    """
-    Redo the last undone mutation (row-level snapshot restore).
-    """
-    session = await SessionManager.load_session(request.session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    table_type = _editable_table_type(session)
-
-    async with document_cache.session_lock(request.session_id):
-        doc = await document_cache.get_document(request.session_id, table_type)
-        if doc is None:
-            raise HTTPException(status_code=404, detail="HTML content not found")
-
-        entry = await SessionManager.pop_redo_row_snapshot(
-            request.session_id, table_type, doc
-        )
-        if entry is None:
-            avail = await SessionManager.get_undo_availability(request.session_id, table_type)
-            return {"success": False, "message": "Nothing to redo", **avail}
-
-        session.mark_edited()
-        await SessionManager.save_session(session)
-        avail = await SessionManager.get_undo_availability(request.session_id, table_type)
-
-    return {"success": True, **avail}

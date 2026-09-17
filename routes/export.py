@@ -7,8 +7,9 @@ from pydantic import BaseModel
 from typing import Optional
 from io import StringIO
 
-from services import SessionManager, HTMLParser, CSVExporter
+from services import SessionManager, CSVExporter
 from services.session_document import document_cache
+from services.view_builder import load_journal_view
 from models import Session
 
 router = APIRouter()
@@ -44,14 +45,13 @@ async def export_csv(request: ExportRequest):
     # Determine table type for HTML loading
     table_type = 'meta' if session.has_metadata else 'cits'
 
-    # Load current HTML via the document cache and parse rows from the
-    # (lazily built, shared) tree instead of re-parsing the whole document.
+    # Rows come from the journal replay (baseline + events) — no HTML parsing.
     async with document_cache.session_lock(request.session_id):
-        doc = await document_cache.get_document(request.session_id, table_type)
-        if doc is None:
+        loaded = await load_journal_view(request.session_id, table_type)
+        if loaded is None:
             raise HTTPException(status_code=404, detail="HTML content not found")
-        soup = await doc.ensure_soup()
-        rows_data = await asyncio.to_thread(HTMLParser.parse_table_from_soup, soup)
+        _journal, view, _state = loaded
+        rows_data = await asyncio.to_thread(view.rows_for_export)
 
     # Generate CSV from parsed data
     original_csv_path = session.meta_csv_path if session.has_metadata else session.cits_csv_path

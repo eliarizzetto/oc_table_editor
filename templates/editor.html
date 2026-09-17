@@ -23,8 +23,8 @@
                     <button class="btn btn-success btn-sm" id="exportBtn">
                         Export CSV
                     </button>
-                    <button class="btn btn-secondary btn-sm" id="saveDraftBtn">
-                        Save Draft
+                    <button class="btn btn-warning btn-sm" id="saveChangesBtn">
+                        💾 Save Changes
                     </button>
                     <button class="btn btn-outline-danger btn-sm" id="deleteDraftBtn">
                         Delete Draft
@@ -42,8 +42,9 @@
         </div>
         
         <div class="card mt-3">
-            <div class="card-header">
+            <div class="card-header d-flex justify-content-between align-items-center">
                 <h6 class="mb-0">Session Info</h6>
+                <span id="unsavedBadge" class="badge bg-warning text-dark d-none" title="You have changes not yet written to the table file (Save Changes)">unsaved</span>
             </div>
             <div class="card-body p-2">
                 <p class="mb-1 small"><strong>Session:</strong> <span id="sessionId">{{ session_id[:8] }}</span></p>
@@ -190,7 +191,7 @@ document.addEventListener('DOMContentLoaded', function() {
     // Event listeners
     document.getElementById('revalidateBtn').addEventListener('click', revalidate);
     document.getElementById('exportBtn').addEventListener('click', exportCSV);
-    document.getElementById('saveDraftBtn').addEventListener('click', saveDraft);
+    document.getElementById('saveChangesBtn').addEventListener('click', saveChanges);
     document.getElementById('deleteDraftBtn').addEventListener('click', deleteDraft);
     document.getElementById('showAllBtn').addEventListener('click', () => loadTable());
     document.getElementById('showEditedBtn').addEventListener('click', loadChangesOnly);
@@ -367,9 +368,12 @@ async function loadSessionInfo() {
         if (response.ok) {
             document.getElementById('editedCount').textContent = data.edited_items_count;
             document.getElementById('editedSinceVal').textContent = data.has_edits_since_validation ? 'Yes' : 'No';
-            document.getElementById('lastValidated').textContent = data.last_validated_at 
-                ? new Date(data.last_validated_at).toLocaleString() 
+            document.getElementById('lastValidated').textContent = data.last_validated_at
+                ? new Date(data.last_validated_at).toLocaleString()
                 : '-';
+            const unsavedEl = document.getElementById('unsavedBadge');
+            if (data.unsaved_changes) unsavedEl.classList.remove('d-none');
+            else unsavedEl.classList.add('d-none');
         }
     } catch (error) {
         console.error('Error loading session info:', error);
@@ -799,27 +803,26 @@ async function exportCSV() {
     }
 }
 
-async function saveDraft() {
+async function saveChanges() {
+    const btn = document.getElementById('saveChangesBtn');
+    btn.disabled = true;
     try {
-        const response = await fetch('/api/draft/save', {
+        const response = await fetch('/api/edit/commit', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                session_id: sessionId
-            })
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sessionId })
         });
-        
         const data = await response.json();
-        
         if (response.ok) {
-            showAlert('success', 'Saved', data.message);
+            showAlert('success', 'Saved', 'Your changes have been written to the table file.');
+            loadSessionInfo();
         } else {
-            throw new Error(data.detail || 'Failed to save');
+            throw new Error(data.detail || 'Save failed');
         }
     } catch (error) {
         showAlert('error', 'Error', error.message);
+    } finally {
+        btn.disabled = false;
     }
 }
 
@@ -875,7 +878,7 @@ async function undoEdit() {
         if (response.ok) {
             if (data.success) {
                 updateUndoRedoButtons(data.can_undo, data.can_redo);
-                reloadTable();
+                if (!applyRowPatch(data, data.mode || 'replace')) await reloadTable();
                 loadSessionInfo();
             } else {
                 showAlert('info', 'Undo', data.message || 'Nothing to undo.');
@@ -899,7 +902,7 @@ async function redoEdit() {
         if (response.ok) {
             if (data.success) {
                 updateUndoRedoButtons(data.can_undo, data.can_redo);
-                reloadTable();
+                if (!applyRowPatch(data, data.mode || 'replace')) await reloadTable();
                 loadSessionInfo();
             } else {
                 showAlert('info', 'Redo', data.message || 'Nothing to redo.');
