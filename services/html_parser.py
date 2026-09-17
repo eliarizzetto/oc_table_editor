@@ -4,6 +4,12 @@ from typing import Dict, List, Optional
 import csv
 from io import StringIO
 
+from services.session_document import (
+    SpliceError,
+    find_row_bounds,
+    insert_row_str,
+)
+
 
 class HTMLParser:
     """Parse HTML tables and extract data."""
@@ -1032,5 +1038,486 @@ class HTMLParser:
             if not inserted:
                 # Append at end if insertion point not found
                 cell.append(ghost_item)
-        
+
         return str(soup)
+
+    # =====================================================================
+    # Soup-scoped / string-splice variants (document-cache fast paths)
+    #
+    # These operate on an already-parsed tree (or on canonical strings via
+    # row mini-parses) so that the DocumentCache never needs to re-parse or
+    # re-serialise a whole document.  Semantics mirror the string-based
+    # methods above exactly (item-id formats incl. '-empty', sep insertion,
+    # 'cursor: pointer' style, class-pair cell lookup).
+    # =====================================================================
+
+    @staticmethod
+    def _get_cell_in_row(row: Tag, field_name: str) -> Optional[Tag]:
+        """Locate a cell by its 'field-value {field_name}' class pair."""
+        for td in row.find_all('td', class_='field-value'):
+            if field_name in td.get('class', []):
+                return td
+        return None
+
+    @staticmethod
+    def get_item_value_from_soup(soup, item_id: str) -> Optional[str]:
+        """get_field_data_by_item_id, on an already-parsed tree."""
+        container = soup.find('span', id=item_id)
+        if not container:
+            return None
+        item_data = container.find('span', class_='item-data')
+        return item_data.get_text(strip=False) if item_data else None
+
+    @staticmethod
+    def update_item_value_in_soup(soup, item_id: str, new_value: str) -> None:
+        """update_item_value, on an already-parsed tree (in place)."""
+        container = soup.find('span', id=item_id)
+        if not container:
+            raise ValueError(f"Item with id '{item_id}' not found")
+        item_data = container.find('span', class_='item-data')
+        if item_data:
+            item_data.string = new_value
+        else:
+            new_item_data = soup.new_tag('span', **{'class': 'item-data'})
+            new_item_data.string = new_value
+            container.insert(0, new_item_data)
+
+    @staticmethod
+    def remove_item_in_soup(soup, item_id: str) -> None:
+        """remove_item, on an already-parsed tree (in place)."""
+        container = soup.find('span', id=item_id)
+        if container:
+            container.decompose()
+
+    @staticmethod
+    def get_cell_state_in_row(row: Tag, field_name: str) -> tuple:
+        """get_cell_state, scoped to an already-found row Tag."""
+        cell = HTMLParser._get_cell_in_row(row, field_name)
+        if not cell:
+            return False, 0
+        containers = cell.find_all('span', class_='item-container', recursive=False)
+        has_value = False
+        for container in containers:
+            item_data = container.find('span', class_='item-data')
+            if item_data and item_data.get_text(strip=True):
+                has_value = True
+                break
+        return has_value, len(containers)
+
+    @staticmethod
+    def clear_cell_in_soup(soup, row: Tag, field_name: str) -> str:
+        """clear_cell, on an already-parsed tree.  Returns the new item id."""
+        cell = HTMLParser._get_cell_in_row(row, field_name)
+        if not cell:
+            return ''
+        for container in cell.find_all('span', class_='item-container'):
+            container.decompose()
+        row_num = (row.get('id') or 'row0')[3:]
+        new_item_id = f"{row_num}-{field_name}-0"
+        new_container = soup.new_tag('span', **{'class': 'item-container', 'id': new_item_id})
+        new_item_data = soup.new_tag('span', **{'class': 'item-data', 'style': 'cursor: pointer;'})
+        new_item_data.string = ''
+        new_container.append(new_item_data)
+        cell.append(new_container)
+        return new_item_id
+
+    @staticmethod
+    def add_item_in_cell(soup, row: Tag, field_name: str, value: str = '') -> str:
+        """add_item, located by row/field instead of a reference item id.
+
+        Fixes the duplicate-id bug of the string-based ``add_item`` (which
+        used ``len(siblings)`` as the new index — after deleting a middle
+        item this collides with an existing id).  The new index is
+        ``max(existing numeric indices) + 1`` ('-empty' suffixes skipped).
+        """
+        cell = HTMLParser._get_cell_in_row(row, field_name)
+        if not cell:
+            raise ValueError(f"Field '{field_name}' not found in row")
+        containers = cell.find_all('span', class_='item-container', recursive=False)
+        indices = []
+        for c in containers:
+            cparts = (c.get('id') or '').split('-')
+            if len(cparts) >= 3 and cparts[-1].isdigit():
+                indices.append(int(cparts[-1]))
+        new_index = (max(indices) + 1) if indices else 0
+        row_part = (row.get('id') or 'row0')[3:]
+        new_item_id = f"{row_part}-{field_name}-{new_index}"
+
+        new_container = soup.new_tag('span', **{'class': 'item-container', 'id': new_item_id})
+        new_item_data = soup.new_tag('span', **{'class': 'item-data', 'style': 'cursor: pointer;'})
+        new_item_data.string = value
+        new_container.append(new_item_data)
+
+        if containers:
+            last_container = containers[-1]
+            if not last_container.find('span', class_='sep'):
+                sep_tag = soup.new_tag('span', **{'class': 'sep'})
+                sep_tag.string = HTMLParser.ITEM_SEPARATORS.get(field_name, '')
+                last_container.append(sep_tag)
+            last_container.insert_after(new_container)
+        else:
+            cell.append(new_container)
+        return new_item_id
+
+    @staticmethod
+    def add_row_to_soup(soup) -> str:
+        """add_row, on an already-parsed tree.  Returns the new row id."""
+        table = soup.find('table', id='table-data')
+        if not table:
+            return ''
+        tbody = table.find('tbody')
+        thead = table.find('thead')
+        if not tbody or not thead:
+            return ''
+        header_row = thead.find('tr')
+        if not header_row:
+            return ''
+        headers = header_row.find_all('th')
+        if len(headers) < 2:
+            return ''
+        field_names = [th.get_text(strip=True) for th in headers[1:]]
+
+        row_numbers = []
+        for row in tbody.find_all('tr', id=True):
+            row_id = row.get('id', '')
+            if row_id.startswith('row'):
+                try:
+                    row_numbers.append(int(row_id.replace('row', '')))
+                except ValueError:
+                    pass
+        row_number = max(row_numbers) + 1 if row_numbers else 0
+        new_row_id = f'row{row_number}'
+
+        new_row = soup.new_tag('tr', attrs={'id': new_row_id})
+        row_number_cell = soup.new_tag('td', attrs={'class': 'row-number'})
+        row_number_cell.string = str(row_number)
+        new_row.append(row_number_cell)
+        for field_name in field_names:
+            cell = soup.new_tag('td', attrs={'class': ['field-value', field_name]})
+            item_container = soup.new_tag('span', attrs={'class': 'item-container', 'id': f'{row_number}-{field_name}-0'})
+            item_data = soup.new_tag('span', attrs={'class': 'item-data', 'style': 'cursor: pointer;'})
+            item_data.string = ''
+            item_container.append(item_data)
+            cell.append(item_container)
+            new_row.append(cell)
+        tbody.append(new_row)
+        return new_row_id
+
+    @staticmethod
+    def delete_row_in_soup(soup, row_id: str) -> bool:
+        """delete_row, on an already-parsed tree.  Returns True if removed."""
+        row = soup.find('tr', id=row_id)
+        if row:
+            row.decompose()
+            return True
+        return False
+
+    @staticmethod
+    def get_row_items_with_values(row: Tag) -> Dict[str, str]:
+        """All item ids -> values of a row in a single pass (ghost tracking)."""
+        result: Dict[str, str] = {}
+        for container in row.find_all('span', class_='item-container', recursive=True):
+            cid = container.get('id', '')
+            if not cid:
+                continue
+            item_data = container.find('span', class_='item-data')
+            if item_data is not None:
+                result[cid] = item_data.get_text(strip=False)
+        return result
+
+    @staticmethod
+    def get_cell_items_with_values(row: Tag, field_name: str) -> Dict[str, str]:
+        """All item ids -> values of one cell in a single pass."""
+        cell = HTMLParser._get_cell_in_row(row, field_name)
+        if not cell:
+            return {}
+        result: Dict[str, str] = {}
+        for container in cell.find_all('span', class_='item-container', recursive=False):
+            cid = container.get('id', '')
+            if not cid:
+                continue
+            item_data = container.find('span', class_='item-data')
+            if item_data is not None:
+                result[cid] = item_data.get_text(strip=False)
+        return result
+
+    @staticmethod
+    def get_rows_by_issue_in_soup(soup, issue_id: str) -> List[int]:
+        """get_rows_by_issue, on an already-parsed tree."""
+        table = soup.find('table', id='table-data')
+        if not table:
+            raise ValueError("Table with id 'table-data' not found in HTML")
+        row_indices = set()
+        for icon in table.find_all('span', class_='issue-icon', id=issue_id):
+            row = icon.find_parent('tr')
+            if row:
+                row_id = row.get('id')
+                if row_id and row_id.startswith('row'):
+                    try:
+                        row_indices.add(int(row_id.replace('row', '')))
+                    except ValueError:
+                        pass
+        return sorted(row_indices)
+
+    @staticmethod
+    def build_filtered_table_html(soup, row_indices: List[int]) -> str:
+        """extract_filtered_table without re-parsing: concatenates the kept
+        rows' serializations from the cached tree."""
+        table = soup.find('table', id='table-data')
+        if not table:
+            raise ValueError("Table with id 'table-data' not found in HTML")
+        table_class = table.get('class', [])
+        class_attr = ' '.join(table_class) if isinstance(table_class, list) else table_class
+        parts = [f'<table class="{class_attr}" id="table-data">']
+        thead = table.find('thead')
+        if thead:
+            parts.append(str(thead))
+        parts.append('<tbody>')
+        row_index_set = set(row_indices)
+        for row_idx, row in enumerate(table.find('tbody').find_all('tr')):
+            if row_idx in row_index_set:
+                parts.append(str(row))
+        parts.append('</tbody></table>')
+        return ''.join(parts)
+
+    @staticmethod
+    def parse_table_from_soup(soup) -> List[Dict[str, List[str]]]:
+        """parse_table, on an already-parsed tree."""
+        table = soup.find('table', id='table-data')
+        if not table:
+            raise ValueError("Table with id 'table-data' not found in HTML")
+        header_row = table.find('thead').find('tr')
+        headers = [th.get_text(strip=True) for th in header_row.find_all('th')][1:]
+        rows_data: List[Dict[str, List[str]]] = []
+        for row in table.find('tbody').find_all('tr'):
+            cells = row.find_all('td')[1:]
+            row_data = {}
+            for header, cell in zip(headers, cells):
+                item_data_spans = cell.find_all('span', class_='item-data')
+                items = [span.get_text(strip=False) for span in item_data_spans]
+                items = [t for t in items if t.strip()]
+                if not items:
+                    items = [cell.get_text(strip=False) if not item_data_spans else '']
+                row_data[header] = items
+            rows_data.append(row_data)
+        return rows_data
+
+    @staticmethod
+    def apply_tracking_to_row_html(row_html: str, edited_item_ids: List[str],
+                                   added_item_ids: List[str], added_row: bool) -> str:
+        """Apply edited/added tracking classes to a single row string.
+
+        Mini-parses the row (~1 ms), mirrors the class-append logic of
+        apply_edit_tracking / apply_added_tracking, and re-serialises.
+        """
+        edited = set(edited_item_ids)
+        added = set(added_item_ids)
+        bs = BeautifulSoup(row_html, 'html.parser')
+        row = bs.find('tr')
+        if row is None:
+            return row_html
+        for container in row.find_all('span', class_='item-container'):
+            cid = container.get('id', '')
+            if cid in edited or cid in added:
+                item_data = container.find('span', class_='item-data')
+                if item_data:
+                    classes = item_data.get('class', [])
+                    if isinstance(classes, list):
+                        if cid in edited and 'edited' not in classes:
+                            classes.append('edited')
+                        if cid in added and 'added' not in classes:
+                            classes.append('added')
+                        item_data['class'] = classes
+                    else:
+                        classes_list = classes.split()
+                        if cid in edited and 'edited' not in classes_list:
+                            classes_list.append('edited')
+                        if cid in added and 'added' not in classes_list:
+                            classes_list.append('added')
+                        item_data['class'] = ' '.join(classes_list)
+        if added_row:
+            classes = row.get('class', [])
+            if isinstance(classes, list):
+                if 'added' not in classes:
+                    classes.append('added')
+                row['class'] = classes
+            else:
+                classes_list = classes.split()
+                if 'added' not in classes_list:
+                    classes_list.append('added')
+                row['class'] = ' '.join(classes_list)
+        return str(row)
+
+    @staticmethod
+    def identify_deletions_fast(baseline_soup, current_soup) -> Dict:
+        """identify_deletions_with_values with O(rows + items) dict indexes
+        instead of O(rows²) per-row ``find`` scans."""
+        baseline_table = baseline_soup.find('table', id='table-data')
+        current_table = current_soup.find('table', id='table-data')
+        if not baseline_table or not current_table:
+            return {'deleted_items': [], 'deleted_rows': [], 'deleted_item_values': {}}
+        baseline_tbody = baseline_table.find('tbody')
+        current_tbody = current_table.find('tbody')
+        if not baseline_tbody or not current_tbody:
+            return {'deleted_items': [], 'deleted_rows': [], 'deleted_item_values': {}}
+
+        baseline_rows = {tr.get('id'): tr for tr in baseline_tbody.find_all('tr', id=True)}
+        current_rows = {tr.get('id'): tr for tr in current_tbody.find_all('tr', id=True)}
+        deleted_rows = list(baseline_rows.keys() - current_rows.keys())
+
+        deleted_items: List[str] = []
+        deleted_item_values: Dict[str, str] = {}
+
+        def _items_by_id(row: Tag) -> Dict[str, Tag]:
+            return {
+                c.get('id'): c
+                for c in row.find_all('span', class_='item-container', recursive=True)
+                if c.get('id')
+            }
+
+        for row_id, baseline_row in baseline_rows.items():
+            if row_id in current_rows:
+                current_row = current_rows[row_id]
+                baseline_items = _items_by_id(baseline_row)
+                current_items = _items_by_id(current_row)
+                for item_id, b_container in baseline_items.items():
+                    b_data = b_container.find('span', class_='item-data')
+                    b_value = b_data.get_text(strip=False) if b_data else ''
+                    if item_id not in current_items:
+                        deleted_items.append(item_id)
+                        deleted_item_values[item_id] = b_value
+                    else:
+                        c_data = current_items[item_id].find('span', class_='item-data')
+                        c_value = c_data.get_text(strip=False) if c_data else ''
+                        if b_value.strip() and not c_value.strip():
+                            deleted_items.append(item_id)
+                            deleted_item_values[item_id] = b_value
+
+        return {
+            'deleted_items': deleted_items,
+            'deleted_rows': deleted_rows,
+            'deleted_item_values': deleted_item_values
+        }
+
+    @staticmethod
+    def _build_ghost_row_html(current_soup, row_id: str,
+                              deleted_item_values: Dict[str, str]) -> str:
+        """Build the ghost <tr> string for a fully deleted row (mirrors the
+        ghost-row branch of insert_deleted_overlays)."""
+        row_number = (int(row_id.replace('row', ''))
+                      if row_id.startswith('row') and row_id.replace('row', '').isdigit()
+                      else -1)
+        bs = BeautifulSoup('', 'html.parser')
+        ghost_row = bs.new_tag('tr', attrs={
+            'class': 'deleted',
+            'id': f'ghost-{row_id}',
+            'data-ghost-row-id': row_id
+        })
+        row_number_cell = bs.new_tag('td', attrs={'class': 'row-number'})
+        row_number_cell.string = str(row_number)
+        ghost_row.append(row_number_cell)
+
+        table = current_soup.find('table', id='table-data')
+        header_row = table.find('thead').find('tr') if table and table.find('thead') else None
+        headers = header_row.find_all('th') if header_row else []
+        row_num = row_id.replace('row', '')
+
+        for col_idx in range(1, len(headers)):
+            cell = bs.new_tag('td', attrs={'class': 'field-value'})
+            field_name = headers[col_idx].get_text(strip=True)
+            found_items = False
+            for item_id, value in deleted_item_values.items():
+                item_parts = item_id.split('-')
+                if len(item_parts) >= 3:
+                    if item_parts[0] == row_num and '-'.join(item_parts[1:-1]) == field_name:
+                        ghost_item = HTMLParser.create_ghost_item_container(
+                            bs, item_id, value, field_name in HTMLParser.ITEM_SEPARATORS
+                        )
+                        cell.append(ghost_item)
+                        found_items = True
+            if not found_items:
+                ghost_cell = bs.new_tag('span', attrs={
+                    'class': 'deleted-placeholder',
+                    'style': 'color: #842029; font-style: italic;'
+                })
+                ghost_cell.string = '(deleted)'
+                cell.append(ghost_cell)
+            ghost_row.append(cell)
+        return str(ghost_row)
+
+    @staticmethod
+    def insert_deleted_overlays_fast(current_html: str, current_soup,
+                                     deletions: Dict,
+                                     deleted_item_values: Dict[str, str]) -> str:
+        """insert_deleted_overlays as string surgery on the canonical HTML.
+
+        Ghost rows/items are spliced into a *copy* of the canonical string via
+        per-row mini-parses, so the cached tree and canonical state are never
+        mutated by a view.
+        """
+        table = current_soup.find('table', id='table-data')
+        if not table:
+            return current_html
+        html_out = current_html
+
+        # Current rows in document order, for ghost-row insertion anchors
+        rows_in_order = []
+        for tr in table.find('tbody').find_all('tr', id=True):
+            rid = tr.get('id', '')
+            if rid.startswith('row') and rid.replace('row', '').isdigit():
+                rows_in_order.append((rid, int(rid.replace('row', ''))))
+
+        deleted_rows = deletions.get('deleted_rows', [])
+        for row_id in sorted(
+            deleted_rows,
+            key=lambda x: int(x.replace('row', '')) if x.replace('row', '').isdigit() else 0
+        ):
+            number = (int(row_id.replace('row', ''))
+                      if row_id.startswith('row') and row_id.replace('row', '').isdigit()
+                      else -1)
+            if number < 0:
+                continue
+            ghost_html = HTMLParser._build_ghost_row_html(current_soup, row_id, deleted_item_values)
+            anchor_id = next((rid for rid, num in rows_in_order if num > number), None)
+            html_out = insert_row_str(html_out, ghost_html, anchor_id)
+
+        for item_id in deletions.get('deleted_items', []):
+            parts = item_id.split('-')
+            if len(parts) < 3:
+                continue
+            row_num = parts[0]
+            if not row_num.isdigit():
+                continue
+            row_id = f'row{row_num}'
+            field_name = '-'.join(parts[1:-1])
+            if row_id in deleted_rows:
+                continue
+            try:
+                start, end = find_row_bounds(html_out, row_id)
+            except SpliceError:
+                continue
+            bs = BeautifulSoup(html_out[start:end], 'html.parser')
+            row = bs.find('tr')
+            if row is None:
+                continue
+            cell = HTMLParser._get_cell_in_row(row, field_name)
+            if not cell:
+                continue
+            value = deleted_item_values.get(item_id, '')
+            ghost_item = HTMLParser.create_ghost_item_container(
+                bs, item_id, value, field_name in HTMLParser.ITEM_SEPARATORS
+            )
+            item_index = int(parts[-1]) if parts[-1].isdigit() else -1
+            inserted = False
+            for container in cell.find_all('span', class_='item-container', recursive=False):
+                container_parts = container.get('id', '').split('-')
+                if len(container_parts) >= 3 and container_parts[-1].isdigit():
+                    if int(container_parts[-1]) > item_index:
+                        container.insert_before(ghost_item)
+                        inserted = True
+                        break
+            if not inserted:
+                cell.append(ghost_item)
+            html_out = html_out[:start] + str(row) + html_out[end:]
+
+        return html_out

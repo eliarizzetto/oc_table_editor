@@ -4,6 +4,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 import aiofiles
 
@@ -38,6 +39,10 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# Compress large HTML/JSON responses (a 12 MB table ships as ~1.2 MB).
+# Small endpoints skip compression entirely.
+app.add_middleware(GZipMiddleware, minimum_size=100_000, compresslevel=6)
 
 # Setup directories
 SESSION_DIR.mkdir(parents=True, exist_ok=True)

@@ -3,37 +3,23 @@
 // ── Bootstrap widget initialisation ──────────────────────────────────────────
 // Exposed as a named function so it can be re-called after dynamic HTML injection
 // (the table HTML is loaded asynchronously, so DOMContentLoaded is too early).
+//
+// Popovers/tooltips are initialised lazily via delegation (see
+// setupTableDelegation) — initialising ~1300 issue icons eagerly after every
+// table load was a major cost on large tables. This function only needs to
+// keep the oc_validator overrides in place.
 
 function initBootstrapWidgets() {
-    // Enable Bootstrap popovers for issue icons
-    const popoverTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="popover"]'));
-    popoverTriggerList.map(function(el) {
-        // Dispose any existing popover instance before creating a new one to avoid duplicates
-        const existing = bootstrap.Popover.getInstance(el);
-        if (existing) existing.dispose();
-        return new bootstrap.Popover(el);
-    });
-
-    // Enable Bootstrap tooltips
-    const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
-    tooltipTriggerList.map(function(el) {
-        const existing = bootstrap.Tooltip.getInstance(el);
-        if (existing) existing.dispose();
-        return new bootstrap.Tooltip(el);
-    });
-
     // Override the highlightInvolvedElements function that oc_validator embeds in the HTML.
     // The embedded script runs after HTML injection and defines its own version,
     // so we must override it here to redirect to our filtered-view behavior.
     window.highlightInvolvedElements = function(clickedIssue) {
-        console.log('OVERRIDE highlightInvolvedElements called for:', clickedIssue.id);
-        
         // Hide the popover immediately so it doesn't cover the filtered view
         const popover = bootstrap.Popover.getInstance(clickedIssue);
         if (popover) {
             popover.hide();
         }
-        
+
         const issueId = clickedIssue.id;
         if (!issueId) {
             console.warn('Issue icon has no id attribute');
@@ -46,8 +32,80 @@ function initBootstrapWidgets() {
     window.clearHighlights = function() {};
 }
 
+// ── Delegated table interactions ─────────────────────────────────────────────
+// One click listener on the persistent #tableContainer replaces per-item
+// listeners on every .item-data span and every injected button, so replaced
+// rows (targeted updates) need no re-attachment.
+
+function fieldNameFromCell(td) {
+    if (!td) return null;
+    const classes = Array.from(td.classList);
+    const fvIdx = classes.indexOf('field-value');
+    return (fvIdx >= 0 && fvIdx + 1 < classes.length) ? classes[fvIdx + 1] : null;
+}
+
+function setupTableDelegation() {
+    const container = document.getElementById('tableContainer');
+    if (!container) return;  // not on the editor page
+
+    container.addEventListener('click', function(e) {
+        // Issue icons keep their inline onclick → highlightInvolvedElements
+        if (e.target.closest('.issue-icon')) return;
+
+        const btn = e.target.closest('button');
+        if (btn) {
+            e.stopPropagation();
+            const tr = btn.closest('tr');
+            const rowId = (tr && tr.id) ? tr.id : null;
+            if (btn.classList.contains('add-row-btn')) { addNewRow(); return; }
+            if (btn.classList.contains('delete-row-btn')) {
+                if (rowId) deleteRow(rowId);
+                return;
+            }
+            const fieldName = fieldNameFromCell(btn.closest('td.field-value'));
+            if (btn.classList.contains('clear-cell-btn')) {
+                if (rowId && fieldName) clearCell(rowId, fieldName);
+                return;
+            }
+            if (btn.classList.contains('add-item-btn') || btn.classList.contains('add-first-item-btn')) {
+                if (rowId && fieldName) openAddItemModal(rowId, fieldName);
+                return;
+            }
+            return;  // unknown button — do nothing
+        }
+
+        // Click on a value → open the edit modal
+        const item = e.target.closest('.item-data');
+        if (item) {
+            const itemContainer = item.closest('.item-container');
+            if (!itemContainer || !itemContainer.id) return;
+            e.stopPropagation();
+            e.preventDefault();
+            currentItemId = itemContainer.id;
+            openEditModal(item.textContent, currentItemId);
+        }
+    });
+
+    // Lazy popover/tooltip initialisation: construct the Bootstrap instance
+    // on first hover (and show it immediately, since the mouse is already
+    // over the element and the instance's own listeners start from the next
+    // hover cycle).
+    container.addEventListener('mouseover', function(e) {
+        const el = e.target.closest('[data-bs-toggle="popover"], [data-bs-toggle="tooltip"]');
+        if (!el || el.dataset.lazyInit) return;
+        el.dataset.lazyInit = '1';
+        if (el.getAttribute('data-bs-toggle') === 'popover') {
+            const popover = new bootstrap.Popover(el);
+            popover.show();
+        } else {
+            new bootstrap.Tooltip(el);
+        }
+    });
+}
+
 document.addEventListener('DOMContentLoaded', function() {
     initBootstrapWidgets();
+    setupTableDelegation();
 });
 
 

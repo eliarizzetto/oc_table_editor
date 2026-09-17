@@ -12,6 +12,24 @@ from oc_validator.interface.gui import make_gui, merge_html_files
 router = APIRouter()
 
 
+def _check_csv_header(filename: str, content: bytes) -> None:
+    """
+    Reject CSVs whose header contains characters that oc_validator would
+    interpolate unescaped into HTML class names / element ids (<, >, ").
+    Such headers already produce broken table markup today; failing early
+    gives a clear message instead.
+    """
+    header = content.decode('utf-8-sig', errors='replace').split('\n', 1)[0]
+    bad = [ch for ch in '<>"' if ch in header]
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{filename}': CSV header contains characters that cannot be "
+                   f"rendered in the editor ({', '.join(bad)}). "
+                   f"Please fix the header row."
+        )
+
+
 def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool) -> None:
     """
     Generate an HTML visualisation for a validated CSV table.
@@ -95,6 +113,7 @@ async def upload_files(
         meta_content = await metadata_file.read()
         if not meta_content:
             raise HTTPException(status_code=400, detail="Metadata file is empty.")
+        _check_csv_header(filename, meta_content)
         meta_path = await SessionManager.save_uploaded_file(session_id, meta_content, filename)
         session.meta_csv_path = meta_path
 
@@ -103,6 +122,7 @@ async def upload_files(
         cits_content = await citations_file.read()
         if not cits_content:
             raise HTTPException(status_code=400, detail="Citations file is empty.")
+        _check_csv_header(filename, cits_content)
         cits_path = await SessionManager.save_uploaded_file(session_id, cits_content, filename)
         session.cits_csv_path = cits_path
 

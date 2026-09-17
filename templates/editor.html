@@ -377,134 +377,178 @@ async function loadSessionInfo() {
 }
 
 function setupEditHandlers() {
-    // TODO: vedi se questo primo step serve effettivamente a qualcosa, eventualmente rimuovilo
+    // Full-(re)load path: enhance every row. Click handling is delegated
+    // (see setupTableDelegation in editor.js), so this only needs to inject
+    // the per-row/per-cell buttons and clean up empty containers.
+    document.querySelectorAll('#tableContainer tr[id]').forEach(enhanceRow);
+    ensureAddRowButton();
+}
+
+/**
+ * Enhance a single table row: remove empty item-containers without
+ * validation errors, inject the delete-row button and the per-cell
+ * clear/add buttons.  Idempotent — safe to call again after replacing
+ * a row's HTML.
+ */
+function enhanceRow(tr) {
+    if (!tr || !tr.id || !tr.id.startsWith('row')) return;
+
     // 1. Remove empty item-containers that don't have validation errors
-    document.querySelectorAll('.item-container').forEach(container => {
+    tr.querySelectorAll('.item-container').forEach(container => {
         const itemData = container.querySelector('.item-data');
         if (itemData && itemData.textContent.trim() === '') {
-            // Check if this empty item has a validation error
             const hasIssueIcon = container.querySelector('.issue-icon');
             if (!hasIssueIcon) {
-                // No error - remove the entire empty item-container
                 container.remove();
             } else {
-                // Has error - mark it with empty-slot class
                 itemData.classList.add('empty-slot');
             }
         }
     });
 
-    // 2. Attach click handlers to all .item-data spans (non-issue-icon clicks)
-    document.querySelectorAll('.item-data').forEach(item => {
-        item.addEventListener('click', function(e) {
-            if (e.target.classList.contains('issue-icon')) return;
-            e.stopPropagation();
-            e.preventDefault();
-            const container = this.closest('.item-container');
-            if (!container || !container.id) return;
-            currentItemId = container.id;
-            openEditModal(this.textContent, currentItemId);
-        });
-        item.style.cursor = 'pointer';
-    });
-
-    // 3. Inject delete-row buttons into row-number cells (visible on row hover)
-    document.querySelectorAll('td.row-number').forEach(cell => {
-        const row = cell.closest('tr');
-        if (!row || !row.id) return;
-        const rowId = row.id;
+    // 2. Delete-row button in the row-number cell (visible on row hover)
+    const numCell = tr.querySelector('td.row-number');
+    if (numCell && !numCell.querySelector('.delete-row-btn')) {
         const delBtn = document.createElement('button');
         delBtn.className = 'delete-row-btn table-action';
         delBtn.title = 'Delete this entire row';
         delBtn.textContent = '🗑';
-        delBtn.addEventListener('click', e => { e.stopPropagation(); deleteRow(rowId); });
-        cell.appendChild(delBtn);
-    });
+        numCell.appendChild(delBtn);
+    }
 
-    // 4. Inject clear-cell buttons and add-item buttons
-    document.querySelectorAll('td.field-value').forEach(cell => {
+    // 3. Clear-cell and add-item buttons per cell
+    tr.querySelectorAll('td.field-value').forEach(cell => {
+        if (cell.querySelector('.clear-cell-btn')) return; // already enhanced
         const classes = Array.from(cell.classList);
         const fvIdx = classes.indexOf('field-value');
         const fieldName = (fvIdx >= 0 && fvIdx + 1 < classes.length) ? classes[fvIdx + 1] : null;
         if (!fieldName) return;
-        const row = cell.closest('tr');
-        if (!row || !row.id) return;
-        const rowId = row.id;
 
-        // "✕ clear" button — revealed on cell hover via CSS
+        // "🧹 clear" button — revealed on cell hover via CSS
         const clearBtn = document.createElement('button');
         clearBtn.className = 'clear-cell-btn table-action';
         clearBtn.title = `Clear all values in "${fieldName}"`;
         clearBtn.textContent = '🧹';
-        clearBtn.addEventListener('click', e => { e.stopPropagation(); clearCell(rowId, fieldName); });
         cell.appendChild(clearBtn);
 
         const containers = cell.querySelectorAll('.item-container');
         const isMultiValue = MULTI_VALUE_FIELDS.has(fieldName);
 
-        if (isMultiValue) {
-            // For multi-value fields, inject add-item button
-            if (containers.length === 0) {
-                // Empty multi-value cell - show "add first value" button
-                const addBtn = document.createElement('button');
-                addBtn.className = 'add-first-item-btn table-action';
-                addBtn.textContent = '+';
-                addBtn.title = 'Add an item to this field'
-                addBtn.addEventListener('click', e => { e.stopPropagation(); openAddItemModal(rowId, fieldName); });
-                cell.insertBefore(addBtn, clearBtn);
-            } else {
-                // Multi-value cell with items - show "+ add" button after last item
-                const lastContainer = containers[containers.length - 1];
-                const addBtn = document.createElement('button');
-                addBtn.className = 'add-item-btn table-action';
-                addBtn.textContent = '+';
-                addBtn.title = 'Add another item to this field';
-                addBtn.addEventListener('click', e => { 
-                    e.stopPropagation(); 
-                    openAddItemModal(rowId, fieldName);
-                });
-                cell.insertBefore(addBtn, clearBtn);
-            }
-        } else {
-            // For single-value fields, show add button only if cell is empty
-            if (containers.length === 0) {
-                const addBtn = document.createElement('button');
-                addBtn.className = 'add-first-item-btn table-action';
-                addBtn.textContent = '+';
-                addBtn.title = 'Add an item to this field'
-                addBtn.addEventListener('click', e => { e.stopPropagation(); openAddItemModal(rowId, fieldName); });
-                cell.insertBefore(addBtn, clearBtn);
-            }
+        // "+" add button: multi-value cells always get one; single-value
+        // cells only while empty (defensive — UI prevents double adds).
+        const needsAdd = isMultiValue || containers.length === 0;
+        if (needsAdd) {
+            const addBtn = document.createElement('button');
+            addBtn.className = (containers.length === 0
+                ? 'add-first-item-btn' : 'add-item-btn') + ' table-action';
+            addBtn.textContent = '+';
+            addBtn.title = containers.length === 0
+                ? 'Add an item to this field'
+                : 'Add another item to this field';
+            cell.insertBefore(addBtn, clearBtn);
         }
     });
+}
 
-    // 5. Inject "Add Row" button at the end of tbody
+/**
+ * Keep the "+ row" button at the end of tbody (exactly one instance).
+ */
+function ensureAddRowButton() {
     const table = document.getElementById('table-data');
-    if (table) {
-        const tbody = table.querySelector('tbody');
-        if (tbody) {
-            const addRowBtn = document.createElement('button');
-            addRowBtn.className = 'add-row-btn';  //style this button differently than buttons inside cells
-            addRowBtn.textContent = '+ row';
-            addRowBtn.title = 'Add a new empty row to the table';
-            addRowBtn.addEventListener('click', e => { e.stopPropagation(); addNewRow(); });
-            tbody.appendChild(addRowBtn);
-        }
-    }
+    if (!table) return;
+    const tbody = table.querySelector('tbody');
+    if (!tbody || tbody.querySelector('.add-row-btn')) return;
+    const addRowBtn = document.createElement('button');
+    addRowBtn.className = 'add-row-btn';  // styled differently than buttons inside cells
+    addRowBtn.textContent = '+ row';
+    addRowBtn.title = 'Add a new empty row to the table';
+    tbody.appendChild(addRowBtn);
 }
 
 // Multi-value fields (must match HTMLParser.ITEM_SEPARATORS in html_parser.py)
 const MULTI_VALUE_FIELDS = new Set(['citing_id', 'cited_id', 'id', 'author', 'publisher', 'editor']);
 
+// ── Targeted row patching (server returns row_html after mutations) ─────────
+
+function disposePopoversIn(el) {
+    if (!el) return;
+    el.querySelectorAll('[data-bs-toggle="popover"]').forEach(pEl => {
+        const inst = bootstrap.Popover.getInstance(pEl);
+        if (inst) inst.dispose();
+    });
+    el.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(tEl => {
+        const inst = bootstrap.Tooltip.getInstance(tEl);
+        if (inst) inst.dispose();
+    });
+}
+
+/** Parse a server-provided "<tr>...</tr>" string into a live element. */
+function parseRowHtml(rowHtml) {
+    const tpl = document.createElement('template');
+    tpl.innerHTML = rowHtml.trim();
+    const row = tpl.content.firstElementChild;
+    return (row && row.tagName === 'TR') ? row : null;
+}
+
+/** Replace an existing <tr> in place. Returns true on success. */
+function replaceRow(rowId, rowHtml) {
+    const container = document.getElementById('tableContainer');
+    const old = container.querySelector(`tr[id="${rowId}"]`);
+    const newRow = parseRowHtml(rowHtml);
+    if (!old || !newRow) return false;
+    disposePopoversIn(old);
+    old.replaceWith(newRow);
+    enhanceRow(newRow);
+    return true;
+}
+
+/** Insert a new <tr> before beforeRowId (or at the end, before the +row button). */
+function insertRow(rowHtml, beforeRowId) {
+    const container = document.getElementById('tableContainer');
+    const tbody = container.querySelector('#table-data tbody');
+    const newRow = parseRowHtml(rowHtml);
+    if (!tbody || !newRow) return false;
+    const anchor = beforeRowId
+        ? tbody.querySelector(`tr[id="${beforeRowId}"]`)
+        : tbody.querySelector('.add-row-btn');
+    if (anchor) tbody.insertBefore(newRow, anchor);
+    else tbody.appendChild(newRow);
+    enhanceRow(newRow);
+    return true;
+}
+
+/** Remove a <tr> from the DOM. Returns true on success. */
+function removeRow(rowId) {
+    const container = document.getElementById('tableContainer');
+    const row = container.querySelector(`tr[id="${rowId}"]`);
+    if (!row) return false;
+    disposePopoversIn(row);
+    row.remove();
+    return true;
+}
+
 /**
- * Parse the field name from an item_id string.
- * item_id format: "{row}-{field}-{index}"  (field may contain hyphens, e.g. "citing_id")
- * Everything between the first and last "-" component is the field name.
+ * Apply a mutation response to the table in place.
+ * mode: 'replace' | 'insert' | 'remove'.
+ * Returns false when in-place patching is not possible (filtered view
+ * active, row_html missing, or target row not found) — callers should
+ * then fall back to a full reload.
  */
-function fieldNameFromItemId(itemId) {
-    const parts = itemId.split('-');
-    if (parts.length < 3) return null;
-    return parts.slice(1, -1).join('-');
+function applyRowPatch(data, mode) {
+    if (typeof currentFilterIssueId !== 'undefined' && currentFilterIssueId) return false;
+    try {
+        if (mode === 'remove') {
+            return !!(data && data.row_id && removeRow(data.row_id));
+        }
+        if (!data || !data.row_html) return false;
+        if (mode === 'insert') {
+            return insertRow(data.row_html, data.insert_before_row_id || null);
+        }
+        return !!(data.row_id && replaceRow(data.row_id, data.row_html));
+    } catch (err) {
+        console.warn('Row patch failed, falling back to full reload:', err);
+        return false;
+    }
 }
 
 function openEditModal(currentValue, itemId) {
@@ -549,7 +593,7 @@ async function saveNewItem() {
             addItemModal.hide();
             showAlert('success', 'Item Added', 'The new item has been added to the field.');
             updateUndoRedoButtons();
-            reloadTable();
+            if (!applyRowPatch(data, 'replace')) await reloadTable();
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to add item');
@@ -578,7 +622,7 @@ async function deleteItem(itemId) {
             editModal.hide();
             showAlert('success', 'Item Deleted', 'The item has been removed from the field.');
             updateUndoRedoButtons();
-            reloadTable();
+            if (!applyRowPatch(data, 'replace')) await reloadTable();
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to delete item');
@@ -601,7 +645,7 @@ async function deleteRow(rowId) {
             editModal.hide();
             showAlert('success', 'Row Deleted', 'The row has been removed from the table.');
             updateUndoRedoButtons();
-            reloadTable();
+            if (!applyRowPatch(data, 'remove')) await reloadTable();
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to delete row');
@@ -624,56 +668,10 @@ async function clearCell(rowId, fieldName) {
             editModal.hide();
             showAlert('success', 'Field Cleared', `The "${fieldName}" field has been cleared.`);
             updateUndoRedoButtons();
-            reloadTable();
+            if (!applyRowPatch(data, 'replace')) await reloadTable();
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to clear field');
-        }
-    } catch (error) {
-        showAlert('error', 'Error', error.message);
-    }
-}
-
-async function initCell(rowId, fieldName) {
-    // Initialise an empty multi-value cell so it becomes clickable
-    try {
-        const response = await fetch('/api/edit/cell/clear', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: sessionId, row_id: rowId, field_name: fieldName })
-        });
-        const data = await response.json();
-        if (response.ok) {
-            reloadTable();
-            loadSessionInfo();
-        } else {
-            throw new Error(data.detail || 'Failed to initialize cell');
-        }
-    } catch (error) {
-        showAlert('error', 'Error', error.message);
-    }
-}
-
-async function addItemToCell(itemId) {
-    try {
-        const response = await fetch('/api/edit/item/add', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                session_id: sessionId,
-                item_id: itemId
-            })
-        });
-
-        const data = await response.json();
-
-        if (response.ok) {
-            editModal.hide();
-            showAlert('success', 'Item Added', 'A new empty slot has been added. Click it to enter a value.');
-            reloadTable();
-            loadSessionInfo();
-        } else {
-            throw new Error(data.detail || 'Failed to add item');
         }
     } catch (error) {
         showAlert('error', 'Error', error.message);
@@ -693,7 +691,7 @@ async function addNewRow() {
         if (response.ok) {
             showAlert('success', 'Row Added', 'A new empty row has been added to the table.');
             updateUndoRedoButtons();
-            reloadTable();
+            if (!applyRowPatch(data, 'insert')) await reloadTable();
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to add row');
@@ -725,7 +723,7 @@ async function saveEdit() {
             showAlert('success', 'Saved', 'Item updated successfully!');
             editModal.hide();
             updateUndoRedoButtons();
-            reloadTable();
+            if (!applyRowPatch(data, 'replace')) await reloadTable();
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to save');
