@@ -14,11 +14,16 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Optional
 
 from services import SessionManager, HTMLParser, ValidatorService, CSVExporter
 from services.journal import ChangeJournal
-from services.session_document import compose_display, document_cache
+from services.session_document import (
+    SpliceError,
+    _slice_div,
+    compose_display,
+    document_cache,
+)
 from services.validator_service import load_jsonl_report
 from services.view_builder import (
     TableView,
@@ -27,7 +32,7 @@ from services.view_builder import (
     load_table_state,
 )
 from models import Session
-from config import TEMP_DIR
+from config import TABLE_PAGE_SIZE, TEMP_DIR
 
 # Import oc_validator interface for HTML generation and merging
 from oc_validator.interface.gui import make_gui, merge_html_files
@@ -86,16 +91,6 @@ def _recompute(state: dict, journal: ChangeJournal) -> TableView:
                      journal.applied_events)
 
 
-def _base_item_values(state: dict) -> dict:
-    """Flat {item_id: value} of the baseline, for original-value lookups."""
-    out = {}
-    for fields in state['artifacts'].get('rows', {}).values():
-        for items in fields.values():
-            for item_id, value in items:
-                out[item_id] = value
-    return out
-
-
 def _cleanup_legacy_state_files(session_id: str) -> None:
     """Remove pre-journal tracking files if a session still carries them."""
     session_dir = TEMP_DIR / session_id
@@ -104,6 +99,41 @@ def _cleanup_legacy_state_files(session_id: str) -> None:
         (session_dir / name).unlink(missing_ok=True)
     import shutil
     shutil.rmtree(session_dir / 'undo', ignore_errors=True)
+
+
+def _page_count(total: int) -> int:
+    """Number of TABLE_PAGE_SIZE pages needed for ``total`` rows (≥ 1)."""
+    return max(1, -(-total // TABLE_PAGE_SIZE))
+
+
+def _pager_html(kind: str, page: int, page_count: int, total_rows: int) -> str:
+    """Pager bar injected after each table.  Clicks are handled by the
+    delegated listener in editor.js (``[data-pager] button[data-page]``)."""
+    at_first = page <= 1
+    at_last = page >= page_count
+    rows_label = 'row' if total_rows == 1 else 'rows'
+    return (
+        f'<div class="table-pager" data-pager="{kind}">'
+        f'<button type="button" class="btn btn-sm btn-outline-secondary" '
+        f'data-page="1" title="First page"{" disabled" if at_first else ""}>«</button>'
+        f'<button type="button" class="btn btn-sm btn-outline-secondary" '
+        f'data-page="{max(1, page - 1)}" title="Previous page"{" disabled" if at_first else ""}>‹</button>'
+        f'<span class="pager-info">Page {page} of {page_count} · {total_rows} {rows_label}</span>'
+        f'<button type="button" class="btn btn-sm btn-outline-secondary" '
+        f'data-page="{min(page_count, page + 1)}" title="Next page"{" disabled" if at_last else ""}>›</button>'
+        f'<button type="button" class="btn btn-sm btn-outline-secondary" '
+        f'data-page="{page_count}" title="Last page"{" disabled" if at_last else ""}>»</button>'
+        f'</div>'
+    )
+
+
+def _general_info_or_500(base_html: str, table_type: str) -> str:
+    try:
+        return _slice_div(base_html, 'container-fluid general-info')
+    except SpliceError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Cannot slice general-info from {table_type} baseline: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -134,11 +164,6 @@ class RevalidateRequest(BaseModel):
     verify_id_existence: Optional[bool] = None
 
 
-class GetFilteredRowsRequest(BaseModel):
-    session_id: str
-    issue_id: str
-
-
 class DeleteRowRequest(BaseModel):
     session_id: str
     row_id: str   # e.g. "row5"
@@ -166,14 +191,24 @@ class CommitRequest(BaseModel):
 # Routes
 # ---------------------------------------------------------------------------
 
-@router.get("/html/{session_id}")
-async def get_html(session_id: str):
+@router.get("/table/{session_id}")
+async def get_table_view(session_id: str, page: int = 1, show_all: bool = False,
+                         changes_only: bool = False, issue_id: Optional[str] = None,
+                         focus_row_id: Optional[str] = None, cits_page: int = 1):
     """
-    Get the current table HTML for a session (baseline + journal events).
+    One page (≤ TABLE_PAGE_SIZE rows) of the editor's table view.
 
-    For paired sessions the display document is derived on the fly from the
-    meta view and the citations base, so edits, added rows, and undo/redo
-    are always reflected immediately.
+    Row visibility: by default only rows with issues (errors/warnings) or
+    with journal changes (edits / additions / deletions — ghost rows count
+    as changed); ``show_all`` reveals every row regardless of validity,
+    ``changes_only`` restricts the view to changed rows.  ``issue_id``
+    switches to the single-issue filtered view.  Ghost overlays for deleted
+    items/rows are always part of the rendered rows.  Rows are selected by
+    id, never by position; ``focus_row_id`` (a live row id, or a
+    ``ghost-`` prefixed one) selects the page containing that row.
+
+    For paired sessions the read-only citations table is appended, paginated
+    independently via ``cits_page``.
     """
     session = await SessionManager.load_session(session_id)
     if not session:
@@ -181,15 +216,119 @@ async def get_html(session_id: str):
 
     async with document_cache.session_lock(session_id):
         journal, view, state = await _load_view(session_id, session)
+        artifacts = state['artifacts']
+
+        if not artifacts.get('has_table'):
+            # Legacy fallback: fully-valid uploads have no parsable table —
+            # serve the whole document with the paging UI disabled.
+            if session.has_metadata and session.has_citations:
+                cits_state = await load_table_state(session_id, 'cits')
+                if cits_state is None:
+                    raise HTTPException(status_code=404,
+                                        detail="HTML content not found")
+                html_content = compose_display(view.html, cits_state['base_html'])
+            else:
+                html_content = view.html
+            return {"html": html_content, "has_table": False,
+                    "paginated": False, "page": 1, "page_count": 1,
+                    "total_rows": 0, "table_type": _editable_table_type(session),
+                    "cits": None}
+
+        deletions = view.compute_deletions()
+        changed = view.changed_row_ids(deletions)
+        issues = view.issue_row_ids()
+
+        if issue_id is not None:
+            entries = [{'row_id': rid, 'ghost': False}
+                       for rid in artifacts['issue_index'].get(issue_id, [])
+                       if rid in view.row_ids]
+        else:
+            entries = [e for e in view.display_rows()
+                       if (show_all or e['row_id'] in issues
+                           or e['row_id'] in changed)
+                       and (not changes_only or e['row_id'] in changed)]
+
+        total = len(entries)
+        page_count = _page_count(total)
+        page = max(1, min(page, page_count))
+        if focus_row_id:
+            base_focus = (focus_row_id[6:]
+                          if focus_row_id.startswith('ghost-') else focus_row_id)
+            for i, e in enumerate(entries):
+                if e['row_id'] == base_focus:
+                    page = i // TABLE_PAGE_SIZE + 1
+                    break
+
+        page_entries = entries[(page - 1) * TABLE_PAGE_SIZE:page * TABLE_PAGE_SIZE]
+
+        # Deleted items per surviving row (for in-row ghost containers)
+        deleted_by_row = {}
+        for item_id in deletions['deleted_items']:
+            rid = _row_id_for_item(item_id)
+            if rid in deletions['deleted_rows']:
+                continue
+            deleted_by_row.setdefault(rid, []).append(item_id)
+        values = deletions['deleted_item_values']
+
+        row_parts = []
+        for e in page_entries:
+            if e['ghost']:
+                row_parts.append(view.ghost_row_html(e['row_id']))
+            else:
+                row_parts.append(view.row_html_with_ghosts(
+                    e['row_id'], deleted_by_row.get(e['row_id'], []), values))
+
+        editable_open = artifacts['table_open_tag'].replace(
+            '>', ' data-editable="1">', 1)
+        html_parts = [
+            _general_info_or_500(state['base_html'],
+                                 _editable_table_type(session)),
+            '<div class="table-container container-fluid">',
+            editable_open, artifacts['thead_html'], '<tbody>',
+            *row_parts,
+            '</tbody></table></div>',
+            _pager_html('meta', page, page_count, total),
+        ]
+
+        cits_info = None
         if session.has_metadata and session.has_citations:
             cits_state = await load_table_state(session_id, 'cits')
             if cits_state is None:
-                raise HTTPException(status_code=404, detail="HTML content not found")
-            html_content = compose_display(view.html, cits_state['base_html'])
-        else:
-            html_content = view.html
+                raise HTTPException(status_code=404,
+                                    detail="HTML content not found")
+            cits_art = cits_state['artifacts']
+            cits_base = cits_state['base_html']
+            if cits_art.get('has_table'):
+                cits_row_ids = cits_art.get('row_ids', [])
+                cits_total = len(cits_row_ids)
+                cits_page_count = _page_count(cits_total)
+                cits_page = max(1, min(cits_page, cits_page_count))
+                cits_slice = cits_row_ids[(cits_page - 1) * TABLE_PAGE_SIZE:
+                                          cits_page * TABLE_PAGE_SIZE]
+                cits_rows = []
+                for rid in cits_slice:
+                    s, e = cits_art['row_offsets'][rid]
+                    cits_rows.append(cits_base[s:e])
+                try:
+                    cits_gi = _slice_div(cits_base, 'container-fluid general-info')
+                except SpliceError:
+                    cits_gi = ''
+                html_parts.extend([
+                    cits_gi,
+                    '<div class="table-container container-fluid">',
+                    cits_art['table_open_tag'], cits_art['thead_html'], '<tbody>',
+                    *cits_rows,
+                    '</tbody></table></div>',
+                    _pager_html('cits', cits_page, cits_page_count, cits_total),
+                ])
+                cits_info = {"page": cits_page, "page_count": cits_page_count,
+                             "total_rows": cits_total}
+            else:
+                cits_info = {"page": 1, "page_count": 1, "total_rows": 0}
 
-    return {"html": html_content}
+    return {"html": ''.join(html_parts), "has_table": True, "paginated": True,
+            "page": page, "page_count": page_count, "total_rows": total,
+            "table_type": _editable_table_type(session), "cits": cits_info}
 
 
 @router.post("/item")
@@ -752,101 +891,6 @@ async def revalidate(request: RevalidateRequest):
 # ---------------------------------------------------------------------------
 # Views
 # ---------------------------------------------------------------------------
-
-@router.post("/filtered-rows")
-async def get_filtered_rows(request: GetFilteredRowsRequest):
-    """
-    HTML table fragment with only the rows involved in a validation issue.
-
-    Rows come from the (base-built) issue index minus journal row-deletions,
-    sliced by stored offsets and replayed with their events — selected by
-    row id, never by position (fixes the historical position/id divergence
-    after row add/delete).
-    """
-    session = await SessionManager.load_session(request.session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    async with document_cache.session_lock(request.session_id):
-        journal, view, state = await _load_view(request.session_id, session)
-        artifacts = state['artifacts']
-        if not artifacts.get('has_table'):
-            raise HTTPException(status_code=404, detail="HTML content not found")
-        row_ids = [r for r in artifacts['issue_index'].get(request.issue_id, [])
-                   if r in view.row_ids]
-        parts = [artifacts['table_open_tag'], artifacts['thead_html'], '<tbody>']
-        parts.extend(view.row_html(r) or '' for r in row_ids)
-        parts.append('</tbody></table>')
-        filtered_html = ''.join(parts)
-
-    return {
-        "html": filtered_html,
-        "row_indices": [int(r[3:]) for r in row_ids if r[3:].isdigit()],
-        "issue_id": request.issue_id
-    }
-
-
-@router.get("/edited/{session_id}")
-async def get_edited_items(session_id: str):
-    """List of edited items (original + current values), from the journal."""
-    session = await SessionManager.load_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    async with document_cache.session_lock(session_id):
-        journal, view, state = await _load_view(session_id, session)
-        last_set = {}
-        for ev in journal.applied_events:
-            if ev['op'] == 'set_item':
-                last_set[ev['item']] = ev['value']
-        base_values = _base_item_values(state)
-        edited_items = [
-            {
-                "item_id": item_id,
-                "original_value": base_values.get(item_id, ''),
-                "edited_value": value
-            }
-            for item_id, value in last_set.items()
-            if item_id in view.edited_item_ids
-        ]
-
-    return {"edited_items": edited_items, "count": len(edited_items)}
-
-
-@router.get("/deleted/{session_id}")
-async def get_deleted_view(session_id: str):
-    """
-    HTML with ghost overlays for deleted items/rows — derived from the
-    journal (per-row base-vs-view diff), never a baseline re-parse.
-
-    Paired sessions keep the historical behaviour of returning no ghosts
-    (the merged display baseline was never persisted by any code path).
-    """
-    session = await SessionManager.load_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    async with document_cache.session_lock(session_id):
-        journal, view, state = await _load_view(session_id, session)
-
-        if session.has_metadata and session.has_citations:
-            cits_state = await load_table_state(session_id, 'cits')
-            if cits_state is None:
-                raise HTTPException(status_code=404, detail="HTML content not found")
-            return {"html": compose_display(view.html, cits_state['base_html']),
-                    "has_ghosts": False}
-
-        html_with_ghosts, n_items, n_rows = view.build_ghost_html()
-        if n_items == 0 and n_rows == 0:
-            return {"html": view.html, "has_ghosts": False}
-
-    return {
-        "html": html_with_ghosts,
-        "has_ghosts": True,
-        "deleted_items_count": n_items,
-        "deleted_rows_count": n_rows
-    }
-
 
 @router.get("/session/{session_id}")
 async def get_session(session_id: str):

@@ -31,8 +31,6 @@ from services.html_parser import HTMLParser
 from services.session_document import (
     SpliceError,
     atomic_write,
-    find_row_bounds,
-    insert_row_str,
 )
 
 # Matches <tr ... id="rowN" ...> regardless of attribute order
@@ -274,13 +272,23 @@ class TableView:
         for ev in events:
             by_row.setdefault(ev['row'], []).append(ev)
 
-        self.deleted_base_rows = {ev['row'] for ev in events
-                                  if ev['op'] == 'delete_row'}
-        self.added_row_ids = [ev['row'] for ev in events
-                              if ev['op'] == 'add_row']
+        # Row existence is order-aware: a row is currently dead when its
+        # LAST add_row/delete_row event is a delete.  ``next_add_row_id``
+        # can reuse the id of a deleted added row, so "any delete event
+        # exists" would wrongly kill the re-added row.
+        last_row_op: Dict[str, str] = {}
+        for ev in events:
+            if ev['op'] in ('add_row', 'delete_row'):
+                last_row_op[ev['row']] = ev['op']
+        self.deleted_row_ids = {rid for rid, op in last_row_op.items()
+                                if op == 'delete_row'}
+        self.added_row_ids = [rid for rid in dict.fromkeys(
+                                  ev['row'] for ev in events
+                                  if ev['op'] == 'add_row')
+                              if last_row_op[rid] == 'add_row']
         base_row_ids: List[str] = artifacts.get('row_ids', [])
         self.row_ids = ([r for r in base_row_ids
-                         if r not in self.deleted_base_rows]
+                         if r not in self.deleted_row_ids]
                         + self.added_row_ids)
 
         # Replay per affected row
@@ -288,7 +296,7 @@ class TableView:
         self.added_item_ids: set = set()
         self._row_html_overrides: Dict[str, str] = {}
         for rid, evs in by_row.items():
-            if rid in self.deleted_base_rows:
+            if rid in self.deleted_row_ids:
                 continue
             edited, added, row_html = self._replay_row(rid, evs)
             self.edited_item_ids |= edited
@@ -350,7 +358,7 @@ class TableView:
 
     def _assemble(self) -> str:
         overrides = dict(self._row_html_overrides)
-        for rid in self.deleted_base_rows:
+        for rid in self.deleted_row_ids:
             overrides[rid] = None  # deletion marker
 
         pieces: List[str] = []
@@ -463,88 +471,60 @@ class TableView:
             out.append(row_dict)
         return out
 
-    # -- deletions (ghost view) ------------------------------------------------------
+    # -- display rows (filtering + pagination) -----------------------------------
 
-    def compute_deletions(self) -> dict:
-        """Per-row base-vs-view diff: deleted items/rows with their values.
+    def display_rows(self) -> List[dict]:
+        """Ordered display list: base rows (deleted ones as ghosts) + added rows.
 
-        Mirrors the old ``identify_deletions_with_values`` semantics:
-        - items present in base but absent from the view are deleted;
-        - items present in both but emptied (edit-to-empty) are deleted;
-        - added rows/items never ghost (they are not in the base).
+        The single source of row order for filtering/pagination.  Iterating
+        ``artifacts['row_ids']`` puts each ghost at its numeric position and
+        keeps added rows last; added-then-deleted rows are excluded from
+        ``added_row_ids`` entirely, so they correctly leave no ghost.
         """
-        deleted_items: List[str] = []
-        deleted_item_values: Dict[str, str] = {}
-        rows_with_events = {ev['row'] for ev in self.events}
-        for rid in rows_with_events:
-            if rid in self.deleted_base_rows or rid in self.added_row_ids:
-                continue
-            if rid not in self.artifacts['rows']:
-                continue
-            base_fields = self.artifacts['rows'][rid]
-            view_fields = parse_row_fields(self.row_html(rid) or '')
-            base_flat = {iid: val for field_items in base_fields.values()
-                         for iid, val in field_items}
-            view_flat = {iid: val for field_items in view_fields.values()
-                         for iid, val in field_items}
-            for iid, bval in base_flat.items():
-                if iid not in view_flat:
-                    deleted_items.append(iid)
-                    deleted_item_values[iid] = bval
-                elif bval.strip() and not view_flat[iid].strip():
-                    deleted_items.append(iid)
-                    deleted_item_values[iid] = bval
-        return {
-            'deleted_items': deleted_items,
-            'deleted_rows': sorted(self.deleted_base_rows,
-                                   key=lambda r: int(r[3:]) if r[3:].isdigit() else 0),
-            'deleted_item_values': deleted_item_values,
-        }
+        out: List[dict] = [{'row_id': rid, 'ghost': rid in self.deleted_row_ids}
+                           for rid in self.artifacts.get('row_ids', [])]
+        out.extend({'row_id': rid, 'ghost': False}
+                   for rid in self.added_row_ids)
+        return out
 
-    def build_ghost_html(self) -> Tuple[str, int, int]:
-        """View HTML with ghost overlays for deleted items/rows spliced in.
+    def changed_row_ids(self, deletions: Optional[dict] = None) -> set:
+        """Ids of rows with any edit, addition or deletion (incl. ghost rows)."""
+        if deletions is None:
+            deletions = self.compute_deletions()
+        changed = {'row' + iid.split('-')[0]
+                   for iid in (self.edited_item_ids | self.added_item_ids
+                               | set(deletions['deleted_items']))}
+        changed |= set(deletions['deleted_rows'])
+        changed |= set(self.added_row_ids)
+        return changed
 
-        The cached state is never mutated — ghosts are inserted into a copy.
-        Returns (html, deleted_item_count, deleted_row_count).
+    def issue_row_ids(self) -> set:
+        """Ids of base rows carrying any issue icon (errors or warnings)."""
+        out: set = set()
+        for row_ids in self.artifacts.get('issue_index', {}).values():
+            out |= set(row_ids)
+        return out
+
+    def row_html_with_ghosts(self, rid: str, deleted_items: List[str],
+                             values: Dict[str, str]) -> str:
+        """A view row's HTML with ghost containers for its deleted items.
+
+        ``deleted_items`` must be this row's item ids only — callers group
+        ``compute_deletions()['deleted_items']`` by row prefix so each
+        affected row is mini-parsed once.
         """
-        deletions = self.compute_deletions()
-        if not deletions['deleted_items'] and not deletions['deleted_rows']:
-            return self._html, 0, 0
-
-        html_out = self._html
-        values = deletions['deleted_item_values']
-
-        # Ghost rows (fully deleted base rows), inserted before the first
-        # view row with a higher number, else at the end
-        for rid in deletions['deleted_rows']:
-            number = int(rid[3:]) if rid[3:].isdigit() else -1
-            if number < 0:
-                continue
-            ghost_html = self._ghostify_row(rid)
-            anchor_id = next(
-                (vr for vr in self.row_ids
-                 if vr.startswith('row') and vr[3:].isdigit()
-                 and int(vr[3:]) > number),
-                None)
-            html_out = insert_row_str(html_out, ghost_html, anchor_id)
-
-        # Ghost items inside surviving rows
-        for item_id in deletions['deleted_items']:
+        html = self.row_html(rid) or ''
+        if not deleted_items:
+            return html
+        bs = BeautifulSoup(html, 'html.parser')
+        row = bs.find('tr')
+        if row is None:
+            return html
+        for item_id in deleted_items:
             parts = item_id.split('-')
             if len(parts) < 3 or not parts[0].isdigit():
                 continue
-            rid = f'row{parts[0]}'
             field_name = '-'.join(parts[1:-1])
-            if rid in deletions['deleted_rows']:
-                continue
-            try:
-                start, end = find_row_bounds(html_out, rid)
-            except SpliceError:
-                continue
-            bs = BeautifulSoup(html_out[start:end], 'html.parser')
-            row = bs.find('tr')
-            if row is None:
-                continue
             cell = HTMLParser._get_cell_in_row(row, field_name)
             if not cell:
                 continue
@@ -563,12 +543,71 @@ class TableView:
                         break
             if not inserted:
                 cell.append(ghost_item)
-            html_out = html_out[:start] + str(row) + html_out[end:]
+        return str(row)
 
-        return (html_out, len(deletions['deleted_items']),
-                len(deletions['deleted_rows']))
+    # -- deletions (ghost view) ------------------------------------------------------
 
-    def _ghostify_row(self, rid: str) -> str:
+    def compute_deletions(self) -> dict:
+        """Per-row base-vs-view diff: deleted items/rows with their values.
+
+        Mirrors the old ``identify_deletions_with_values`` semantics:
+        - items present in base but absent from the view are deleted;
+        - items present in both but emptied (edit-to-empty) are deleted;
+        - added rows/items never ghost (they are not in the base).
+        """
+        deleted_items: List[str] = []
+        deleted_item_values: Dict[str, str] = {}
+        rows_with_events = {ev['row'] for ev in self.events}
+        for rid in rows_with_events:
+            if rid in self.deleted_row_ids or rid in self.added_row_ids:
+                continue
+            if rid not in self.artifacts['rows']:
+                continue
+            base_fields = self.artifacts['rows'][rid]
+            view_fields = parse_row_fields(self.row_html(rid) or '')
+            base_flat = {iid: val for field_items in base_fields.values()
+                         for iid, val in field_items}
+            view_flat = {iid: val for field_items in view_fields.values()
+                         for iid, val in field_items}
+            for iid, bval in base_flat.items():
+                if iid not in view_flat:
+                    deleted_items.append(iid)
+                    deleted_item_values[iid] = bval
+                elif bval.strip() and not view_flat[iid].strip():
+                    deleted_items.append(iid)
+                    deleted_item_values[iid] = bval
+        return {
+            'deleted_items': deleted_items,
+            'deleted_rows': sorted((r for r in self.deleted_row_ids
+                                    if r in self.artifacts.get('rows', {})),
+                                   key=lambda r: int(r[3:]) if r[3:].isdigit() else 0),
+            'deleted_item_values': deleted_item_values,
+        }
+
+    def ghost_row_html(self, rid: str) -> str:
+        """Transform a base row into a ghost row (red strikethrough view)."""
+        s, e = self.artifacts['row_offsets'][rid]
+        bs = BeautifulSoup(self.base_html[s:e], 'html.parser')
+        row = bs.find('tr')
+        if row is None:
+            return ''
+        classes = row.get('class', [])
+        if isinstance(classes, list):
+            if 'deleted' not in classes:
+                classes.append('deleted')
+            row['class'] = classes
+        row['id'] = f'ghost-{rid}'
+        row['data-ghost-row-id'] = rid
+        for container in row.find_all('span', class_='item-container'):
+            cclasses = container.get('class', [])
+            if isinstance(cclasses, list):
+                if 'deleted-ghost' not in cclasses:
+                    cclasses.append('deleted-ghost')
+                container['class'] = cclasses
+            data = container.find('span', class_='item-data')
+            if data is not None:
+                data['style'] = 'color: #842029; font-style: italic;'
+        return str(row)
         """Transform a base row into a ghost row (red strikethrough view)."""
         s, e = self.artifacts['row_offsets'][rid]
         bs = BeautifulSoup(self.base_html[s:e], 'html.parser')
