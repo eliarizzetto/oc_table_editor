@@ -72,6 +72,8 @@
                     <li>Red strikethrough = deleted data (always visible as ghosts)</li>
                     <li>Underline = has validation issues</li>
                     <li>Click colored square to filter by issue</li>
+                    <li>Cells are reduced by default: one line per valid cell; in cells with issues, all invalid items are shown in full and valid ones are hidden behind an ellipsis</li>
+                    <li>Use <em>Expand cells</em> in the toolbar, or the ▸/▾ chevron next to the row number, to show full cell contents</li>
                     <li>By default only rows with errors/warnings or changes are shown; <em>Show all rows</em> reveals the rest</li>
                     <li><em>Show Changes Only</em> = view only edited, added and deleted data</li>
                     <li>The table is paginated (25 rows per page)</li>
@@ -92,6 +94,8 @@
                             title="Valid, unchanged rows are hidden by default">Show all rows</button>
                     <button class="btn btn-sm btn-outline-secondary view-toggle" id="showChangesOnlyBtn"
                             title="Show only rows with edits, additions or deletions">Show Changes Only</button>
+                    <button class="btn btn-sm btn-outline-secondary view-toggle" id="cellDisplayBtn"
+                            title="Reduced cells show one line per valid cell (invalid items always in full); click to show full cell contents">Expand cells</button>
                 </div>
             </div>
             <!-- Filter banner (hidden by default) -->
@@ -205,6 +209,12 @@ document.addEventListener('DOMContentLoaded', function() {
         viewState.changesOnly = !viewState.changesOnly;
         viewState.page = 1;
         renderView({ scrollToTop: true });
+    });
+    document.getElementById('cellDisplayBtn').addEventListener('click', function() {
+        cellDisplay.mode = (cellDisplay.mode === 'expanded') ? 'reduced' : 'expanded';
+        cellDisplay.rowOverrides.clear();   // global switch = uniform state again
+        applyCellDisplay();                 // pure DOM transform — no refetch
+        updateViewToggleButtons();
     });
     document.getElementById('saveEditBtn').addEventListener('click', saveEdit);
     document.getElementById('deleteItemBtn').addEventListener('click', () => deleteItem(currentItemId));
@@ -583,6 +593,7 @@ async function revalidate() {
             // drop the issue filter (without restoring stale state) and page 1.
             exitFilteredView(false);
             viewState.page = 1;
+            resetCellDisplayOverrides();   // row ids are renumbered per generation
             renderView({ scrollToTop: true });
             loadSessionInfo();
         } else {

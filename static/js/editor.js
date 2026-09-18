@@ -43,6 +43,15 @@ let filteredState = null;          // {issueId, page} while in the issue-filtere
 let savedMainViewState = null;     // captured on entering the filtered view, restored on exit
 let renderSeq = 0;                 // stale-response guard for overlapping fetches
 
+// Cell display mode: 'reduced' (default) collapses fully-valid cells to one
+// truncated line and hides valid items in error cells behind an ellipsis;
+// 'expanded' shows full content.  Deliberately separate from viewState and
+// never captured by savedMainViewState — the setting is shared between the
+// main and issue-filtered views and independent of the view toggles.  Row
+// overrides survive re-renders and pagination, keyed 'main:rowN' / 'cits:rowN'
+// (the two tables of a paired session reuse the same row ids).
+const cellDisplay = { mode: 'reduced', rowOverrides: new Map() };
+
 /**
  * Fetch and inject the current view (main or issue-filtered).
  * opts: { preserveScroll, scrollToTop, focusRowId }
@@ -82,6 +91,7 @@ async function renderView(opts = {}) {
             ? emptyStateHtml() + data.html
             : data.html;
         if (typeof setupEditHandlers === 'function') setupEditHandlers();
+        applyCellDisplay();   // after enhanceRow (buttons exist) and before the focus scroll
         initBootstrapWidgets();
         updateViewToggleButtons();
         const toggles = document.getElementById('viewToggles');
@@ -152,6 +162,11 @@ function updateViewToggleButtons() {
         chBtn.classList.toggle('active', viewState.changesOnly);
         chBtn.disabled = !!filteredState;
     }
+    const cdBtn = document.getElementById('cellDisplayBtn');
+    if (cdBtn) {
+        // Shared by the main and filtered views — intentionally never disabled.
+        cdBtn.classList.toggle('active', cellDisplay.mode === 'expanded');
+    }
 }
 
 // ── Delegated table interactions ─────────────────────────────────────────────
@@ -190,6 +205,13 @@ function setupTableDelegation() {
 
         const btn = e.target.closest('button');
         if (btn) {
+            // Cell-display chevron — must run before the data-editable guard
+            // below so it also works in the read-only citations table.
+            if (btn.classList.contains('cell-toggle-btn')) {
+                e.stopPropagation();
+                toggleRowCellDisplay(btn);
+                return;
+            }
             if (!btn.closest('table[data-editable]')) return;
             e.stopPropagation();
             const tr = btn.closest('tr');
@@ -245,6 +267,156 @@ document.addEventListener('DOMContentLoaded', function() {
     initBootstrapWidgets();
     setupTableDelegation();
 });
+
+
+// ── Reduced / expanded cell display ──────────────────────────────────────────
+// Purely client-side: the server always ships complete row markup, so the
+// reduced view is a reversible DOM transform re-applied after every render.
+//   • fully-valid cells → single truncated line (CSS text-overflow, class
+//     'cell-collapsed', no DOM surgery);
+//   • cells containing issues → every .item-container that holds an issue
+//     icon stays fully visible; maximal runs of valid containers are wrapped
+//     in a hidden span, one '…' marker per run.
+// The restore step makes the transform idempotent and reversible (toggling
+// never needs a server refetch).  Hidden runs can never contain an issue
+// icon — icon-bearing containers are run-breakers — so the lazy popover
+// delegation is unaffected by construction.
+
+/** 'main' for the editable table, 'cits' for the read-only citations table. */
+function tableScope(table) {
+    return table.hasAttribute('data-editable') ? 'main' : 'cits';
+}
+
+/** The mode a row currently uses: its override, else the table-wide mode. */
+function effectiveRowMode(tr, scope) {
+    return cellDisplay.rowOverrides.get(scope + ':' + tr.id) || cellDisplay.mode;
+}
+
+/** Undo any previous reduction of the row's cells (idempotent). */
+function restoreRowCells(tr) {
+    tr.querySelectorAll('td.field-value').forEach(td => {
+        td.classList.remove('cell-collapsed', 'cell-collapsed-invalid');
+        td.querySelectorAll(':scope > .cell-ellipsis').forEach(marker => marker.remove());
+        td.querySelectorAll(':scope > .hidden-items-run').forEach(wrapper => {
+            while (wrapper.firstChild) td.insertBefore(wrapper.firstChild, wrapper);
+            wrapper.remove();
+        });
+    });
+}
+
+/** A hideable node: a span.item-container with no issue icons inside (a
+ *  valid item — includes deleted-ghost items and icon-less empty slots). */
+function isHideableContainer(node) {
+    return node.nodeType === Node.ELEMENT_NODE && node.tagName === 'SPAN'
+        && node.classList.contains('item-container')
+        && !node.querySelector('.issue-icon');
+}
+
+function isPureWhitespaceText(node) {
+    return node.nodeType === Node.TEXT_NODE && node.textContent.trim() === '';
+}
+
+/** Apply the reduced presentation to the row's cells (call after restore). */
+function reduceRowCells(tr) {
+    tr.querySelectorAll('td.field-value').forEach(td => {
+        if (!td.querySelector('.issue-icon')) {
+            // Fully-valid cell: CSS-only single line + ellipsis.
+            td.classList.add('cell-collapsed');
+            return;
+        }
+        // Mixed cell: hide maximal runs of valid containers (plus any
+        // whitespace between them) behind an ellipsis marker; injected
+        // action buttons and every icon-bearing container stay in place.
+        const nodes = Array.from(td.childNodes);
+        let i = 0;
+        while (i < nodes.length) {
+            if (!isHideableContainer(nodes[i])) { i++; continue; }
+            let j = i;
+            while (j + 1 < nodes.length
+                   && (isHideableContainer(nodes[j + 1]) || isPureWhitespaceText(nodes[j + 1]))) {
+                j++;
+            }
+            const run = nodes.slice(i, j + 1);
+            const count = run.filter(isHideableContainer).length;
+            const marker = document.createElement('span');
+            marker.className = 'cell-ellipsis';
+            marker.textContent = '…';
+            marker.title = `${count} more item${count !== 1 ? 's' : ''} hidden — expand the row to show them`;
+            const wrapper = document.createElement('span');
+            wrapper.className = 'hidden-items-run';
+            wrapper.hidden = true;
+            td.insertBefore(marker, run[0]);
+            run.forEach(node => wrapper.appendChild(node));   // moves the nodes in
+            td.insertBefore(wrapper, marker);                  // final order: wrapper, marker
+            i = j + 1;
+        }
+        td.classList.add('cell-collapsed-invalid');   // keeps normal wrapping
+    });
+}
+
+/** Inject the per-row expand/reduce chevron (ghost rows stay untouched). */
+function ensureRowToggleButton(tr) {
+    if (tr.hasAttribute('data-ghost-row-id')) return;   // read-only ghost row
+    const numCell = tr.querySelector('td.row-number');
+    if (!numCell || numCell.querySelector('.cell-toggle-btn')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'cell-toggle-btn table-action';
+    const delBtn = numCell.querySelector('.delete-row-btn');
+    if (delBtn) numCell.insertBefore(btn, delBtn);
+    else numCell.appendChild(btn);
+    // icon/title are set by updateRowToggleButton on the same pass
+}
+
+/** Sync the chevron icon + tooltip with the row's effective mode. */
+function updateRowToggleButton(tr, mode) {
+    const btn = tr.querySelector('td.row-number .cell-toggle-btn');
+    if (!btn) return;
+    if (mode === 'expanded') {
+        btn.textContent = '▾';
+        btn.title = 'Reduce cell contents (show less)';
+    } else {
+        btn.textContent = '▸';
+        btn.title = 'Expand cell contents (show full text)';
+    }
+}
+
+/** Restore, then apply the row's effective mode (idempotent). */
+function applyRowCellDisplay(tr, scope) {
+    restoreRowCells(tr);
+    const mode = effectiveRowMode(tr, scope);
+    updateRowToggleButton(tr, mode);
+    if (mode === 'expanded') return;
+    reduceRowCells(tr);
+}
+
+/** Full pass over the current DOM — the render hook and the toolbar toggle. */
+function applyCellDisplay() {
+    document.querySelectorAll('#tableContainer .table-container table').forEach(table => {
+        const scope = tableScope(table);
+        table.querySelectorAll('tbody tr').forEach(tr => {   // '+ row' is a button, not a tr
+            ensureRowToggleButton(tr);
+            applyRowCellDisplay(tr, scope);
+        });
+    });
+}
+
+/** Per-row chevron click: flip this row's override and re-apply, no refetch. */
+function toggleRowCellDisplay(btn) {
+    const tr = btn.closest('tr');
+    const table = btn.closest('table');
+    if (!tr || !table || !tr.id) return;
+    const scope = tableScope(table);
+    const key = scope + ':' + tr.id;
+    const current = cellDisplay.rowOverrides.get(key) || cellDisplay.mode;
+    cellDisplay.rowOverrides.set(key, current === 'reduced' ? 'expanded' : 'reduced');
+    applyRowCellDisplay(tr, scope);
+}
+
+/** Drop per-row overrides (revalidate renumbers row ids per generation). */
+function resetCellDisplayOverrides() {
+    cellDisplay.rowOverrides.clear();
+}
 
 
 // ── Issue-filtered view functionality ─────────────────────────────────────────
@@ -412,6 +584,8 @@ if (typeof module !== 'undefined' && module.exports) {
         emptyStateHtml,
         enableShowAllRows,
         updateViewToggleButtons,
+        applyCellDisplay,
+        resetCellDisplayOverrides,
         highlightInvolvedElements,
         loadFilteredTable,
         exitFilteredView,

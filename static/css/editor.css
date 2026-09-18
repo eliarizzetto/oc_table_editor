@@ -418,3 +418,54 @@ tr:hover .delete-row-btn {
     border-radius: 2px;
     background-color: rgba(0, 128, 0, 0.74);
 }
+
+/* ── Reduced cell display ──────────────────────────────────────────────── */
+
+/* Fully-valid cell in reduced mode: single line + ellipsis.  Restores the
+   base td rule (white-space/overflow/text-overflow) that the td.field-value
+   wrap override defeats; works because #table-data is table-layout:fixed. */
+#table-data td.field-value.cell-collapsed {
+    white-space: nowrap;
+    word-break: normal;
+    overflow-wrap: normal;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    position: relative;   /* positioning context for the pinned action buttons */
+}
+
+/* The injected clear/add buttons would be pushed past the clip edge of
+   single-line cells — pin them to the cell's top-right corner instead. */
+#table-data td.field-value.cell-collapsed .table-action {
+    position: absolute;
+    top: 0.15rem;
+    z-index: 5;
+}
+#table-data td.field-value.cell-collapsed .clear-cell-btn { right: 0.25rem; }
+#table-data td.field-value.cell-collapsed .add-item-btn,
+#table-data td.field-value.cell-collapsed .add-first-item-btn { right: calc(0.25rem + 1.9em); }
+
+/* Ellipsis marker standing in for a run of hidden valid items. */
+.cell-ellipsis {
+    color: #6c757d;
+    margin: 0 0.2em;
+    user-select: none;
+    cursor: default;
+}
+
+/* Per-row expand/reduce chevron in the row-number cell — absolutely
+   positioned so it takes no layout space (td.row-number is already a
+   positioning context, see above). */
+#table-data td.row-number .cell-toggle-btn {
+    position: absolute;
+    top: 2px;
+    right: 1px;
+    font-size: 0.9em;
+}
+
+tr:hover .cell-toggle-btn {
+    opacity: 0.7;
+}
+
+#table-data td.row-number .cell-toggle-btn:hover {
+    opacity: 1;
+}
