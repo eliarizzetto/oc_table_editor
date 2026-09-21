@@ -130,11 +130,14 @@ def _slice_div(html: str, marker: str) -> str:
 
     Neither ``general-info`` nor ``table-container`` contains nested
     ``<div>``s, so the first ``</div>`` after the marker closes the element.
+    A marker that already starts at the ``<div`` tag locates the element
+    directly; a marker inside the tag (a class name) is backed up to the
+    tag start.
     """
     pos = html.find(marker)
     if pos == -1:
         raise SpliceError(f"Marker '{marker}' not found in document")
-    start = html.rfind('<div', 0, pos)
+    start = pos if marker.startswith('<div') else html.rfind('<div', 0, pos)
     end = html.find('</div>', pos)
     if start == -1 or end == -1:
         raise SpliceError(f"Div boundaries not found around '{marker}'")

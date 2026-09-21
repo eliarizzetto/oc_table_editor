@@ -32,7 +32,8 @@ def _check_csv_header(filename: str, content: bytes) -> None:
         )
 
 
-def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool) -> None:
+def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool,
+                   table_label: str = 'Metadata') -> None:
     """
     Generate an HTML visualisation for a validated CSV table.
 
@@ -43,13 +44,15 @@ def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool) -> 
     ``ValidatorService._make_no_errors_html`` instead.
 
     Args:
-        csv_fp:    Path to the original CSV file.
-        report_fp: Path to the JSON-Lines validation report.
-        out_fp:    Destination HTML file path.
-        is_valid:  Whether the validation passed (True = no errors).
+        csv_fp:      Path to the original CSV file.
+        report_fp:   Path to the JSON-Lines validation report.
+        out_fp:      Destination HTML file path.
+        is_valid:    Whether the validation passed (True = no errors).
+        table_label: Table type for the header ('Metadata'/'Citations'),
+                     used only on the zero-errors path.
     """
     if is_valid:
-        ValidatorService._make_no_errors_html(out_fp, csv_fp)
+        ValidatorService._make_no_errors_html(out_fp, csv_fp, table_label)
     else:
         make_gui(csv_fp, report_fp, out_fp)
 
@@ -150,9 +153,9 @@ async def upload_files(
             cits_table_path = session_dir / 'cits_table.html'
 
             _generate_html(session.meta_csv_path, meta_report_path,
-                            str(meta_table_path), meta_is_valid)
+                            str(meta_table_path), meta_is_valid, 'Metadata')
             _generate_html(session.cits_csv_path, cits_report_path,
-                            str(cits_table_path), cits_is_valid)
+                            str(cits_table_path), cits_is_valid, 'Citations')
 
             # Save individual tables through session manager (meta_table.html,
             # cits_table.html) so that re-validation can parse them later.
@@ -192,7 +195,7 @@ async def upload_files(
 
             meta_table_path = session_dir / 'meta_table.html'
             _generate_html(session.meta_csv_path, meta_report_path,
-                            str(meta_table_path), meta_is_valid)
+                            str(meta_table_path), meta_is_valid, 'Metadata')
 
             with open(meta_table_path, 'r', encoding='utf-8') as f:
                 meta_html_content = f.read()
@@ -215,7 +218,7 @@ async def upload_files(
 
             cits_table_path = session_dir / 'cits_table.html'
             _generate_html(session.cits_csv_path, cits_report_path,
-                            str(cits_table_path), cits_is_valid)
+                            str(cits_table_path), cits_is_valid, 'Citations')
 
             with open(cits_table_path, 'r', encoding='utf-8') as f:
                 cits_html_content = f.read()

@@ -10,6 +10,7 @@ Save (commit) and revalidate.
 """
 import asyncio
 import json
+from functools import lru_cache
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -19,8 +20,6 @@ from typing import Optional
 from services import SessionManager, HTMLParser, ValidatorService, CSVExporter
 from services.journal import ChangeJournal
 from services.session_document import (
-    SpliceError,
-    _slice_div,
     compose_display,
     document_cache,
 )
@@ -44,7 +43,8 @@ router = APIRouter()
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool) -> None:
+def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool,
+                   table_label: str = 'Metadata') -> None:
     """
     Generate an HTML visualisation for a validated CSV table.
 
@@ -52,9 +52,10 @@ def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool) -> 
     ``make_gui`` crashes (it tries to open ``valid_page.html`` via a bare
     relative path that does not exist in this project).  We detect this and
     delegate to ``ValidatorService._make_no_errors_html`` instead.
+    ``table_label`` ('Metadata'/'Citations') is only used on that path.
     """
     if is_valid:
-        ValidatorService._make_no_errors_html(out_fp, csv_fp)
+        ValidatorService._make_no_errors_html(out_fp, csv_fp, table_label)
     else:
         make_gui(csv_fp, report_fp, out_fp)
 
@@ -127,13 +128,73 @@ def _pager_html(kind: str, page: int, page_count: int, total_rows: int) -> str:
     )
 
 
-def _general_info_or_500(base_html: str, table_type: str) -> str:
+@lru_cache(maxsize=128)
+def _cached_report_counts(path: str, mtime_ns: int) -> tuple:
+    """(errors, warnings) tally of a JSONL report, cached per file mtime so
+    pagination clicks don't re-read the report (revalidate overwrites the
+    same path; the mtime key invalidates the stale entry)."""
+    entries = load_jsonl_report(path)
+    return (sum(1 for e in entries if e.get('error_type') == 'error'),
+            sum(1 for e in entries if e.get('error_type') == 'warning'))
+
+
+def _report_counts(report_path: Optional[str]) -> tuple:
+    """(errors, warnings) from a JSONL report; (0, 0) when missing/unreadable."""
+    if not report_path:
+        return 0, 0
     try:
-        return _slice_div(base_html, 'container-fluid general-info')
-    except SpliceError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Cannot slice general-info from {table_type} baseline: {exc}")
+        mtime_ns = Path(report_path).stat().st_mtime_ns
+    except OSError:
+        return 0, 0
+    try:
+        return _cached_report_counts(report_path, mtime_ns)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 0, 0
+
+
+def _table_header_html(label: str, errors: int, warnings: int,
+                       invalid_rows: int, total_rows: int,
+                       filename: Optional[str] = None) -> str:
+    """Compact per-table header (table-type title + one-line validation
+    stats) that replaces the verbose general-info block emitted by
+    ``make_gui``.  The ``table-stats`` class marks the new format."""
+    parts = [
+        '<div class="container-fluid general-info table-stats">',
+        f'<h4>{label}</h4>',
+        f'<p class="table-stats-line">Errors: {errors} | Warnings: {warnings}'
+        f' | Invalid rows: {invalid_rows} | Total rows: {total_rows}</p>',
+    ]
+    if filename is not None:
+        parts.append(f'<p class="text-success mb-0"><strong>✓ No issues found '
+                     f'in <em>{filename}</em>.</strong></p>')
+    parts.append('</div>')
+    return ''.join(parts)
+
+
+def _replace_general_info(html: str, replacements: list) -> str:
+    """Positionally swap every general-info div for ``replacements[i]``
+    (document order).  Fewer divs than replacements → extras ignored; more
+    divs than replacements → extras kept as-is.  Used on the legacy
+    whole-document fallback path, where div 0 is the editable table's header
+    and div 1 (paired sessions) the citations one.  Same find/rfind logic as
+    ``session_document._slice_div`` — assumes no nested <div> inside
+    general-info (true for every variant we generate)."""
+    out: list = []
+    pos = 0
+    for header in replacements:
+        idx = html.find('container-fluid general-info', pos)
+        if idx == -1:
+            break
+        start = html.rfind('<div', 0, idx)
+        end = html.find('</div>', idx)
+        if start == -1 or end == -1:
+            break
+        seg_end = end + len('</div>')
+        out.append(html[pos:start])
+        out.append(header)
+        pos = seg_end
+    out.append(html[pos:])
+    return ''.join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -220,15 +281,40 @@ async def get_table_view(session_id: str, page: int = 1, show_all: bool = False,
 
         if not artifacts.get('has_table'):
             # Legacy fallback: fully-valid uploads have no parsable table —
-            # serve the whole document with the paging UI disabled.
+            # serve the whole document with the paging UI disabled.  The
+            # editable side is fully valid (zero stats); a paired citations
+            # table may still carry issues, so it gets real counts.
+            tt = _editable_table_type(session)
+            editable_csv = session.meta_csv_path or session.cits_csv_path or ''
+            replacements = [
+                _table_header_html('Metadata' if tt == 'meta' else 'Citations',
+                                   0, 0, 0, 0,
+                                   filename=Path(editable_csv).name
+                                   if editable_csv else None)]
             if session.has_metadata and session.has_citations:
                 cits_state = await load_table_state(session_id, 'cits')
                 if cits_state is None:
                     raise HTTPException(status_code=404,
                                         detail="HTML content not found")
+                cits_art = cits_state['artifacts']
+                if cits_art.get('has_table'):
+                    cits_issues = {rid
+                                   for rids in cits_art.get('issue_index', {}).values()
+                                   for rid in rids}
+                    c_err, c_warn = _report_counts(session.cits_report_path)
+                    replacements.append(_table_header_html(
+                        'Citations', c_err, c_warn,
+                        len(cits_issues & set(cits_art.get('row_ids', []))),
+                        len(cits_art.get('row_ids', []))))
+                else:
+                    replacements.append(_table_header_html(
+                        'Citations', 0, 0, 0, 0,
+                        filename=Path(session.cits_csv_path).name
+                        if session.cits_csv_path else None))
                 html_content = compose_display(view.html, cits_state['base_html'])
             else:
                 html_content = view.html
+            html_content = _replace_general_info(html_content, replacements)
             return {"html": html_content, "has_table": False,
                     "paginated": False, "page": 1, "page_count": 1,
                     "total_rows": 0, "table_type": _editable_table_type(session),
@@ -280,9 +366,18 @@ async def get_table_view(session_id: str, page: int = 1, show_all: bool = False,
 
         editable_open = artifacts['table_open_tag'].replace(
             '>', ' data-editable="1">', 1)
+        # Whole-table stats (the pager's `total` is the filtered-view count):
+        # errors/warnings from the last validation report; invalid/total rows
+        # from the live view (ghosts excluded, journal-added rows included).
+        tt = _editable_table_type(session)
+        errors, warnings = _report_counts(
+            session.meta_report_path if tt == 'meta' else session.cits_report_path)
+        live_rows = set(view.row_ids)
+        invalid_rows = len(issues & live_rows)
+        total_rows = len(view.row_ids)
         html_parts = [
-            _general_info_or_500(state['base_html'],
-                                 _editable_table_type(session)),
+            _table_header_html('Metadata' if tt == 'meta' else 'Citations',
+                               errors, warnings, invalid_rows, total_rows),
             '<div class="table-container container-fluid">',
             editable_open, artifacts['thead_html'], '<tbody>',
             *row_parts,
@@ -309,10 +404,12 @@ async def get_table_view(session_id: str, page: int = 1, show_all: bool = False,
                 for rid in cits_slice:
                     s, e = cits_art['row_offsets'][rid]
                     cits_rows.append(cits_base[s:e])
-                try:
-                    cits_gi = _slice_div(cits_base, 'container-fluid general-info')
-                except SpliceError:
-                    cits_gi = ''
+                cits_issues = {rid for rids in cits_art.get('issue_index', {}).values()
+                               for rid in rids}
+                cits_errors, cits_warnings = _report_counts(session.cits_report_path)
+                cits_gi = _table_header_html(
+                    'Citations', cits_errors, cits_warnings,
+                    len(cits_issues & set(cits_row_ids)), cits_total)
                 html_parts.extend([
                     cits_gi,
                     '<div class="table-container container-fluid">',
@@ -779,10 +876,10 @@ async def revalidate(request: RevalidateRequest):
                 cits_table_path = session_dir / 'cits_table.html'
                 await asyncio.to_thread(_generate_html, str(temp_meta_csv),
                                         meta_report_path, str(meta_table_path),
-                                        meta_is_valid)
+                                        meta_is_valid, 'Metadata')
                 await asyncio.to_thread(_generate_html, str(temp_cits_csv),
                                         cits_report_path, str(cits_table_path),
-                                        cits_is_valid)
+                                        cits_is_valid, 'Citations')
 
                 with open(meta_table_path, 'r', encoding='utf-8', newline='') as f:
                     new_meta_html = f.read()
@@ -846,8 +943,10 @@ async def revalidate(request: RevalidateRequest):
                 )
 
                 temp_html_path = session_dir / 'temp_revalidate.html'
-                await asyncio.to_thread(_generate_html, str(temp_csv_path),
-                                        report_path, str(temp_html_path), is_valid)
+                await asyncio.to_thread(
+                    _generate_html, str(temp_csv_path), report_path,
+                    str(temp_html_path), is_valid,
+                    'Metadata' if table_type == 'meta' else 'Citations')
                 with open(temp_html_path, 'r', encoding='utf-8', newline='') as f:
                     new_html = f.read()
 

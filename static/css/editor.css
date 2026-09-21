@@ -35,6 +35,7 @@ body {
     white-space: normal;
     word-break: break-word;
     overflow-wrap: break-word;
+    position: relative;   /* positioning context for the pinned action buttons */
 }
 
 #table-data th {
@@ -273,6 +274,24 @@ span.item-data:has(~ span.issue-icon.warning) {
     .col-md-2 {
         margin-bottom: 1rem;
     }
+    /* Stacked layout: the sidebar sits full-width above the table and must
+       not stick to the viewport. */
+    .sidebar-container {
+        position: static;
+        max-height: none;
+        overflow-y: visible;
+    }
+}
+
+/* ── Table stats header (injected by the backend above each table) ────────── */
+
+.general-info h4 {
+    font-size: 1.1rem;
+}
+
+.table-stats-line {
+    color: #495057;
+    margin-bottom: 0.25rem;
 }
 
 /* ── Filter banner (issue-filtered view) ───────────────────────────────────── */
@@ -298,13 +317,41 @@ span.item-data:has(~ span.issue-icon.warning) {
     color: #0d6efd;
 }
 
-/* ── Collapsible sidebar ───────────────────────────────────────────────────── */
-
+/* ── Sidebar: sticky, self-scrolling, collapsible ────────────────────────────
+   The navbar is in normal flow (it scrolls away with the page), so the
+   sticky offset is just a viewport gap.  If the navbar ever becomes
+   sticky/fixed, re-tune top/max-height to account for its height. */
 .sidebar-container {
-    position: relative;
-    transition: all 0.3s ease;
+    position: sticky;
+    top: 0.75rem;
+    align-self: flex-start;            /* .row is flex; stretch defeats sticky */
+    max-height: calc(100vh - 1.5rem);
+    overflow-y: auto;                  /* independent scrollbar */
+    overscroll-behavior: contain;      /* wheel scrolls don't chain to the page */
+    transition: width .3s ease, max-width .3s ease, padding .3s ease;
 }
 
+.sidebar-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: .5rem;
+    margin-bottom: .5rem;
+}
+
+.sidebar-head-title {
+    font-size: .8rem;
+    font-weight: 600;
+    color: #495057;
+    white-space: nowrap;
+}
+
+#sidebarToggle {
+    flex: 0 0 auto;
+    line-height: 1;
+}
+
+/* Collapsed: 24px rail — the toggle stays visible, cards are hidden */
 .sidebar-container.collapsed {
     width: 24px !important;
     flex: 0 0 24px;
@@ -313,7 +360,22 @@ span.item-data:has(~ span.issue-icon.warning) {
     padding: 0 !important;
 }
 
-.sidebar-container.collapsed #sidebarContent {
+.sidebar-container.collapsed .sidebar-head {
+    justify-content: center;
+    margin-bottom: 0;
+    padding: 2px 0;
+}
+
+.sidebar-container.collapsed .sidebar-head-title {
+    display: none;
+}
+
+.sidebar-container.collapsed #sidebarToggle {
+    width: 22px;
+    padding: .125rem 0;
+}
+
+.sidebar-container.collapsed .card {
     display: none;
 }
 
@@ -322,39 +384,6 @@ span.item-data:has(~ span.issue-icon.warning) {
     width: calc(100% - 24px) !important;
     flex: 0 0 calc(100% - 24px);
     max-width: calc(100% - 24px);
-}
-
-.sidebar-toggle {
-    position: sticky;
-    top: 0;
-    width: 100%;
-    height: 22px;
-    padding: 1px 6px;
-    border: none;
-    border-radius: 0.25rem;
-    background-color: #dee2e6;
-    z-index: 100;
-    font-size: 0.8em;
-    font-weight: bold;
-    color: #495057;
-    text-align: left;
-    cursor: pointer;
-    transition: background-color 0.2s;
-    display: block;
-    margin-bottom: 0.1rem;
-}
-
-.sidebar-toggle:hover {
-    background-color: #ced4da;
-}
-
-.sidebar-container.collapsed .sidebar-toggle {
-    position: sticky;
-    top: 0;
-    width: 24px;
-    height: 24px;
-    text-align: center;
-    padding: 1px 0;
 }
 
 .table-action {
@@ -398,9 +427,21 @@ td.field-value:hover .table-action:hover {
     background-color: rgba(255, 0, 0, 0.486);
 }
 
-td.row-number .delete-row-btn {
-    display: block;
-    margin: 2px auto 0 auto;
+/* Delete-row button: pinned left of the row number, out of the flow so it
+   adds no row height (the expand chevron occupies top-right; td.row-number
+   is already the positioning context).  Hover reveal via the tr:hover rules
+   below; sizing here overrides the base .table-action block above. */
+#table-data td.row-number .delete-row-btn {
+    position: absolute;
+    left: 1px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 14px;
+    height: 14px;
+    padding: 0;
+    margin: 0;
+    font-size: 0.6rem;
+    line-height: 1;
 }
 
 tr:hover .delete-row-btn {
@@ -430,19 +471,37 @@ tr:hover .delete-row-btn {
     overflow-wrap: normal;
     overflow: hidden;
     text-overflow: ellipsis;
-    position: relative;   /* positioning context for the pinned action buttons */
 }
 
-/* The injected clear/add buttons would be pushed past the clip edge of
-   single-line cells — pin them to the cell's top-right corner instead. */
-#table-data td.field-value.cell-collapsed .table-action {
+/* The injected clear/add buttons are invisible (opacity: 0) but keep their
+   layout space — as in-flow flex blocks they added a whole button line
+   under the cell text (the "white band" under every row).  Pin them to the
+   cell's top-right corner instead, in every display mode, and size them
+   like the delete-row button (~14px) so they cover little text on hover. */
+#table-data td.field-value > .table-action {
     position: absolute;
     top: 0.15rem;
     z-index: 5;
+    width: 1.2em;
+    height: 1.2em;
+    font-size: 0.75rem;
+    margin: 0;
 }
-#table-data td.field-value.cell-collapsed .clear-cell-btn { right: 0.25rem; }
-#table-data td.field-value.cell-collapsed .add-item-btn,
-#table-data td.field-value.cell-collapsed .add-first-item-btn { right: calc(0.25rem + 1.9em); }
+/* Clear button: flush with the cell's top-left corner. */
+#table-data td.field-value > .clear-cell-btn {
+    top: 0;
+    left: 0;
+}
+
+/* Add buttons: flush with the cell's bottom-right corner
+   (top: auto is required — with top, bottom and height all set, the shared
+   top: 0.15rem would win and bottom would be ignored). */
+#table-data td.field-value > .add-item-btn,
+#table-data td.field-value > .add-first-item-btn {
+    top: auto;
+    right: 0;
+    bottom: 0;
+}
 
 /* Ellipsis marker standing in for a run of hidden valid items. */
 .cell-ellipsis {

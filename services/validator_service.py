@@ -33,7 +33,8 @@ class ValidatorService:
     """Wrapper service for oc_validator functionality."""
 
     @staticmethod
-    def _make_no_errors_html(out_fp: str, csv_path: str) -> None:
+    def _make_no_errors_html(out_fp: str, csv_path: str,
+                             table_label: str = 'Metadata') -> None:
         """
         Write a minimal 'no errors found' HTML file to out_fp.
 
@@ -43,8 +44,9 @@ class ValidatorService:
         directory) and crashes with a FileNotFoundError.
 
         Args:
-            out_fp:   Destination HTML file path.
-            csv_path: Path to the CSV that was validated (used for the title).
+            out_fp:      Destination HTML file path.
+            csv_path:    Path to the CSV that was validated (used for the title).
+            table_label: Table type shown in the header ('Metadata'/'Citations').
         """
         filename = Path(csv_path).name
         html = (
@@ -52,10 +54,10 @@ class ValidatorService:
             '<meta charset="utf-8">'
             '<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">'
             '</head><body>'
-            '<div class="container-fluid general-info">'
-            '<h4>Validation Results</h4>'
-            f'<p>There are <strong>0</strong> errors/warnings in the table submitted for validation.</p>'
-            f'<p class="text-success"><strong>✓ No issues found in <em>{filename}</em>.</strong></p>'
+            '<div class="container-fluid general-info table-stats">'
+            f'<h4>{table_label}</h4>'
+            '<p class="table-stats-line">Errors: 0 | Warnings: 0 | Invalid rows: 0 | Total rows: 0</p>'
+            f'<p class="text-success mb-0"><strong>✓ No issues found in <em>{filename}</em>.</strong></p>'
             '</div>'
             '<div class="table-container container-fluid"></div>'
             '<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>'
