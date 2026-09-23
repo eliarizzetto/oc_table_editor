@@ -1,8 +1,8 @@
 """Session model.
 
-Edit tracking no longer lives here — the change journal
-(``services/journal.py`` + ``journal.jsonl``) is the single source of truth
-for edits, additions, deletions, and undo history.
+Edit tracking no longer lives here — the per-table change journals
+(``services/journal.py`` + ``journal_{table_type}.jsonl``) are the single
+source of truth for edits, additions, deletions, and undo history.
 """
 from dataclasses import dataclass, field
 from datetime import datetime

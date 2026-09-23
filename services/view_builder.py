@@ -608,26 +608,3 @@ class TableView:
             if data is not None:
                 data['style'] = 'color: #842029; font-style: italic;'
         return str(row)
-        """Transform a base row into a ghost row (red strikethrough view)."""
-        s, e = self.artifacts['row_offsets'][rid]
-        bs = BeautifulSoup(self.base_html[s:e], 'html.parser')
-        row = bs.find('tr')
-        if row is None:
-            return ''
-        classes = row.get('class', [])
-        if isinstance(classes, list):
-            if 'deleted' not in classes:
-                classes.append('deleted')
-            row['class'] = classes
-        row['id'] = f'ghost-{rid}'
-        row['data-ghost-row-id'] = rid
-        for container in row.find_all('span', class_='item-container'):
-            cclasses = container.get('class', [])
-            if isinstance(cclasses, list):
-                if 'deleted-ghost' not in cclasses:
-                    cclasses.append('deleted-ghost')
-                container['class'] = cclasses
-            data = container.find('span', class_='item-data')
-            if data is not None:
-                data['style'] = 'color: #842029; font-style: italic;'
-        return str(row)

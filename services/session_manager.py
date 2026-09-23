@@ -1,7 +1,8 @@
 """Service for managing session files and persistence.
 
-Since the event-sourced-journal refactor, editing state lives in
-``journal.jsonl`` (see ``services/journal.py``); this module only handles
+Since the event-sourced-journal refactor, editing state lives in the
+per-table journals ``journal_{table_type}.jsonl`` (see
+``services/journal.py``); this module only handles
 session identity, uploaded files, and atomic reads/writes of the HTML
 artifacts (baseline = immutable base, ``*_table.html`` = commit artifacts).
 """

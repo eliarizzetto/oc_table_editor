@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from services import SessionManager, HTMLParser, ValidatorService, CSVExporter
-from services.journal import ChangeJournal
+from services.journal import ChangeJournal, truncate_redo_tails
 from services.session_document import (
     compose_display,
     document_cache,
@@ -61,8 +61,39 @@ def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool,
 
 
 def _editable_table_type(session: Session) -> str:
-    """The table the journal edits ('meta' or 'cits')."""
+    """The session's primary table ('meta' when metadata was uploaded)."""
     return 'meta' if session.has_metadata else 'cits'
+
+
+def _session_table_types(session: Session) -> tuple:
+    """The table types present in the session, meta first (document order)."""
+    tts = []
+    if session.has_metadata:
+        tts.append('meta')
+    if session.has_citations:
+        tts.append('cits')
+    return tuple(tts)
+
+
+def _resolve_table_type(session: Session, requested: Optional[str]) -> str:
+    """Validate a client-requested table type against the session.
+
+    ``None`` keeps the legacy behaviour (the session's primary table).
+    Both tables of a paired session are editable, so mutations carry an
+    explicit ``table_type``; the row/item id space is shared between the
+    two tables, and resolving against the wrong one would silently edit
+    the wrong table.
+    """
+    if requested is None:
+        return _editable_table_type(session)
+    if requested not in ('meta', 'cits'):
+        raise HTTPException(status_code=422,
+                            detail=f"Invalid table_type '{requested}' "
+                                   f"(expected 'meta' or 'cits')")
+    if requested not in _session_table_types(session):
+        raise HTTPException(status_code=404,
+                            detail=f"Table '{requested}' not in this session")
+    return requested
 
 
 def _row_id_for_item(item_id: str) -> str:
@@ -75,13 +106,15 @@ def _field_for_item(item_id: str) -> str:
     return '-'.join(parts[1:-1]) if len(parts) >= 3 else ''
 
 
-async def _load_view(session_id: str, session: Session):
-    """Load (journal, view, table_state) for the editable table.
+async def _load_view(session_id: str, session: Session,
+                    table_type: Optional[str] = None):
+    """Load (journal, view, table_state) for one table (default: primary).
 
     Caller must hold the session lock.  Raises 404 when the baseline
     (base) is missing.
     """
-    loaded = await load_journal_view(session_id, _editable_table_type(session))
+    tt = _resolve_table_type(session, table_type)
+    loaded = await load_journal_view(session_id, tt)
     if loaded is None:
         raise HTTPException(status_code=404, detail="HTML content not found")
     return loaded
@@ -90,6 +123,19 @@ async def _load_view(session_id: str, session: Session):
 def _recompute(state: dict, journal: ChangeJournal) -> TableView:
     return TableView(state['base_html'], state['artifacts'],
                      journal.applied_events)
+
+
+async def _append_event(session: Session, session_id: str, table_type: str,
+                        journal: ChangeJournal, op: str, **fields) -> dict:
+    """Append one event, keeping the session-wide undo stack coherent.
+
+    Both tables share one logical undo stack (ordered by each event's
+    ``gseq`` stamp), so a new edit must destroy the redo tails of EVERY
+    journal — not just the one being appended to — before appending.
+    Caller must hold the session lock."""
+    await truncate_redo_tails(session_id, _session_table_types(session),
+                              exclude=(table_type,))
+    return await journal.append(op, **fields)
 
 
 def _cleanup_legacy_state_files(session_id: str) -> None:
@@ -154,14 +200,18 @@ def _report_counts(report_path: Optional[str]) -> tuple:
 
 def _table_header_html(label: str, errors: int, warnings: int,
                        invalid_rows: int, total_rows: int,
-                       filename: Optional[str] = None) -> str:
+                       filename: Optional[str] = None,
+                       table_type: Optional[str] = None) -> str:
     """Compact per-table header (table-type title + one-line validation
     stats) that replaces the verbose general-info block emitted by
-    ``make_gui``.  The ``table-stats`` class marks the new format."""
+    ``make_gui``.  The ``table-stats`` class marks the new format;
+    ``data-table-type`` (when given) is the per-table anchor used by the
+    frontend for scoped queries and scroll targeting."""
+    attrs = f' data-table-type="{table_type}"' if table_type else ''
     parts = [
-        '<div class="container-fluid general-info table-stats">',
+        f'<div class="container-fluid general-info table-stats"{attrs}>',
         f'<h4>{label}</h4>',
-        f'<p class="table-stats-line">Errors: {errors} | Warnings: {warnings}'
+        f'<p class="table-stats-line">Issues: {errors + warnings} (errors: {errors}; warnings: {warnings})'
         f' | Invalid rows: {invalid_rows} | Total rows: {total_rows}</p>',
     ]
     if filename is not None:
@@ -169,6 +219,60 @@ def _table_header_html(label: str, errors: int, warnings: int,
                      f'in <em>{filename}</em>.</strong></p>')
     parts.append('</div>')
     return ''.join(parts)
+
+
+def _table_controls_html(table_type: str, show_all: bool, changes_only: bool,
+                         filtered: bool) -> str:
+    """Per-table filter buttons, rendered with each table's fragment (each
+    table of a paired session filters independently).  ``filtered`` (the
+    issue-filtered view) disables both toggles.  Clicks are delegated in
+    editor.js via ``[data-table-toggle]``."""
+    def btn(kind: str, label: str, active: bool) -> str:
+        return (f'<button type="button" class="btn btn-sm btn-outline-secondary '
+                f'view-toggle{" active" if active else ""}" '
+                f'data-table-toggle="{kind}" data-table-type="{table_type}"'
+                f'{" disabled" if filtered else ""}>{label}</button>')
+    return (f'<div class="table-controls" data-table-type="{table_type}">'
+            + btn('show-all', 'Show all rows', show_all)
+            + btn('changes-only', 'Show Changes Only', changes_only)
+            + '</div>')
+
+
+def _filter_banner_html(table_type: str, issue_id: str, row_count: int) -> str:
+    """Banner above a table in the issue-filtered view (server-rendered;
+    the exit button is delegated in editor.js via ``[data-exit-filter]``)."""
+    rows_label = 'row' if row_count == 1 else 'rows'
+    return (f'<div class="filter-banner" data-table-type="{table_type}">'
+            f'<div class="filter-banner-content">'
+            f'<button type="button" class="btn btn-sm btn-outline-primary" '
+            f'data-exit-filter="{table_type}">← Back to full table</button>'
+            f'<span class="filter-banner-text">Filtered by issue: '
+            f'<strong>{issue_id}</strong></span>'
+            f'<span class="badge bg-secondary">{row_count} {rows_label}</span>'
+            f'</div></div>')
+
+
+def _empty_state_html(table_type: str, show_all: bool, changes_only: bool,
+                      filtered: bool) -> str:
+    """Context-dependent message when a table's filtered view has no rows
+    (server-rendered; the CTA button is delegated via
+    ``[data-empty-show-all]``)."""
+    if filtered:
+        text = ('No rows involved in this issue are left in the table '
+                '(deleted rows drop out of the filtered view).')
+    elif changes_only:
+        text = ('No changes yet — edit, add or delete content, or turn off '
+                '“Show Changes Only”.')
+    elif not show_all:
+        return (f'<div class="empty-state" data-table-type="{table_type}">'
+                f'No rows with errors/warnings or changes.'
+                f'<button type="button" class="btn btn-sm btn-outline-primary '
+                f'ms-2" data-empty-show-all="{table_type}">Show all rows'
+                f'</button></div>')
+    else:
+        text = 'The table is empty.'
+    return (f'<div class="empty-state" data-table-type="{table_type}">'
+            f'{text}</div>')
 
 
 def _replace_general_info(html: str, replacements: list) -> str:
@@ -197,6 +301,99 @@ def _replace_general_info(html: str, replacements: list) -> str:
     return ''.join(out)
 
 
+async def _table_fragment(session_id: str, table_type: str, *, page: int,
+                          show_all: bool, changes_only: bool,
+                          issue_id: Optional[str],
+                          focus_row_id: Optional[str],
+                          report_path: Optional[str]):
+    """Build one table's page fragment: stats header (+ per-table filter
+    controls, filter banner, empty state) + journal-replayed table page +
+    pager.  Returns ``(html, info)`` where ``info`` carries the clamped
+    page/page_count and the filtered-view row count, or ``(None, None)``
+    when the table has no parsable table (fully-valid side).  Caller must
+    hold the session lock.
+    """
+    loaded = await load_journal_view(session_id, table_type)
+    if loaded is None or not loaded[2]['artifacts'].get('has_table'):
+        return None, None
+    _journal, view, state = loaded
+    artifacts = state['artifacts']
+    label = 'Metadata' if table_type == 'meta' else 'Citations'
+
+    deletions = view.compute_deletions()
+    changed = view.changed_row_ids(deletions)
+    issues = view.issue_row_ids()
+
+    if issue_id is not None:
+        entries = [{'row_id': rid, 'ghost': False}
+                   for rid in artifacts['issue_index'].get(issue_id, [])
+                   if rid in view.row_ids]
+    else:
+        entries = [e for e in view.display_rows()
+                   if (show_all or e['row_id'] in issues
+                       or e['row_id'] in changed)
+                   and (not changes_only or e['row_id'] in changed)]
+
+    total = len(entries)
+    page_count = _page_count(total)
+    page = max(1, min(page, page_count))
+    if focus_row_id:
+        base_focus = (focus_row_id[6:]
+                      if focus_row_id.startswith('ghost-') else focus_row_id)
+        for i, e in enumerate(entries):
+            if e['row_id'] == base_focus:
+                page = i // TABLE_PAGE_SIZE + 1
+                break
+
+    page_entries = entries[(page - 1) * TABLE_PAGE_SIZE:page * TABLE_PAGE_SIZE]
+
+    # Deleted items per surviving row (for in-row ghost containers)
+    deleted_by_row = {}
+    for item_id in deletions['deleted_items']:
+        rid = _row_id_for_item(item_id)
+        if rid in deletions['deleted_rows']:
+            continue
+        deleted_by_row.setdefault(rid, []).append(item_id)
+    values = deletions['deleted_item_values']
+
+    row_parts = []
+    for e in page_entries:
+        if e['ghost']:
+            row_parts.append(view.ghost_row_html(e['row_id']))
+        else:
+            row_parts.append(view.row_html_with_ghosts(
+                e['row_id'], deleted_by_row.get(e['row_id'], []), values))
+
+    open_tag = artifacts['table_open_tag'].replace(
+        '>', f' data-editable="1" data-table-type="{table_type}">', 1)
+    # Whole-table stats (the pager's `total` is the filtered-view count):
+    # errors/warnings from the last validation report; invalid/total rows
+    # from the live view (ghosts excluded, journal-added rows included).
+    errors, warnings = _report_counts(report_path)
+    live_rows = set(view.row_ids)
+    invalid_rows = len(issues & live_rows)
+    total_rows = len(view.row_ids)
+
+    filtered = issue_id is not None
+    parts = [_table_header_html(label, errors, warnings, invalid_rows,
+                                total_rows, table_type=table_type)]
+    if filtered:
+        parts.append(_filter_banner_html(table_type, issue_id, total))
+    if not entries:
+        parts.append(_empty_state_html(table_type, show_all, changes_only,
+                                       filtered))
+    parts.extend([
+        _table_controls_html(table_type, show_all, changes_only, filtered),
+        '<div class="table-container container-fluid">',
+        open_tag, artifacts['thead_html'], '<tbody>',
+        *row_parts,
+        '</tbody></table></div>',
+        _pager_html(table_type, page, page_count, total),
+    ])
+    info = {"page": page, "page_count": page_count, "total_rows": total}
+    return ''.join(parts), info
+
+
 # ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
@@ -205,11 +402,13 @@ class EditItemRequest(BaseModel):
     session_id: str
     item_id: str
     new_value: str
+    table_type: Optional[str] = None   # 'meta' or 'cits'; None = primary
 
 
 class DeleteItemRequest(BaseModel):
     session_id: str
     item_id: str
+    table_type: Optional[str] = None
 
 
 class AddItemRequest(BaseModel):
@@ -218,6 +417,7 @@ class AddItemRequest(BaseModel):
     row_id: Optional[str] = None    # Row ID for adding with value
     field_name: Optional[str] = None  # Field name for adding with value
     new_value: Optional[str] = None  # Value for the new item
+    table_type: Optional[str] = None
 
 
 class RevalidateRequest(BaseModel):
@@ -228,20 +428,26 @@ class RevalidateRequest(BaseModel):
 class DeleteRowRequest(BaseModel):
     session_id: str
     row_id: str   # e.g. "row5"
+    table_type: Optional[str] = None
 
 
 class AddRowRequest(BaseModel):
     session_id: str
+    table_type: Optional[str] = None
 
 
 class ClearCellRequest(BaseModel):
     session_id: str
     row_id: str       # e.g. "row5"
     field_name: str   # e.g. "id", "author"
+    table_type: Optional[str] = None
 
 
 class UndoRedoRequest(BaseModel):
     session_id: str
+    table_type: Optional[str] = None   # unused: undo/redo work on the
+                                       # session-wide stack (kept for request
+                                       # compatibility with older clients)
 
 
 class CommitRequest(BaseModel):
@@ -255,177 +461,124 @@ class CommitRequest(BaseModel):
 @router.get("/table/{session_id}")
 async def get_table_view(session_id: str, page: int = 1, show_all: bool = False,
                          changes_only: bool = False, issue_id: Optional[str] = None,
-                         focus_row_id: Optional[str] = None, cits_page: int = 1):
+                         focus_row_id: Optional[str] = None, cits_page: int = 1,
+                         cits_show_all: bool = False,
+                         cits_changes_only: bool = False,
+                         cits_issue_id: Optional[str] = None,
+                         cits_focus_row_id: Optional[str] = None):
     """
-    One page (≤ TABLE_PAGE_SIZE rows) of the editor's table view.
+    One page (≤ TABLE_PAGE_SIZE rows) per table of the editor's view —
+    every table of the session (metadata and citations, both editable) is
+    journal-replayed and paginated/filtered independently.
 
-    Row visibility: by default only rows with issues (errors/warnings) or
-    with journal changes (edits / additions / deletions — ghost rows count
-    as changed); ``show_all`` reveals every row regardless of validity,
-    ``changes_only`` restricts the view to changed rows.  ``issue_id``
-    switches to the single-issue filtered view.  Ghost overlays for deleted
-    items/rows are always part of the rendered rows.  Rows are selected by
-    id, never by position; ``focus_row_id`` (a live row id, or a
-    ``ghost-`` prefixed one) selects the page containing that row.
+    Row visibility (per table): by default only rows with issues
+    (errors/warnings) or with journal changes (edits / additions /
+    deletions — ghost rows count as changed); ``show_all`` reveals every
+    row regardless of validity, ``changes_only`` restricts the view to
+    changed rows.  ``issue_id`` switches to the single-issue filtered
+    view.  Ghost overlays for deleted items/rows are always part of the
+    rendered rows.  Rows are selected by id, never by position;
+    ``focus_row_id`` (a live row id, or a ``ghost-`` prefixed one)
+    selects the page containing that row.
 
-    For paired sessions the read-only citations table is appended, paginated
-    independently via ``cits_page``.
+    The top-level params describe the session's *primary* table (the
+    first of meta/cits with a parsable table); in paired sessions the
+    ``cits_*`` params describe the citations table when it is not the
+    primary one.
     """
     session = await SessionManager.load_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
     async with document_cache.session_lock(session_id):
-        journal, view, state = await _load_view(session_id, session)
-        artifacts = state['artifacts']
+        states = {}
+        for tt in _session_table_types(session):
+            states[tt] = await load_table_state(session_id, tt)
+        primary = next((tt for tt in ('meta', 'cits')
+                        if tt in states and states[tt] is not None
+                        and states[tt]['artifacts'].get('has_table')), None)
 
-        if not artifacts.get('has_table'):
-            # Legacy fallback: fully-valid uploads have no parsable table —
-            # serve the whole document with the paging UI disabled.  The
-            # editable side is fully valid (zero stats); a paired citations
-            # table may still carry issues, so it gets real counts.
+        if primary is None:
+            # Legacy fallback: no parsable table anywhere (fully-valid
+            # uploads) — serve the whole document with the paging UI
+            # disabled.  Both sides are fully valid (zero stats).
             tt = _editable_table_type(session)
-            editable_csv = session.meta_csv_path or session.cits_csv_path or ''
-            replacements = [
-                _table_header_html('Metadata' if tt == 'meta' else 'Citations',
-                                   0, 0, 0, 0,
-                                   filename=Path(editable_csv).name
-                                   if editable_csv else None)]
+            _journal, view, _state = await _load_view(session_id, session, tt)
+            replacements = []
+            for t in _session_table_types(session):
+                csv_path = (session.meta_csv_path if t == 'meta'
+                            else session.cits_csv_path) or ''
+                replacements.append(_table_header_html(
+                    'Metadata' if t == 'meta' else 'Citations', 0, 0, 0, 0,
+                    filename=Path(csv_path).name if csv_path else None))
             if session.has_metadata and session.has_citations:
-                cits_state = await load_table_state(session_id, 'cits')
-                if cits_state is None:
+                if states.get('cits') is None:
                     raise HTTPException(status_code=404,
                                         detail="HTML content not found")
-                cits_art = cits_state['artifacts']
-                if cits_art.get('has_table'):
-                    cits_issues = {rid
-                                   for rids in cits_art.get('issue_index', {}).values()
-                                   for rid in rids}
-                    c_err, c_warn = _report_counts(session.cits_report_path)
-                    replacements.append(_table_header_html(
-                        'Citations', c_err, c_warn,
-                        len(cits_issues & set(cits_art.get('row_ids', []))),
-                        len(cits_art.get('row_ids', []))))
-                else:
-                    replacements.append(_table_header_html(
-                        'Citations', 0, 0, 0, 0,
-                        filename=Path(session.cits_csv_path).name
-                        if session.cits_csv_path else None))
-                html_content = compose_display(view.html, cits_state['base_html'])
+                html_content = compose_display(view.html,
+                                               states['cits']['base_html'])
             else:
                 html_content = view.html
             html_content = _replace_general_info(html_content, replacements)
             return {"html": html_content, "has_table": False,
                     "paginated": False, "page": 1, "page_count": 1,
-                    "total_rows": 0, "table_type": _editable_table_type(session),
-                    "cits": None}
+                    "total_rows": 0, "table_type": tt, "cits": None}
 
-        deletions = view.compute_deletions()
-        changed = view.changed_row_ids(deletions)
-        issues = view.issue_row_ids()
+        # The primary table's fragment is described by the top-level params
+        # (compat); the other table — only possible when primary is 'meta'
+        # — by the cits_* params.
+        params_by_table = {primary: dict(page=page, show_all=show_all,
+                                         changes_only=changes_only,
+                                         issue_id=issue_id,
+                                         focus_row_id=focus_row_id)}
+        other = 'cits' if primary == 'meta' else 'meta'
+        if other in states and states[other] is not None \
+                and states[other]['artifacts'].get('has_table'):
+            params_by_table[other] = dict(page=cits_page, show_all=cits_show_all,
+                                          changes_only=cits_changes_only,
+                                          issue_id=cits_issue_id,
+                                          focus_row_id=cits_focus_row_id)
 
-        if issue_id is not None:
-            entries = [{'row_id': rid, 'ghost': False}
-                       for rid in artifacts['issue_index'].get(issue_id, [])
-                       if rid in view.row_ids]
-        else:
-            entries = [e for e in view.display_rows()
-                       if (show_all or e['row_id'] in issues
-                           or e['row_id'] in changed)
-                       and (not changes_only or e['row_id'] in changed)]
-
-        total = len(entries)
-        page_count = _page_count(total)
-        page = max(1, min(page, page_count))
-        if focus_row_id:
-            base_focus = (focus_row_id[6:]
-                          if focus_row_id.startswith('ghost-') else focus_row_id)
-            for i, e in enumerate(entries):
-                if e['row_id'] == base_focus:
-                    page = i // TABLE_PAGE_SIZE + 1
-                    break
-
-        page_entries = entries[(page - 1) * TABLE_PAGE_SIZE:page * TABLE_PAGE_SIZE]
-
-        # Deleted items per surviving row (for in-row ghost containers)
-        deleted_by_row = {}
-        for item_id in deletions['deleted_items']:
-            rid = _row_id_for_item(item_id)
-            if rid in deletions['deleted_rows']:
+        html_parts: list = []
+        info_by_table: dict = {}
+        for tt in _session_table_types(session):   # document order: meta, cits
+            if tt not in params_by_table:
                 continue
-            deleted_by_row.setdefault(rid, []).append(item_id)
-        values = deletions['deleted_item_values']
+            report_path = (session.meta_report_path if tt == 'meta'
+                           else session.cits_report_path)
+            html, info = await _table_fragment(session_id, tt,
+                                               report_path=report_path,
+                                               **params_by_table[tt])
+            html_parts.append(html)
+            info_by_table[tt] = info
 
-        row_parts = []
-        for e in page_entries:
-            if e['ghost']:
-                row_parts.append(view.ghost_row_html(e['row_id']))
+        # Fully-valid (table-less) sides still get their zero-stats card,
+        # in document order, so the "✓ no issues" reassurance is kept.
+        # The response's `cits` key describes the citations table only when
+        # it is NOT the primary (in solo-cits sessions the top-level fields
+        # already describe it).
+        cits_info = info_by_table.get('cits') if primary != 'cits' else None
+        for tt in _session_table_types(session):
+            if tt in info_by_table or tt not in states:
+                continue
+            csv_path = (session.meta_csv_path if tt == 'meta'
+                        else session.cits_csv_path) or ''
+            card = _table_header_html('Metadata' if tt == 'meta' else 'Citations',
+                                      0, 0, 0, 0,
+                                      filename=Path(csv_path).name
+                                      if csv_path else None,
+                                      table_type=tt)
+            if tt == 'meta':
+                html_parts.insert(0, card)
             else:
-                row_parts.append(view.row_html_with_ghosts(
-                    e['row_id'], deleted_by_row.get(e['row_id'], []), values))
-
-        editable_open = artifacts['table_open_tag'].replace(
-            '>', ' data-editable="1">', 1)
-        # Whole-table stats (the pager's `total` is the filtered-view count):
-        # errors/warnings from the last validation report; invalid/total rows
-        # from the live view (ghosts excluded, journal-added rows included).
-        tt = _editable_table_type(session)
-        errors, warnings = _report_counts(
-            session.meta_report_path if tt == 'meta' else session.cits_report_path)
-        live_rows = set(view.row_ids)
-        invalid_rows = len(issues & live_rows)
-        total_rows = len(view.row_ids)
-        html_parts = [
-            _table_header_html('Metadata' if tt == 'meta' else 'Citations',
-                               errors, warnings, invalid_rows, total_rows),
-            '<div class="table-container container-fluid">',
-            editable_open, artifacts['thead_html'], '<tbody>',
-            *row_parts,
-            '</tbody></table></div>',
-            _pager_html('meta', page, page_count, total),
-        ]
-
-        cits_info = None
-        if session.has_metadata and session.has_citations:
-            cits_state = await load_table_state(session_id, 'cits')
-            if cits_state is None:
-                raise HTTPException(status_code=404,
-                                    detail="HTML content not found")
-            cits_art = cits_state['artifacts']
-            cits_base = cits_state['base_html']
-            if cits_art.get('has_table'):
-                cits_row_ids = cits_art.get('row_ids', [])
-                cits_total = len(cits_row_ids)
-                cits_page_count = _page_count(cits_total)
-                cits_page = max(1, min(cits_page, cits_page_count))
-                cits_slice = cits_row_ids[(cits_page - 1) * TABLE_PAGE_SIZE:
-                                          cits_page * TABLE_PAGE_SIZE]
-                cits_rows = []
-                for rid in cits_slice:
-                    s, e = cits_art['row_offsets'][rid]
-                    cits_rows.append(cits_base[s:e])
-                cits_issues = {rid for rids in cits_art.get('issue_index', {}).values()
-                               for rid in rids}
-                cits_errors, cits_warnings = _report_counts(session.cits_report_path)
-                cits_gi = _table_header_html(
-                    'Citations', cits_errors, cits_warnings,
-                    len(cits_issues & set(cits_row_ids)), cits_total)
-                html_parts.extend([
-                    cits_gi,
-                    '<div class="table-container container-fluid">',
-                    cits_art['table_open_tag'], cits_art['thead_html'], '<tbody>',
-                    *cits_rows,
-                    '</tbody></table></div>',
-                    _pager_html('cits', cits_page, cits_page_count, cits_total),
-                ])
-                cits_info = {"page": cits_page, "page_count": cits_page_count,
-                             "total_rows": cits_total}
-            else:
+                html_parts.append(card)
                 cits_info = {"page": 1, "page_count": 1, "total_rows": 0}
 
+        primary_info = info_by_table[primary]
     return {"html": ''.join(html_parts), "has_table": True, "paginated": True,
-            "page": page, "page_count": page_count, "total_rows": total,
-            "table_type": _editable_table_type(session), "cits": cits_info}
+            "page": primary_info["page"], "page_count": primary_info["page_count"],
+            "total_rows": primary_info["total_rows"],
+            "table_type": primary, "cits": cits_info}
 
 
 @router.post("/item")
@@ -438,12 +591,13 @@ async def edit_item(request: EditItemRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    table_type = _editable_table_type(session)
+    table_type = _resolve_table_type(session, request.table_type)
     row_id = _row_id_for_item(request.item_id)
     field_name = _field_for_item(request.item_id)
 
     async with document_cache.session_lock(request.session_id):
-        journal, view, state = await _load_view(request.session_id, session)
+        journal, view, state = await _load_view(request.session_id, session,
+                                                table_type)
         bs, row = view.row_soup(row_id)
         if row is None:
             raise HTTPException(status_code=404,
@@ -458,12 +612,14 @@ async def edit_item(request: EditItemRequest):
         if is_multi_value and request.new_value.strip() == '':
             # Edit-to-empty on a multi-value field is a removal (no stray
             # separators in the exported CSV; ghost semantics rely on it).
-            await journal.append('remove_item', row=row_id,
-                                 item=request.item_id, field=field_name)
+            await _append_event(session, request.session_id, table_type,
+                                journal, 'remove_item', row=row_id,
+                                item=request.item_id, field=field_name)
         else:
-            await journal.append('set_item', row=row_id,
-                                 item=request.item_id, field=field_name,
-                                 value=request.new_value)
+            await _append_event(session, request.session_id, table_type,
+                                journal, 'set_item', row=row_id,
+                                item=request.item_id, field=field_name,
+                                value=request.new_value)
 
         new_view = _recompute(state, journal)
         session.mark_edited()
@@ -474,6 +630,7 @@ async def edit_item(request: EditItemRequest):
         "original_value": original_value,
         "new_value": request.new_value,
         "row_id": row_id,
+        "table_type": table_type,
         "row_html": new_view.row_html(row_id)
     }
 
@@ -488,13 +645,16 @@ async def add_item_to_cell(request: AddItemRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    table_type = _resolve_table_type(session, request.table_type)
+
     if request.new_value is not None and request.row_id and request.field_name:
         # ── Adding with value directly ─────────────────────────────────────
         field_name = request.field_name
         is_multi_value = field_name in HTMLParser.ITEM_SEPARATORS
 
         async with document_cache.session_lock(request.session_id):
-            journal, view, state = await _load_view(request.session_id, session)
+            journal, view, state = await _load_view(request.session_id, session,
+                                                    table_type)
             bs, row = view.row_soup(request.row_id)
             if row is None:
                 raise HTTPException(status_code=404,
@@ -504,8 +664,9 @@ async def add_item_to_cell(request: AddItemRequest):
 
             if not has_value:
                 new_item_id = f"{request.row_id[3:]}-{field_name}-0"
-                await journal.append('init_cell', row=request.row_id,
-                                     field=field_name, value=request.new_value)
+                await _append_event(session, request.session_id, table_type,
+                                    journal, 'init_cell', row=request.row_id,
+                                    field=field_name, value=request.new_value)
             elif not is_multi_value:
                 raise HTTPException(
                     status_code=400,
@@ -517,8 +678,9 @@ async def add_item_to_cell(request: AddItemRequest):
                 if not new_item_id:
                     raise HTTPException(status_code=404,
                                         detail=f"Field '{field_name}' not found")
-                await journal.append('append_item', row=request.row_id,
-                                     field=field_name, value=request.new_value)
+                await _append_event(session, request.session_id, table_type,
+                                    journal, 'append_item', row=request.row_id,
+                                    field=field_name, value=request.new_value)
 
             new_view = _recompute(state, journal)
             session.mark_edited()
@@ -528,6 +690,7 @@ async def add_item_to_cell(request: AddItemRequest):
             "success": True,
             "new_item_id": new_item_id,
             "row_id": request.row_id,
+            "table_type": table_type,
             "row_html": new_view.row_html(request.row_id)
         }
 
@@ -546,7 +709,8 @@ async def add_item_to_cell(request: AddItemRequest):
         row_id = _row_id_for_item(request.item_id)
 
         async with document_cache.session_lock(request.session_id):
-            journal, view, state = await _load_view(request.session_id, session)
+            journal, view, state = await _load_view(request.session_id, session,
+                                                    table_type)
             bs, row = view.row_soup(row_id)
             if row is None:
                 raise HTTPException(status_code=404,
@@ -555,8 +719,9 @@ async def add_item_to_cell(request: AddItemRequest):
             if not new_item_id:
                 raise HTTPException(status_code=404,
                                     detail=f"Item '{request.item_id}' not found in HTML")
-            await journal.append('append_item', row=row_id,
-                                 field=field_name, value='')
+            await _append_event(session, request.session_id, table_type,
+                                journal, 'append_item', row=row_id,
+                                field=field_name, value='')
             new_view = _recompute(state, journal)
             session.mark_edited()
             await SessionManager.save_session(session)
@@ -565,6 +730,7 @@ async def add_item_to_cell(request: AddItemRequest):
             "success": True,
             "new_item_id": new_item_id,
             "row_id": row_id,
+            "table_type": table_type,
             "row_html": new_view.row_html(row_id)
         }
     else:
@@ -581,11 +747,13 @@ async def delete_item(request: DeleteItemRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    table_type = _resolve_table_type(session, request.table_type)
     row_id = _row_id_for_item(request.item_id)
     field_name = _field_for_item(request.item_id)
 
     async with document_cache.session_lock(request.session_id):
-        journal, view, state = await _load_view(request.session_id, session)
+        journal, view, state = await _load_view(request.session_id, session,
+                                                table_type)
         bs, row = view.row_soup(row_id)
         if row is None:
             raise HTTPException(status_code=404,
@@ -597,11 +765,13 @@ async def delete_item(request: DeleteItemRequest):
                 "success": True,
                 "item_id": request.item_id,
                 "row_id": row_id,
+                "table_type": table_type,
                 "row_html": view.row_html(row_id)
             }
 
-        await journal.append('remove_item', row=row_id,
-                             item=request.item_id, field=field_name)
+        await _append_event(session, request.session_id, table_type,
+                            journal, 'remove_item', row=row_id,
+                            item=request.item_id, field=field_name)
         new_view = _recompute(state, journal)
         session.mark_edited()
         await SessionManager.save_session(session)
@@ -610,6 +780,7 @@ async def delete_item(request: DeleteItemRequest):
         "success": True,
         "item_id": request.item_id,
         "row_id": row_id,
+        "table_type": table_type,
         "row_html": new_view.row_html(row_id)
     }
 
@@ -621,17 +792,22 @@ async def delete_row(request: DeleteRowRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    table_type = _resolve_table_type(session, request.table_type)
     async with document_cache.session_lock(request.session_id):
-        journal, view, state = await _load_view(request.session_id, session)
+        journal, view, state = await _load_view(request.session_id, session,
+                                                table_type)
         if request.row_id not in view.row_ids:
             # Already gone — success no-op.
-            return {"success": True, "row_id": request.row_id, "removed": False}
+            return {"success": True, "row_id": request.row_id,
+                    "table_type": table_type, "removed": False}
 
-        await journal.append('delete_row', row=request.row_id)
+        await _append_event(session, request.session_id, table_type,
+                            journal, 'delete_row', row=request.row_id)
         session.mark_edited()
         await SessionManager.save_session(session)
 
-    return {"success": True, "row_id": request.row_id, "removed": True}
+    return {"success": True, "row_id": request.row_id,
+            "table_type": table_type, "removed": True}
 
 
 @router.post("/row/add")
@@ -641,12 +817,15 @@ async def add_row(request: AddRowRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    table_type = _resolve_table_type(session, request.table_type)
     async with document_cache.session_lock(request.session_id):
-        journal, view, state = await _load_view(request.session_id, session)
+        journal, view, state = await _load_view(request.session_id, session,
+                                                table_type)
         if not state['artifacts'].get('has_table'):
             raise HTTPException(status_code=500, detail="Failed to add new row")
         new_row_id = view.next_add_row_id()
-        await journal.append('add_row', row=new_row_id)
+        await _append_event(session, request.session_id, table_type,
+                            journal, 'add_row', row=new_row_id)
         new_view = _recompute(state, journal)
         session.mark_edited()
         await SessionManager.save_session(session)
@@ -654,6 +833,7 @@ async def add_row(request: AddRowRequest):
     return {
         "success": True,
         "row_id": new_row_id,
+        "table_type": table_type,
         "row_html": new_view.row_html(new_row_id)
     }
 
@@ -665,8 +845,10 @@ async def clear_cell_route(request: ClearCellRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    table_type = _resolve_table_type(session, request.table_type)
     async with document_cache.session_lock(request.session_id):
-        journal, view, state = await _load_view(request.session_id, session)
+        journal, view, state = await _load_view(request.session_id, session,
+                                                table_type)
         bs, row = view.row_soup(request.row_id)
         if row is None or HTMLParser._get_cell_in_row(row, request.field_name) is None:
             raise HTTPException(
@@ -674,8 +856,9 @@ async def clear_cell_route(request: ClearCellRequest):
                 detail=f"Cell '{request.field_name}' not found in row '{request.row_id}'"
             )
 
-        await journal.append('clear_cell', row=request.row_id,
-                             field=request.field_name)
+        await _append_event(session, request.session_id, table_type,
+                            journal, 'clear_cell', row=request.row_id,
+                            field=request.field_name)
         new_view = _recompute(state, journal)
         session.mark_edited()
         await SessionManager.save_session(session)
@@ -685,6 +868,7 @@ async def clear_cell_route(request: ClearCellRequest):
         "success": True,
         "new_item_id": new_item_id,
         "row_id": request.row_id,
+        "table_type": table_type,
         "row_html": new_view.row_html(request.row_id)
     }
 
@@ -695,57 +879,111 @@ async def clear_cell_route(request: ClearCellRequest):
 
 @router.get("/undo_state/{session_id}")
 async def get_undo_state(session_id: str):
-    """Return whether undo and redo are currently available for this session."""
+    """Undo/redo availability for the session-wide stack (any journal)."""
     session = await SessionManager.load_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     async with document_cache.session_lock(session_id):
-        journal, _view, _state = await _load_view(session_id, session)
-        return {"can_undo": journal.can_undo, "can_redo": journal.can_redo}
+        tables = {}
+        for tt in _session_table_types(session):
+            journal, _view, _state = await _load_view(session_id, session, tt)
+            tables[tt] = {"can_undo": journal.can_undo,
+                          "can_redo": journal.can_redo}
+    return {"tables": tables,
+            "can_undo": any(t["can_undo"] for t in tables.values()),
+            "can_redo": any(t["can_redo"] for t in tables.values())}
+
+
+def _undo_order_key(ev: dict, table_type: str) -> tuple:
+    """Sort key for the session-wide undo stack (chronological by gseq;
+    pre-gseq legacy events fall back to 0 — those histories are
+    single-journal, so journal order is their chronological order)."""
+    return (ev.get('gseq', 0), table_type)
 
 
 @router.post("/undo")
 async def undo(request: UndoRedoRequest):
-    """Undo the last mutation: move the journal cursor back one event."""
+    """Undo the most recent mutation across BOTH tables: move the cursor of
+    whichever journal holds the chronologically last applied event."""
     session = await SessionManager.load_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
     async with document_cache.session_lock(request.session_id):
-        journal, _view, state = await _load_view(request.session_id, session)
-        ev = await journal.undo()
-        if ev is None:
+        journals = {}
+        for tt in _session_table_types(session):
+            journals[tt] = await _load_view(request.session_id, session, tt)
+
+        target_tt = None
+        target_key = None
+        for tt, (journal, _view, _state) in journals.items():
+            applied = journal.applied_events
+            if not applied:
+                continue
+            key = _undo_order_key(applied[-1], tt)
+            if target_key is None or key > target_key:
+                target_tt, target_key = tt, key
+
+        if target_tt is None:
             return {"success": False, "message": "Nothing to undo",
-                    "can_undo": journal.can_undo, "can_redo": journal.can_redo}
+                    "can_undo": False,
+                    "can_redo": any(j.can_redo for j, _v, _s in
+                                    journals.values())}
+
+        journal, _view, state = journals[target_tt]
+        ev = await journal.undo()
         new_view = _recompute(state, journal)
         payload = _patch_payload(ev, new_view, journal)
         session.mark_edited()
         await SessionManager.save_session(session)
+        can_undo = any(j.can_undo for j, _v, _s in journals.values())
+        can_redo = any(j.can_redo for j, _v, _s in journals.values())
 
-    return {"success": True, "can_undo": journal.can_undo,
-            "can_redo": journal.can_redo, **payload}
+    return {"success": True, "table_type": target_tt,
+            "can_undo": can_undo, "can_redo": can_redo, **payload}
 
 
 @router.post("/redo")
 async def redo(request: UndoRedoRequest):
-    """Redo the last undone mutation: move the journal cursor forward."""
+    """Redo the oldest undone mutation across BOTH tables: move the cursor
+    of whichever journal holds the chronologically first event in a redo
+    tail."""
     session = await SessionManager.load_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
     async with document_cache.session_lock(request.session_id):
-        journal, _view, state = await _load_view(request.session_id, session)
-        ev = await journal.redo()
-        if ev is None:
+        journals = {}
+        for tt in _session_table_types(session):
+            journals[tt] = await _load_view(request.session_id, session, tt)
+
+        target_tt = None
+        target_key = None
+        for tt, (journal, _view, _state) in journals.items():
+            tail = journal.events[journal.cursor:]
+            if not tail:
+                continue
+            key = _undo_order_key(tail[0], tt)
+            if target_key is None or key < target_key:
+                target_tt, target_key = tt, key
+
+        if target_tt is None:
             return {"success": False, "message": "Nothing to redo",
-                    "can_undo": journal.can_undo, "can_redo": journal.can_redo}
+                    "can_undo": any(j.can_undo for j, _v, _s in
+                                    journals.values()),
+                    "can_redo": False}
+
+        journal, _view, state = journals[target_tt]
+        ev = await journal.redo()
         new_view = _recompute(state, journal)
         payload = _patch_payload(ev, new_view, journal)
         session.mark_edited()
         await SessionManager.save_session(session)
+        can_undo = any(j.can_undo for j, _v, _s in journals.values())
+        can_redo = any(j.can_redo for j, _v, _s in journals.values())
 
-    return {"success": True, "can_undo": journal.can_undo,
-            "can_redo": journal.can_redo, **payload}
+    return {"success": True, "table_type": target_tt,
+            "can_undo": can_undo, "can_redo": can_redo, **payload}
 
 
 def _patch_payload(ev: dict, view: TableView, journal: ChangeJournal) -> dict:
@@ -771,24 +1009,32 @@ def _patch_payload(ev: dict, view: TableView, journal: ChangeJournal) -> dict:
 @router.post("/commit")
 async def commit(request: CommitRequest):
     """
-    Save: materialize the current view (baseline + events ≤ cursor) into the
-    table file(s).  The journal and undo history are preserved — undo still
+    Save: materialize the current view (baseline + events ≤ cursor) of every
+    uploaded table into its table file, and refresh the composed display for
+    paired sessions.  Journals and undo history are preserved — undo still
     steps back past the save.
     """
     session = await SessionManager.load_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    table_type = _editable_table_type(session)
     async with document_cache.session_lock(request.session_id):
-        journal, view, state = await _load_view(request.session_id, session)
-        await SessionManager.save_html(request.session_id, view.html, table_type)
+        views = {}
+        for tt in _session_table_types(session):
+            journal, view, _state = await _load_view(request.session_id,
+                                                     session, tt)
+            await SessionManager.save_html(request.session_id, view.html, tt)
+            await journal.mark_saved()
+            views[tt] = view.html
         if session.has_metadata and session.has_citations:
-            cits_state = await load_table_state(request.session_id, 'cits')
-            if cits_state is not None:
-                display = compose_display(view.html, cits_state['base_html'])
-                await SessionManager.save_html(request.session_id, display, 'display')
-        await journal.mark_saved()
+            try:
+                display = compose_display(views['meta'], views['cits'])
+            except Exception:
+                # A fully-valid (table-less) side can lack the divs
+                # compose_display slices — fall back to the meta view alone.
+                display = views['meta']
+            await SessionManager.save_html(request.session_id, display,
+                                           'display')
 
     return {"success": True, "saved": True}
 
@@ -824,20 +1070,14 @@ async def revalidate(request: RevalidateRequest):
             if session.has_metadata and session.has_citations:
                 # ── Paired re-validation ────────────────────────────────────
                 journal, meta_view, meta_state = await _load_view(
-                    request.session_id, session)
+                    request.session_id, session, 'meta')
                 meta_rows = (meta_view.rows_for_export()
                              if meta_state['artifacts'].get('has_table') else None)
 
-                cits_state = await load_table_state(request.session_id, 'cits')
-                if cits_state is None:
-                    raise HTTPException(status_code=404,
-                                        detail="Citations baseline not found")
-                cits_rows = None
-                if cits_state['artifacts'].get('has_table'):
-                    # Citations are not editable — base rows are current.
-                    cits_view = TableView(cits_state['base_html'],
-                                          cits_state['artifacts'], [])
-                    cits_rows = cits_view.rows_for_export()
+                cits_journal, cits_view, cits_state = await _load_view(
+                    request.session_id, session, 'cits')
+                cits_rows = (cits_view.rows_for_export()
+                             if cits_state['artifacts'].get('has_table') else None)
 
                 if meta_rows is not None and not meta_rows:
                     raise ValueError("No data found in metadata HTML table")
@@ -901,8 +1141,9 @@ async def revalidate(request: RevalidateRequest):
                 await SessionManager.save_baseline_snapshot(
                     request.session_id, new_cits_html, 'cits')
                 gen_meta = await build_generation_artifacts(request.session_id, 'meta')
-                await build_generation_artifacts(request.session_id, 'cits')
+                gen_cits = await build_generation_artifacts(request.session_id, 'cits')
                 await journal.reset(gen_meta, 'meta')
+                await cits_journal.reset(gen_cits, 'cits')
 
                 session.meta_report_path = meta_report_path
                 session.cits_report_path = cits_report_path
@@ -999,11 +1240,16 @@ async def get_session(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
 
     async with document_cache.session_lock(session_id):
-        journal, view, _state = await _load_view(session_id, session)
-        edited_count = len(view.edited_item_ids)
-        unsaved = journal.has_unsaved_changes
-        can_undo = journal.can_undo
-        can_redo = journal.can_redo
+        edited_count = 0
+        unsaved = False
+        can_undo = False
+        can_redo = False
+        for tt in _session_table_types(session):
+            journal, view, _state = await _load_view(session_id, session, tt)
+            edited_count += len(view.edited_item_ids)
+            unsaved = unsaved or journal.has_unsaved_changes
+            can_undo = can_undo or journal.can_undo
+            can_redo = can_redo or journal.can_redo
 
     return {
         "session_id": session.session_id,

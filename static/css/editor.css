@@ -123,7 +123,9 @@ body {
     pointer-events: none;
 }
 
-/* View toggle buttons ("Show all rows" / "Show Changes Only") */
+/* View toggle buttons ("Show all rows" / "Show Changes Only") — rendered
+   per table by the backend (each table filters independently); the toolbar
+   keeps only the global "Expand cells" toggle. */
 .view-toggle {
     transition: all 0.2s;
 }
@@ -137,6 +139,17 @@ body {
 .view-toggle:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+}
+
+/* ── Per-table view controls (server-rendered above each table; the
+   "Expand cells" button is client-injected into the same row) ──────────── */
+
+.table-controls {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.35rem;
+    padding: 0.25rem 0 0.5rem 0;
 }
 
 /* ── Table pager (injected after each table by the backend) ─────────────── */
@@ -287,6 +300,10 @@ span.item-data:has(~ span.issue-icon.warning) {
 
 .general-info h4 {
     font-size: 1.1rem;
+}
+
+.table-stats {
+    text-align: center;
 }
 
 .table-stats-line {

@@ -18,13 +18,14 @@ function initBootstrapWidgets() {
         const popover = bootstrap.Popover.getInstance(clickedIssue);
         if (popover) popover.hide();
 
-        if (!clickedIssue.closest('table[data-editable]')) return;  // read-only tables
+        const table = clickedIssue.closest('table[data-table-type]');
+        if (!table || !table.hasAttribute('data-editable')) return;  // read-only tables
         const issueId = clickedIssue.id;
         if (!issueId) {
             console.warn('Issue icon has no id attribute');
             return;
         }
-        loadFilteredTable(issueId);
+        loadFilteredTable(issueId, table.dataset.tableType);
     };
 
     // Also override clearHighlights to do nothing (we don't use it anymore)
@@ -32,46 +33,86 @@ function initBootstrapWidgets() {
 }
 
 // ── View state + rendering core ──────────────────────────────────────────────
-// Every view of the table is one page (≤ 25 rows) fetched from
-// GET /api/edit/table/{session_id}.  The toggles and the pager only mutate
-// this state and re-render; mutations call refreshView() so filter
-// membership, ghosts and page boundaries always come from the server.
+// Every view is one page (≤ 25 rows) per table, fetched from
+// GET /api/edit/table/{session_id}.  Both tables of a paired session are
+// editable and paginated/filtered/undone independently: each has its own
+// state object here.  `primaryTable` is the table the server describes with
+// the top-level params (the other one uses the cits_* params); `activeTable`
+// is the last table the user interacted with — undo/redo (sidebar buttons
+// and Ctrl+Z/Y) target it.
 
-const viewState = { page: 1, showAllRows: false, changesOnly: false };
-const citsState = { page: 1 };     // read-only citations table pager (paired sessions)
-let filteredState = null;          // {issueId, page} while in the issue-filtered view
-let savedMainViewState = null;     // captured on entering the filtered view, restored on exit
-let renderSeq = 0;                 // stale-response guard for overlapping fetches
+function mkTableState() {
+    return { page: 1, showAllRows: false, changesOnly: false };
+}
+const tableStates = { meta: mkTableState(), cits: mkTableState() };
+const filteredStates = { meta: null, cits: null };  // {issueId, page} per table
+const savedStates = { meta: null, cits: null };     // captured on entering the filtered view
+let primaryTable = 'meta';   // corrected from the response's table_type on first render
+let activeTable = null;      // last-interacted table (undo/redo target)
+let renderSeq = 0;           // stale-response guard for overlapping fetches
+
+/** Query-param name for a per-table option: the primary table uses the
+ *  historical top-level names, the other table the cits_* ones. */
+function paramName(tt, base) {
+    return tt === primaryTable ? base : 'cits_' + base;
+}
+
+/** Track the last-interacted table (used as the fallback target for
+ *  filtered-view entry, not for undo/redo — that stack is session-wide). */
+function setActiveTable(tt) {
+    if (!tt) return;
+    activeTable = tt;
+}
+
+/** Scroll so the given table's stats header sits at the viewport top —
+ *  paging/filtering never yanks the view away from the table acted upon. */
+function scrollToTableHeader(tt, container) {
+    const el = container || document.getElementById('tableContainer');
+    if (!el) return;
+    const anchor = el.querySelector(`.table-stats[data-table-type="${tt}"]`);
+    if (anchor) anchor.scrollIntoView({ block: 'start' });
+    else el.scrollIntoView({ block: 'start' });
+}
 
 // Cell display mode: 'reduced' (default) collapses fully-valid cells to one
 // truncated line and hides valid items in error cells behind an ellipsis;
-// 'expanded' shows full content.  Deliberately separate from viewState and
-// never captured by savedMainViewState — the setting is shared between the
-// main and issue-filtered views and independent of the view toggles.  Row
-// overrides survive re-renders and pagination, keyed 'main:rowN' / 'cits:rowN'
-// (the two tables of a paired session reuse the same row ids).
-const cellDisplay = { mode: 'reduced', rowOverrides: new Map() };
+// 'expanded' shows full content.  Purely client-side and **per table** (each
+// table's "Expand cells" button works independently); never captured by the
+// filtered-view snapshots.  Row overrides survive re-renders and pagination,
+// keyed 'meta:rowN' / 'cits:rowN' (the two tables of a paired session reuse
+// the same row ids).
+const cellDisplay = {
+    modes: { meta: 'reduced', cits: 'reduced' },
+    rowOverrides: new Map(),
+};
 
 /**
- * Fetch and inject the current view (main or issue-filtered).
- * opts: { preserveScroll, scrollToTop, focusRowId }
+ * Fetch and inject the current view (both tables of a paired session).
+ * opts: { preserveScroll, scrollToTable, focusRowId, focusTable }
  */
 async function renderView(opts = {}) {
     const container = document.getElementById('tableContainer');
     const sid = window.currentSessionId;
     if (!container || !sid) return;
 
+    // Until the first response arrives we don't know which table is the
+    // primary one — all state is at its defaults then, so the initial
+    // param naming assumption ('meta' primary) is harmless.
     const params = new URLSearchParams();
-    if (filteredState) {
-        params.set('issue_id', filteredState.issueId);
-        params.set('page', String(filteredState.page));
-    } else {
-        params.set('page', String(viewState.page));
-        params.set('show_all', String(viewState.showAllRows));
-        params.set('changes_only', String(viewState.changesOnly));
+    for (const tt of ['meta', 'cits']) {
+        const filtered = filteredStates[tt];
+        const st = filtered || tableStates[tt];
+        params.set(paramName(tt, 'page'), String(st.page));
+        if (filtered) {
+            params.set(paramName(tt, 'issue_id'), filtered.issueId);
+        } else {
+            params.set(paramName(tt, 'show_all'), String(st.showAllRows));
+            params.set(paramName(tt, 'changes_only'), String(st.changesOnly));
+        }
     }
-    params.set('cits_page', String(citsState.page));
-    if (opts.focusRowId) params.set('focus_row_id', opts.focusRowId);
+    if (opts.focusRowId && opts.focusTable) {
+        params.set(paramName(opts.focusTable, 'focus_row_id'), opts.focusRowId);
+    }
 
     const seq = ++renderSeq;
     const scrollY = window.scrollY;
@@ -81,32 +122,40 @@ async function renderView(opts = {}) {
         if (seq !== renderSeq) return;  // a newer request superseded this one
         if (!response.ok) throw new Error(data.detail || 'Failed to load table view');
 
-        // Server-side page clamping is authoritative
-        if (filteredState) filteredState.page = data.page;
-        else viewState.page = data.page;
-        if (data.cits) citsState.page = data.cits.page;
+        if (data.table_type) primaryTable = data.table_type;
+        if (!activeTable) activeTable = primaryTable;
 
+        // Server-side page clamping is authoritative, per table (the
+        // primary's info is top-level; the other table's under data.cits).
+        const infoFor = tt => (tt === primaryTable)
+            ? { page: data.page }
+            : (data.cits || null);
+        for (const tt of ['meta', 'cits']) {
+            const info = infoFor(tt);
+            if (info) (filteredStates[tt] || tableStates[tt]).page = info.page;
+        }
+
+        // Empty states, filter banners and the per-table filter buttons are
+        // server-rendered with each fragment; the per-table "Expand cells"
+        // buttons are client-injected into the same controls row.
         if (typeof disposePopoversIn === 'function') disposePopoversIn(container);
-        container.innerHTML = (data.paginated && data.total_rows === 0)
-            ? emptyStateHtml() + data.html
-            : data.html;
+        container.innerHTML = data.html;
         if (typeof setupEditHandlers === 'function') setupEditHandlers();
         applyCellDisplay();   // after enhanceRow (buttons exist) and before the focus scroll
         initBootstrapWidgets();
-        updateViewToggleButtons();
-        const toggles = document.getElementById('viewToggles');
-        if (toggles) toggles.style.display = data.has_table === false ? 'none' : '';
-        if (filteredState) showFilterBanner(filteredState.issueId, data.total_rows);
 
-        if (opts.focusRowId) {
+        if (opts.focusRowId && opts.focusTable) {
             const target = container.querySelector(
-                `table[data-editable] tr[id="${opts.focusRowId}"], ` +
-                `table[data-editable] tr[data-ghost-row-id="${opts.focusRowId}"]`);
+                `table[data-table-type="${opts.focusTable}"] tr[id="${opts.focusRowId}"], ` +
+                `table[data-table-type="${opts.focusTable}"] tr[data-ghost-row-id="${opts.focusRowId}"]`);
             if (target) target.scrollIntoView({ block: 'center' });
+            else scrollToTableHeader(opts.focusTable, container);   // e.g. the row dropped out of the active filter
         } else if (opts.preserveScroll) {
             window.scrollTo(0, scrollY);
-        } else if (opts.scrollToTop) {
-            container.scrollIntoView({ block: 'start' });
+        } else if (opts.scrollToTable) {
+            scrollToTableHeader(opts.scrollToTable, container);
+        } else if (opts.scrollToTop) {   // legacy alias: the primary table's header
+            scrollToTableHeader(primaryTable, container);
         }
     } catch (error) {
         if (seq !== renderSeq) return;
@@ -119,61 +168,19 @@ async function renderView(opts = {}) {
  * Re-render the current view after a mutation — page-bounded, so filter
  * membership, ghost overlays and pagination always reflect the journal.
  */
-async function refreshView(focusRowId = null) {
+async function refreshView(focusRowId = null, focusTable = null) {
     await renderView(focusRowId
-        ? { focusRowId }
+        ? { focusRowId, focusTable: focusTable || activeTable || primaryTable }
         : { preserveScroll: true });
-}
-
-/** Context-dependent message shown above an empty table. */
-function emptyStateHtml() {
-    if (filteredState) {
-        return `<div class="empty-state">No rows involved in this issue are left ` +
-               `in the table (deleted rows drop out of the filtered view).</div>`;
-    }
-    if (viewState.changesOnly) {
-        return `<div class="empty-state">No changes yet — edit, add or delete content, ` +
-               `or turn off “Show Changes Only”.</div>`;
-    }
-    if (!viewState.showAllRows) {
-        return `<div class="empty-state">No rows with errors/warnings or changes.` +
-               `<button type="button" class="btn btn-sm btn-outline-primary ms-2" ` +
-               `onclick="enableShowAllRows()">Show all rows</button></div>`;
-    }
-    return `<div class="empty-state">The table is empty.</div>`;
-}
-
-/** "Show all rows" call-to-action inside the empty state. */
-function enableShowAllRows() {
-    viewState.showAllRows = true;
-    viewState.page = 1;
-    renderView({ scrollToTop: true });
-}
-
-/** Sync the toolbar toggles with the state (disabled inside the filtered view). */
-function updateViewToggleButtons() {
-    const allBtn = document.getElementById('showAllRowsBtn');
-    const chBtn = document.getElementById('showChangesOnlyBtn');
-    if (allBtn) {
-        allBtn.classList.toggle('active', viewState.showAllRows);
-        allBtn.disabled = !!filteredState;
-    }
-    if (chBtn) {
-        chBtn.classList.toggle('active', viewState.changesOnly);
-        chBtn.disabled = !!filteredState;
-    }
-    const cdBtn = document.getElementById('cellDisplayBtn');
-    if (cdBtn) {
-        // Shared by the main and filtered views — intentionally never disabled.
-        cdBtn.classList.toggle('active', cellDisplay.mode === 'expanded');
-    }
 }
 
 // ── Delegated table interactions ─────────────────────────────────────────────
 // One click listener on the persistent #tableContainer replaces per-item
-// listeners on every .item-data span and every injected button.  Only the
-// editable table (marked data-editable by the backend) reacts — the paired
-// session's read-only citations table shares the markup but no handlers.
+// listeners on every .item-data span and every injected button.  Both
+// tables of a paired session carry data-editable + data-table-type, so the
+// same handlers serve either table; every interaction records the table it
+// happened in (activeTable — the undo/redo target — and the table_type of
+// the mutation payloads).
 
 function fieldNameFromCell(td) {
     if (!td) return null;
@@ -190,23 +197,80 @@ function setupTableDelegation() {
         // Issue icons keep their inline onclick → highlightInvolvedElements
         if (e.target.closest('.issue-icon')) return;
 
-        // Injected pager bars (meta + cits) live outside the tables
+        // Injected pager bars live outside the tables; data-pager carries the
+        // table type — each table pages (and scrolls) independently.
         const pagerBtn = e.target.closest('.table-pager button[data-page]');
         if (pagerBtn) {
             e.stopPropagation();
             const target = parseInt(pagerBtn.dataset.page, 10) || 1;
             const kind = pagerBtn.closest('.table-pager').dataset.pager;
-            if (kind === 'cits') citsState.page = target;
-            else if (filteredState) filteredState.page = target;
-            else viewState.page = target;
-            renderView({ scrollToTop: true });
+            const st = filteredStates[kind] || tableStates[kind];
+            if (st) st.page = target;
+            renderView({ scrollToTable: kind });
+            return;
+        }
+
+        // Server-rendered per-table view controls
+        const toggle = e.target.closest('[data-table-toggle]');
+        if (toggle) {
+            e.stopPropagation();
+            const tt = toggle.dataset.tableType;
+            setActiveTable(tt);
+            const st = tableStates[tt];
+            if (st) {
+                if (toggle.dataset.tableToggle === 'show-all') st.showAllRows = !st.showAllRows;
+                else st.changesOnly = !st.changesOnly;
+                st.page = 1;
+            }
+            renderView({ scrollToTable: tt });
+            return;
+        }
+        const exitBtn = e.target.closest('[data-exit-filter]');
+        if (exitBtn) {
+            e.stopPropagation();
+            const tt = exitBtn.dataset.exitFilter;
+            exitFilteredView(true, tt);
+            renderView({ scrollToTable: tt });
+            return;
+        }
+        const showAllBtn = e.target.closest('[data-empty-show-all]');
+        if (showAllBtn) {
+            e.stopPropagation();
+            const tt = showAllBtn.dataset.emptyShowAll;
+            setActiveTable(tt);
+            const st = tableStates[tt];
+            if (st) {
+                st.showAllRows = true;
+                st.page = 1;
+            }
+            renderView({ scrollToTable: tt });
+            return;
+        }
+
+        // Per-table "Expand cells" button (client-injected into the controls
+        // row, next to the two filter buttons) — pure DOM transform, no
+        // refetch.  Lives outside the tables, so it must run before the
+        // data-editable guard below.
+        const cellToggle = e.target.closest('[data-cell-toggle]');
+        if (cellToggle) {
+            e.stopPropagation();
+            const tt = cellToggle.dataset.tableType;
+            setActiveTable(tt);
+            if (tt && cellDisplay.modes[tt]) {
+                cellDisplay.modes[tt] = cellDisplay.modes[tt] === 'expanded'
+                    ? 'reduced' : 'expanded';
+                // Global switch for this table = uniform state again.
+                for (const key of Array.from(cellDisplay.rowOverrides.keys())) {
+                    if (key.startsWith(tt + ':')) cellDisplay.rowOverrides.delete(key);
+                }
+                applyCellDisplay();
+            }
             return;
         }
 
         const btn = e.target.closest('button');
         if (btn) {
-            // Cell-display chevron — must run before the data-editable guard
-            // below so it also works in the read-only citations table.
+            // Cell-display chevron — works on every table.
             if (btn.classList.contains('cell-toggle-btn')) {
                 e.stopPropagation();
                 toggleRowCellDisplay(btn);
@@ -214,20 +278,22 @@ function setupTableDelegation() {
             }
             if (!btn.closest('table[data-editable]')) return;
             e.stopPropagation();
+            const tt = btn.closest('table')?.dataset.tableType || null;
+            setActiveTable(tt);
             const tr = btn.closest('tr');
             const rowId = (tr && tr.id) ? tr.id : null;
-            if (btn.classList.contains('add-row-btn')) { addNewRow(); return; }
+            if (btn.classList.contains('add-row-btn')) { addNewRow(tt); return; }
             if (btn.classList.contains('delete-row-btn')) {
-                if (rowId) deleteRow(rowId);
+                if (rowId) deleteRow(rowId, tt);
                 return;
             }
             const fieldName = fieldNameFromCell(btn.closest('td.field-value'));
             if (btn.classList.contains('clear-cell-btn')) {
-                if (rowId && fieldName) clearCell(rowId, fieldName);
+                if (rowId && fieldName) clearCell(rowId, fieldName, tt);
                 return;
             }
             if (btn.classList.contains('add-item-btn') || btn.classList.contains('add-first-item-btn')) {
-                if (rowId && fieldName) openAddItemModal(rowId, fieldName);
+                if (rowId && fieldName) openAddItemModal(rowId, fieldName, tt);
                 return;
             }
             return;  // unknown button — do nothing
@@ -236,11 +302,15 @@ function setupTableDelegation() {
         // Click on a value → open the edit modal
         const item = e.target.closest('.item-data');
         if (item) {
-            if (!item.closest('table[data-editable]')) return;
+            const table = item.closest('table[data-table-type]');
+            if (!table || !table.hasAttribute('data-editable')) return;
             const itemContainer = item.closest('.item-container');
             if (!itemContainer || !itemContainer.id) return;
             e.stopPropagation();
             e.preventDefault();
+            const tt = table.dataset.tableType;
+            setActiveTable(tt);
+            currentItemTable = tt;
             currentItemId = itemContainer.id;
             openEditModal(item.textContent, currentItemId);
         }
@@ -282,14 +352,18 @@ document.addEventListener('DOMContentLoaded', function() {
 // icon — icon-bearing containers are run-breakers — so the lazy popover
 // delegation is unaffected by construction.
 
-/** 'main' for the editable table, 'cits' for the read-only citations table. */
+/** 'meta' or 'cits' — every table carries data-table-type (the two tables
+ *  of a paired session reuse the same row ids, so the scope disambiguates
+ *  cell-display override keys). */
 function tableScope(table) {
-    return table.hasAttribute('data-editable') ? 'main' : 'cits';
+    return table.dataset.tableType
+        || (table.hasAttribute('data-editable') ? 'meta' : 'cits');
 }
 
-/** The mode a row currently uses: its override, else the table-wide mode. */
+/** The mode a row currently uses: its override, else its table's mode. */
 function effectiveRowMode(tr, scope) {
-    return cellDisplay.rowOverrides.get(scope + ':' + tr.id) || cellDisplay.mode;
+    return cellDisplay.rowOverrides.get(scope + ':' + tr.id)
+        || cellDisplay.modes[scope] || 'reduced';
 }
 
 /** Undo any previous reduction of the row's cells (idempotent). */
@@ -390,8 +464,36 @@ function applyRowCellDisplay(tr, scope) {
     reduceRowCells(tr);
 }
 
-/** Full pass over the current DOM — the render hook and the toolbar toggle. */
+/** Client-inject the per-table "Expand cells" button into each controls row
+ *  (next to the two server-rendered filter buttons) — one per table, working
+ *  independently.  Runs on every render before the state sync below. */
+function ensureCellToggleButtons() {
+    document.querySelectorAll('#tableContainer .table-controls').forEach(div => {
+        const tt = div.dataset.tableType;
+        if (!tt || div.querySelector('[data-cell-toggle]')) return;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-sm btn-outline-secondary view-toggle';
+        btn.dataset.cellToggle = '1';
+        btn.dataset.tableType = tt;
+        btn.textContent = 'Expand cells';
+        btn.title = 'Reduced cells show one line per valid cell (invalid items '
+                  + 'always in full); click to show this table’s full cell contents';
+        div.appendChild(btn);
+    });
+}
+
+/** Sync each table's "Expand cells" button with that table's mode. */
+function updateCellToggleButtons() {
+    document.querySelectorAll('#tableContainer [data-cell-toggle]').forEach(btn => {
+        btn.classList.toggle('active',
+                             cellDisplay.modes[btn.dataset.tableType] === 'expanded');
+    });
+}
+
+/** Full pass over the current DOM — the render hook and the table toggles. */
 function applyCellDisplay() {
+    ensureCellToggleButtons();
     document.querySelectorAll('#tableContainer .table-container table').forEach(table => {
         const scope = tableScope(table);
         table.querySelectorAll('tbody tr').forEach(tr => {   // '+ row' is a button, not a tr
@@ -399,6 +501,7 @@ function applyCellDisplay() {
             applyRowCellDisplay(tr, scope);
         });
     });
+    updateCellToggleButtons();
 }
 
 /** Per-row chevron click: flip this row's override and re-apply, no refetch. */
@@ -408,7 +511,8 @@ function toggleRowCellDisplay(btn) {
     if (!tr || !table || !tr.id) return;
     const scope = tableScope(table);
     const key = scope + ':' + tr.id;
-    const current = cellDisplay.rowOverrides.get(key) || cellDisplay.mode;
+    const current = cellDisplay.rowOverrides.get(key)
+        || cellDisplay.modes[scope] || 'reduced';
     cellDisplay.rowOverrides.set(key, current === 'reduced' ? 'expanded' : 'reduced');
     applyRowCellDisplay(tr, scope);
 }
@@ -425,100 +529,73 @@ function resetCellDisplayOverrides() {
  * Bridge function called by onclick attributes on .issue-icon spans.
  * The oc_validator package generates onclick="highlightInvolvedElements(this)"
  * so we keep this function name but redirect to the filtered view behavior.
+ * (The initBootstrapWidgets override above usually wins — this standalone
+ * version is a fallback.)
  *
  * @param {HTMLElement} clickedIssue  The .issue-icon span that was clicked.
  */
 function highlightInvolvedElements(clickedIssue) {
-    // The read-only citations table shares the icon markup — only the
-    // editable table's icons open the filtered view.
-    if (!clickedIssue.closest('table[data-editable]')) return;
+    const table = clickedIssue.closest('table[data-table-type]');
+    if (!table || !table.hasAttribute('data-editable')) return;
     const issueId = clickedIssue.id;
     if (!issueId) {
         console.warn('Issue icon has no id attribute');
         return;
     }
-    loadFilteredTable(issueId);
+    loadFilteredTable(issueId, table.dataset.tableType);
 }
 
 /**
- * Switch to the filtered view showing only rows involved in the given issue
- * (paginated).  The current main-view state (page + both toggles) is saved
- * and restored verbatim by exitFilteredViewAndReload().
+ * Switch one table to the filtered view showing only rows involved in the
+ * given issue (paginated).  That table's current view state (page + both
+ * toggles) is saved and restored verbatim by exitFilteredViewAndReload();
+ * the other table is unaffected.
  *
- * @param {string} issueId  The issue ID (e.g., 'meta-0', 'cits-1')
+ * @param {string} issueId    The issue ID (e.g., 'meta-0', 'cits-1')
+ * @param {string} tableType  'meta' or 'cits'
  */
-async function loadFilteredTable(issueId) {
+async function loadFilteredTable(issueId, tableType = null) {
     if (!window.currentSessionId) {
         console.error('Session ID not available for filtered view');
         return;
     }
-    if (filteredState && filteredState.issueId === issueId) {
-        await refreshView();  // already filtering on this issue — just refresh
+    const tt = tableType || activeTable || primaryTable;
+    setActiveTable(tt);
+    if (filteredStates[tt] && filteredStates[tt].issueId === issueId) {
+        await refreshView(null, tt);  // already filtering on this issue — refresh
         return;
     }
-    savedMainViewState = { ...viewState };
-    filteredState = { issueId, page: 1 };
-    await renderView({ scrollToTop: true });
+    if (!filteredStates[tt]) savedStates[tt] = { ...tableStates[tt] };
+    filteredStates[tt] = { issueId, page: 1 };
+    await renderView({ scrollToTable: tt });
 }
 
 /**
- * Leave the filtered view.  With ``restore`` (default) the saved main-view
- * state is restored; without it the state is dropped (used after
- * revalidation, when issue ids are renumbered).
+ * Leave the filtered view.  With ``restore`` (default) the saved view state
+ * is restored; without it the state is dropped (used after revalidation,
+ * when issue ids are renumbered).  ``tableType`` limits the exit to one
+ * table; without it every filtered table exits.
  */
-function exitFilteredView(restore = true) {
-    if (filteredState) {
-        if (restore && savedMainViewState) Object.assign(viewState, savedMainViewState);
-        else if (restore) viewState.page = 1;
-        savedMainViewState = null;
-        filteredState = null;
-    }
-    const banner = document.getElementById('filterBanner');
-    if (banner) {
-        banner.style.display = 'none';
-    }
-}
-
-/**
- * Show the filter banner with issue ID and row count.
- */
-function showFilterBanner(issueId, rowCount) {
-    let banner = document.getElementById('filterBanner');
-
-    if (!banner) {
-        // Create banner if it doesn't exist (fallback for templates that don't have it)
-        const cardHeader = document.querySelector('#tableContainer').closest('.card').querySelector('.card-header');
-        if (cardHeader) {
-            banner = document.createElement('div');
-            banner.id = 'filterBanner';
-            banner.className = 'filter-banner';
-            cardHeader.after(banner);
+function exitFilteredView(restore = true, tableType = null) {
+    for (const tt of (tableType ? [tableType] : ['meta', 'cits'])) {
+        if (filteredStates[tt]) {
+            if (restore && savedStates[tt]) Object.assign(tableStates[tt], savedStates[tt]);
+            else if (restore) tableStates[tt].page = 1;
+            savedStates[tt] = null;
+            filteredStates[tt] = null;
         }
     }
-
-    if (banner) {
-        banner.innerHTML = `
-            <div class="filter-banner-content">
-                <button type="button" class="btn btn-sm btn-outline-primary" onclick="exitFilteredViewAndReload()">
-                    ← Back to full table
-                </button>
-                <span class="filter-banner-text">
-                    Filtered by issue: <strong>${issueId}</strong>
-                </span>
-                <span class="badge bg-secondary">${rowCount} row${rowCount !== 1 ? 's' : ''}</span>
-            </div>
-        `;
-        banner.style.display = 'block';
-    }
 }
 
 /**
- * Exit filtered view and return to the exact main view the user left
- * (page number + both toggle states).  Called from the banner button.
+ * Exit filtered view and return to the exact view the user left (page
+ * number + both toggle states).  The exit buttons are server-rendered with
+ * each table's banner (delegated via [data-exit-filter]).
  */
-function exitFilteredViewAndReload() {
-    exitFilteredView();
-    renderView({ scrollToTop: true });
+function exitFilteredViewAndReload(tableType = null) {
+    const tt = tableType || activeTable || primaryTable;
+    exitFilteredView(true, tt);
+    renderView({ scrollToTable: tt });
 }
 
 
@@ -581,15 +658,11 @@ if (typeof module !== 'undefined' && module.exports) {
         initBootstrapWidgets,
         renderView,
         refreshView,
-        emptyStateHtml,
-        enableShowAllRows,
-        updateViewToggleButtons,
         applyCellDisplay,
         resetCellDisplayOverrides,
         highlightInvolvedElements,
         loadFilteredTable,
         exitFilteredView,
-        showFilterBanner,
         exitFilteredViewAndReload,
         showAlert,
         formatDate,

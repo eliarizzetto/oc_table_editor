@@ -29,9 +29,18 @@
                         <span class="spinner-border spinner-border-sm d-none" role="status"></span>
                         Re-Validate
                     </button>
+                    {% if has_metadata and has_citations %}
+                    <button class="btn btn-success btn-sm" id="exportMetaBtn">
+                        Export Metadata CSV
+                    </button>
+                    <button class="btn btn-success btn-sm" id="exportCitsBtn">
+                        Export Citations CSV
+                    </button>
+                    {% else %}
                     <button class="btn btn-success btn-sm" id="exportBtn">
                         Export CSV
                     </button>
+                    {% endif %}
                     <button class="btn btn-warning btn-sm" id="saveChangesBtn">
                         💾 Save Changes
                     </button>
@@ -71,19 +80,6 @@
     <!-- Main editor area -->
     <div class="col-md-10">
         <div class="card">
-            <div class="card-header d-flex justify-content-between align-items-center">
-                <h5 class="mb-0">Validation Results</h5>
-                <div id="viewToggles">
-                    <button class="btn btn-sm btn-outline-secondary view-toggle" id="showAllRowsBtn"
-                            title="Valid, unchanged rows are hidden by default">Show all rows</button>
-                    <button class="btn btn-sm btn-outline-secondary view-toggle" id="showChangesOnlyBtn"
-                            title="Show only rows with edits, additions or deletions">Show Changes Only</button>
-                    <button class="btn btn-sm btn-outline-secondary view-toggle" id="cellDisplayBtn"
-                            title="Reduced cells show one line per valid cell (invalid items always in full); click to show full cell contents">Expand cells</button>
-                </div>
-            </div>
-            <!-- Filter banner (hidden by default) -->
-            <div id="filterBanner" class="filter-banner" style="display: none;"></div>
             <div class="card-body" id="tableContainer">
                 <div class="text-center py-5">
                     <div class="spinner-border" role="status">
@@ -167,10 +163,12 @@
                     <li>Underline = has validation issues</li>
                     <li>Click colored square to filter by issue</li>
                     <li>Cells are reduced by default: one line per valid cell; in cells with issues, all invalid items are shown in full and valid ones are hidden behind an ellipsis</li>
-                    <li>Use <em>Expand cells</em> in the toolbar, or the ▸/▾ chevron next to the row number, to show full cell contents</li>
+                    <li>Use the <em>Expand cells</em> button above each table (each table expands independently), or the ▸/▾ chevron next to the row number, to show full cell contents</li>
                     <li>By default only rows with errors/warnings or changes are shown; <em>Show all rows</em> reveals the rest</li>
                     <li><em>Show Changes Only</em> = view only edited, added and deleted data</li>
-                    <li>The table is paginated (25 rows per page)</li>
+                    <li>When both a metadata and a citations table are loaded, each table has its own filters, pager and <em>+ row</em> button — they work independently</li>
+                    <li>Undo/Redo (sidebar buttons or Ctrl+Z / Ctrl+Y) works across both tables: the most recent change anywhere is always undone first, and the view jumps to what was undone/redone</li>
+                    <li>Each table is paginated (25 rows per page)</li>
                     <li>Re-validate after editing</li>
                 </ul>
                 <h6>Understanding the validation view</h6>
@@ -221,44 +219,35 @@
 window.currentSessionId = '{{ session_id }}';
 const sessionId = '{{ session_id }}';
 let currentItemId = null;
+let currentItemTable = null;   // 'meta' | 'cits' — table of the item in the edit modal
 let editModal = null;
 let addItemModal = null;
 let alertToast = null;
 let currentAddRowId = null;
 let currentAddFieldName = null;
+let currentAddTable = null;    // 'meta' | 'cits' — table of the cell in the add-item modal
 
 document.addEventListener('DOMContentLoaded', function() {
     editModal = new bootstrap.Modal(document.getElementById('editModal'));
     addItemModal = new bootstrap.Modal(document.getElementById('addItemModal'));
     alertToast = new bootstrap.Toast(document.getElementById('alertToast'));
-    
+
     // Load initial data
     renderView();
     loadSessionInfo();
 
     // Event listeners
     document.getElementById('revalidateBtn').addEventListener('click', revalidate);
-    document.getElementById('exportBtn').addEventListener('click', exportCSV);
+    const exportBtn = document.getElementById('exportBtn');
+    if (exportBtn) exportBtn.addEventListener('click', () => exportCSV(null));
+    const exportMetaBtn = document.getElementById('exportMetaBtn');
+    if (exportMetaBtn) exportMetaBtn.addEventListener('click', () => exportCSV('meta'));
+    const exportCitsBtn = document.getElementById('exportCitsBtn');
+    if (exportCitsBtn) exportCitsBtn.addEventListener('click', () => exportCSV('cits'));
     document.getElementById('saveChangesBtn').addEventListener('click', saveChanges);
     document.getElementById('deleteDraftBtn').addEventListener('click', deleteDraft);
-    document.getElementById('showAllRowsBtn').addEventListener('click', function() {
-        viewState.showAllRows = !viewState.showAllRows;
-        viewState.page = 1;
-        renderView({ scrollToTop: true });
-    });
-    document.getElementById('showChangesOnlyBtn').addEventListener('click', function() {
-        viewState.changesOnly = !viewState.changesOnly;
-        viewState.page = 1;
-        renderView({ scrollToTop: true });
-    });
-    document.getElementById('cellDisplayBtn').addEventListener('click', function() {
-        cellDisplay.mode = (cellDisplay.mode === 'expanded') ? 'reduced' : 'expanded';
-        cellDisplay.rowOverrides.clear();   // global switch = uniform state again
-        applyCellDisplay();                 // pure DOM transform — no refetch
-        updateViewToggleButtons();
-    });
     document.getElementById('saveEditBtn').addEventListener('click', saveEdit);
-    document.getElementById('deleteItemBtn').addEventListener('click', () => deleteItem(currentItemId));
+    document.getElementById('deleteItemBtn').addEventListener('click', () => deleteItem(currentItemId, currentItemTable));
     document.getElementById('saveNewItemBtn').addEventListener('click', saveNewItem);
     document.getElementById('undoBtn').addEventListener('click', undoEdit);
     document.getElementById('redoBtn').addEventListener('click', redoEdit);
@@ -315,10 +304,11 @@ async function loadSessionInfo() {
 }
 
 function setupEditHandlers() {
-    // Full-(re)load path: enhance every row of the editable table. Click
-    // handling is delegated (see setupTableDelegation in editor.js), so this
-    // only needs to inject the per-row/per-cell buttons and clean up empty
-    // containers. The read-only citations table (paired sessions) is skipped.
+    // Full-(re)load path: enhance every row of every editable table (both
+    // the metadata and the citations table of a paired session). Click
+    // handling is delegated (see setupTableDelegation in editor.js), so
+    // this only needs to inject the per-row/per-cell buttons and clean up
+    // empty containers.
     document.querySelectorAll('#tableContainer table[data-editable] tbody tr[id]')
         .forEach(enhanceRow);
     ensureAddRowButton();
@@ -393,17 +383,19 @@ function enhanceRow(tr) {
 }
 
 /**
- * Keep the "+ row" button at the end of the editable table's tbody
- * (exactly one instance, present on every page).
+ * Keep a "+ row" button at the end of every editable table's tbody
+ * (exactly one instance per table, present on every page).
  */
 function ensureAddRowButton() {
-    const tbody = document.querySelector('#tableContainer table[data-editable] tbody');
-    if (!tbody || tbody.querySelector('.add-row-btn')) return;
-    const addRowBtn = document.createElement('button');
-    addRowBtn.className = 'add-row-btn';  // styled differently than buttons inside cells
-    addRowBtn.textContent = '+ row';
-    addRowBtn.title = 'Add a new empty row to the table';
-    tbody.appendChild(addRowBtn);
+    document.querySelectorAll('#tableContainer table[data-editable] tbody')
+        .forEach(tbody => {
+            if (tbody.querySelector('.add-row-btn')) return;
+            const addRowBtn = document.createElement('button');
+            addRowBtn.className = 'add-row-btn';  // styled differently than buttons inside cells
+            addRowBtn.textContent = '+ row';
+            addRowBtn.title = 'Add a new empty row to this table';
+            tbody.appendChild(addRowBtn);
+        });
 }
 
 // Multi-value fields (must match HTMLParser.ITEM_SEPARATORS in html_parser.py)
@@ -430,9 +422,10 @@ function openEditModal(currentValue, itemId) {
     editModal.show();
 }
 
-function openAddItemModal(rowId, fieldName) {
+function openAddItemModal(rowId, fieldName, tableType = null) {
     currentAddRowId = rowId;
     currentAddFieldName = fieldName;
+    currentAddTable = tableType;
     document.getElementById('newItemValue').value = '';
     document.getElementById('addItemInfo').textContent = `Adding item to field "${fieldName}" in row ${rowId}`;
     addItemModal.show();
@@ -440,13 +433,13 @@ function openAddItemModal(rowId, fieldName) {
 
 async function saveNewItem() {
     const newValue = document.getElementById('newItemValue').value.trim();
-    
+
     // Validate that value is not empty
     if (!newValue) {
         showAlert('warning', 'Value Required', 'Please enter a value to add. Empty items are not allowed.');
         return;
     }
-    
+
     try {
         const response = await fetch('/api/edit/item/add', {
             method: 'POST',
@@ -455,7 +448,8 @@ async function saveNewItem() {
                 session_id: sessionId,
                 row_id: currentAddRowId,
                 field_name: currentAddFieldName,
-                new_value: newValue
+                new_value: newValue,
+                table_type: currentAddTable
             })
         });
 
@@ -465,7 +459,7 @@ async function saveNewItem() {
             addItemModal.hide();
             showAlert('success', 'Item Added', 'The new item has been added to the field.');
             updateUndoRedoButtons();
-            await refreshView(data.row_id ?? null);
+            await refreshView(data.row_id ?? null, data.table_type ?? null);
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to add item');
@@ -475,16 +469,17 @@ async function saveNewItem() {
     }
 }
 
-async function deleteItem(itemId) {
+async function deleteItem(itemId, tableType = null) {
     if (!confirm(`Delete this item? This will remove only this specific item from the field.`)) return;
-    
+
     try {
         const response = await fetch('/api/edit/item', {
             method: 'DELETE',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 session_id: sessionId,
-                item_id: itemId
+                item_id: itemId,
+                table_type: tableType
             })
         });
 
@@ -494,7 +489,7 @@ async function deleteItem(itemId) {
             editModal.hide();
             showAlert('success', 'Item Deleted', 'The item has been removed from the field.');
             updateUndoRedoButtons();
-            await refreshView(data.row_id ?? null);
+            await refreshView(data.row_id ?? null, data.table_type ?? null);
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to delete item');
@@ -504,20 +499,20 @@ async function deleteItem(itemId) {
     }
 }
 
-async function deleteRow(rowId) {
+async function deleteRow(rowId, tableType = null) {
     if (!confirm(`Delete the entire row? All data in this row will be permanently removed from the table.`)) return;
     try {
         const response = await fetch('/api/edit/row/delete', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: sessionId, row_id: rowId })
+            body: JSON.stringify({ session_id: sessionId, row_id: rowId, table_type: tableType })
         });
         const data = await response.json();
         if (response.ok) {
             editModal.hide();
             showAlert('success', 'Row Deleted', 'The row has been removed from the table.');
             updateUndoRedoButtons();
-            await refreshView(data.row_id ?? null);
+            await refreshView(data.row_id ?? null, data.table_type ?? null);
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to delete row');
@@ -527,20 +522,20 @@ async function deleteRow(rowId) {
     }
 }
 
-async function clearCell(rowId, fieldName) {
+async function clearCell(rowId, fieldName, tableType = null) {
     if (!confirm(`Clear all values in the "${fieldName}" field for this row?`)) return;
     try {
         const response = await fetch('/api/edit/cell/clear', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: sessionId, row_id: rowId, field_name: fieldName })
+            body: JSON.stringify({ session_id: sessionId, row_id: rowId, field_name: fieldName, table_type: tableType })
         });
         const data = await response.json();
         if (response.ok) {
             editModal.hide();
             showAlert('success', 'Field Cleared', `The "${fieldName}" field has been cleared.`);
             updateUndoRedoButtons();
-            await refreshView(data.row_id ?? null);
+            await refreshView(data.row_id ?? null, data.table_type ?? null);
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to clear field');
@@ -550,20 +545,20 @@ async function clearCell(rowId, fieldName) {
     }
 }
 
-async function addNewRow() {
+async function addNewRow(tableType = null) {
     if (!confirm('Add a new empty row to the table?')) return;
-    
+
     try {
         const response = await fetch('/api/edit/row/add', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: sessionId })
+            body: JSON.stringify({ session_id: sessionId, table_type: tableType })
         });
         const data = await response.json();
         if (response.ok) {
             showAlert('success', 'Row Added', 'A new empty row has been added to the table.');
             updateUndoRedoButtons();
-            await refreshView(data.row_id ?? null);
+            await refreshView(data.row_id ?? null, data.table_type ?? null);
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to add row');
@@ -575,7 +570,7 @@ async function addNewRow() {
 
 async function saveEdit() {
     const newValue = document.getElementById('newValue').value;
-    
+
     try {
         const response = await fetch('/api/edit/item', {
             method: 'POST',
@@ -585,17 +580,18 @@ async function saveEdit() {
             body: JSON.stringify({
                 session_id: sessionId,
                 item_id: currentItemId,
-                new_value: newValue
+                new_value: newValue,
+                table_type: currentItemTable
             })
         });
-        
+
         const data = await response.json();
-        
+
         if (response.ok) {
             showAlert('success', 'Saved', 'Item updated successfully!');
             editModal.hide();
             updateUndoRedoButtons();
-            await refreshView(data.row_id ?? null);
+            await refreshView(data.row_id ?? null, data.table_type ?? null);
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Failed to save');
@@ -627,12 +623,13 @@ async function revalidate() {
         
         if (response.ok) {
             showAlert('success', 'Validation Complete', `Found ${data.error_count} errors/warnings.`);
-            // New generation: issue ids are renumbered and the journal resets —
-            // drop the issue filter (without restoring stale state) and page 1.
+            // New generation: issue ids are renumbered and every journal
+            // resets — drop the issue filters (without restoring stale
+            // state), reset pages and cell-display overrides.
             exitFilteredView(false);
-            viewState.page = 1;
+            for (const tt of ['meta', 'cits']) tableStates[tt].page = 1;
             resetCellDisplayOverrides();   // row ids are renumbered per generation
-            renderView({ scrollToTop: true });
+            renderView({ scrollToTable: primaryTable });
             loadSessionInfo();
         } else {
             throw new Error(data.detail || 'Validation failed');
@@ -645,7 +642,7 @@ async function revalidate() {
     }
 }
 
-async function exportCSV() {
+async function exportCSV(tableType = null) {
     try {
         const response = await fetch('/api/export/', {
             method: 'POST',
@@ -654,17 +651,18 @@ async function exportCSV() {
             },
             body: JSON.stringify({
                 session_id: sessionId,
+                table_type: tableType,
                 revalidate: false
             })
         });
-        
+
         if (response.ok) {
             // Handle CSV download
             const blob = await response.blob();
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = 'exported_data.csv';
+            a.download = (tableType === 'cits' ? 'citations' : 'metadata') + '_edited.csv';
             a.click();
             window.URL.revokeObjectURL(url);
         } else {
@@ -723,21 +721,28 @@ async function deleteDraft() {
 }
 
 // ── Undo / Redo ──────────────────────────────────────────────────────────────
+// Both tables share ONE undo stack (ordered server-side by each event's
+// gseq stamp): undo always reverts the most recent change on either table,
+// and the view focuses the affected row in its table.  A new edit clears
+// the whole redo stack.
 
-function updateUndoRedoButtons(canUndo, canRedo) {
-    // If called without arguments, fetch the state from the server
-    if (canUndo === undefined) {
-        fetch(`/api/edit/undo_state/${sessionId}`)
-            .then(r => r.ok ? r.json() : Promise.reject())
-            .then(d => {
-                document.getElementById('undoBtn').disabled = !d.can_undo;
-                document.getElementById('redoBtn').disabled = !d.can_redo;
-            })
-            .catch(() => {});
-        return;
-    }
-    document.getElementById('undoBtn').disabled = !canUndo;
-    document.getElementById('redoBtn').disabled = !canRedo;
+let undoStateCache = { can_undo: false, can_redo: false };
+
+/** Fetch the session-wide undo/redo flags from the server and re-render. */
+function updateUndoRedoButtons() {
+    fetch(`/api/edit/undo_state/${sessionId}`)
+        .then(r => r.ok ? r.json() : Promise.reject())
+        .then(d => {
+            undoStateCache = d;
+            renderUndoRedoButtons();
+        })
+        .catch(() => {});
+}
+
+/** Render the buttons from the cached session-wide flags. */
+function renderUndoRedoButtons() {
+    document.getElementById('undoBtn').disabled = !undoStateCache.can_undo;
+    document.getElementById('redoBtn').disabled = !undoStateCache.can_redo;
 }
 
 async function undoEdit() {
@@ -750,8 +755,8 @@ async function undoEdit() {
         const data = await response.json();
         if (response.ok) {
             if (data.success) {
-                updateUndoRedoButtons(data.can_undo, data.can_redo);
-                await refreshView(data.row_id ?? null);
+                updateUndoRedoButtons();
+                await refreshView(data.row_id ?? null, data.table_type ?? null);
                 loadSessionInfo();
             } else {
                 showAlert('info', 'Undo', data.message || 'Nothing to undo.');
@@ -774,8 +779,8 @@ async function redoEdit() {
         const data = await response.json();
         if (response.ok) {
             if (data.success) {
-                updateUndoRedoButtons(data.can_undo, data.can_redo);
-                await refreshView(data.row_id ?? null);
+                updateUndoRedoButtons();
+                await refreshView(data.row_id ?? null, data.table_type ?? null);
                 loadSessionInfo();
             } else {
                 showAlert('info', 'Redo', data.message || 'Nothing to redo.');

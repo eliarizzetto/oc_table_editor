@@ -230,16 +230,16 @@ async def upload_files(
             await SessionManager.save_baseline_snapshot(session_id, cits_html_content, 'cits')
 
         # Build the generation artifacts (one threaded parse per table —
-        # becomes the immutable base for journal replay) and initialize the
-        # change journal against the editable table's generation.
+        # becomes the immutable base for journal replay) and initialize one
+        # change journal per uploaded table, against its own generation:
+        # in paired sessions both tables are independently editable.
         table_types = (('meta', 'cits') if (has_metadata and has_citations)
                        else ('meta',) if has_metadata else ('cits',))
         generations = {}
         for tt in table_types:
             generations[tt] = await build_generation_artifacts(session_id, tt)
-        editable = 'meta' if has_metadata else 'cits'
-        journal = await ChangeJournal.load(session_id, table_type=editable)
-        await journal.ensure_initialized(generations[editable], editable)
+            journal = await ChangeJournal.load(session_id, table_type=tt)
+            await journal.ensure_initialized(generations[tt], tt)
 
         # Mark as validated and persist session
         session.mark_validated()

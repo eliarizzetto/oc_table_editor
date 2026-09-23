@@ -18,22 +18,25 @@ router = APIRouter()
 class ExportRequest(BaseModel):
     """Request model for exporting data."""
     session_id: str
+    table_type: Optional[str] = None   # 'meta' or 'cits'; None = primary table
     revalidate: bool = False
 
 
 @router.post("/")
 async def export_csv(request: ExportRequest):
     """
-    Export current HTML data to CSV format.
-    
+    Export current table data to CSV format.
+
     - **session_id**: Session identifier
+    - **table_type**: Which table to export ('meta'/'cits'; in paired
+      sessions each table is exported with its own journal view)
     - **revalidate**: Whether to re-validate before exporting (only if edits made)
     """
     session = await SessionManager.load_session(request.session_id)
-    
+
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
     # Check if revalidation is needed
     if request.revalidate:
         if not session.has_edits_since_validation:
@@ -41,9 +44,19 @@ async def export_csv(request: ExportRequest):
                 "warning": "No edits made since last validation. Re-validation skipped.",
                 "exported": False
             }
-    
-    # Determine table type for HTML loading
-    table_type = 'meta' if session.has_metadata else 'cits'
+
+    # Determine the table to export (both tables of a paired session are
+    # independently editable and exportable).
+    table_type = request.table_type or ('meta' if session.has_metadata
+                                        else 'cits')
+    if table_type not in ('meta', 'cits'):
+        raise HTTPException(status_code=422,
+                            detail=f"Invalid table_type '{table_type}' "
+                                   f"(expected 'meta' or 'cits')")
+    if (table_type == 'meta' and not session.has_metadata) or \
+            (table_type == 'cits' and not session.has_citations):
+        raise HTTPException(status_code=404,
+                            detail=f"Table '{table_type}' not in this session")
 
     # Rows come from the journal replay (baseline + events) — no HTML parsing.
     async with document_cache.session_lock(request.session_id):
@@ -54,15 +67,13 @@ async def export_csv(request: ExportRequest):
         rows_data = await asyncio.to_thread(view.rows_for_export)
 
     # Generate CSV from parsed data
-    original_csv_path = session.meta_csv_path if session.has_metadata else session.cits_csv_path
+    original_csv_path = (session.meta_csv_path if table_type == 'meta'
+                         else session.cits_csv_path)
     csv_content = await asyncio.to_thread(CSVExporter.rows_to_csv, rows_data, original_csv_path)
-    
+
     # Determine filename
-    if session.has_metadata:
-        filename_prefix = "metadata"
-    else:
-        filename_prefix = "citations"
-    
+    filename_prefix = "metadata" if table_type == 'meta' else "citations"
+
     # Return CSV as downloadable file
     return StreamingResponse(
         StringIO(csv_content),
