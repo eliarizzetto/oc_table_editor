@@ -41,7 +41,9 @@ def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool,
     validation report is empty, ``make_gui`` crashes because it tries to open
     ``'valid_page.html'`` via a bare relative path that does not exist in the
     oc_table_editor working directory.  We detect this case and delegate to
-    ``ValidatorService._make_no_errors_html`` instead.
+    ``ValidatorService.make_valid_table_html`` instead, which renders the
+    same editable table (with zero issue icons), so valid tables stay
+    editable.
 
     Args:
         csv_fp:      Path to the original CSV file.
@@ -52,7 +54,7 @@ def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool,
                      used only on the zero-errors path.
     """
     if is_valid:
-        ValidatorService._make_no_errors_html(out_fp, csv_fp, table_label)
+        ValidatorService.make_valid_table_html(out_fp, csv_fp, table_label)
     else:
         make_gui(csv_fp, report_fp, out_fp)
 

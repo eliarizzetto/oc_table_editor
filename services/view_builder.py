@@ -83,6 +83,7 @@ def _build_artifacts_sync(base_html: str) -> dict:
             continue
         parse_row_ids.append(rid)
         fields: Dict[str, list] = {}
+        row_issue_ids: set = set()
         cells = tr.find_all('td')[1:]
         for header, cell in zip(headers, cells):
             items: List[list] = []
@@ -94,7 +95,14 @@ def _build_artifacts_sync(base_html: str) -> dict:
                     items.append([cid, data.get_text(strip=False)])
             fields[header] = items
             for icon in cell.find_all('span', class_='issue-icon', id=True):
-                issue_index.setdefault(icon.get('id'), []).append(rid)
+                iid = icon.get('id')
+                # One issue can carry its icon in several cells/items of the
+                # SAME row (e.g. a self-citation involves both citing_id and
+                # cited_id): index the row once per issue, or the filtered
+                # view renders it once per icon occurrence.
+                if iid not in row_issue_ids:
+                    row_issue_ids.add(iid)
+                    issue_index.setdefault(iid, []).append(rid)
         rows[rid] = fields
 
     # Row byte offsets via a single regex pass over the raw string

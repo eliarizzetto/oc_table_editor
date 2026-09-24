@@ -34,6 +34,7 @@ from models import Session
 from config import TABLE_PAGE_SIZE, TEMP_DIR
 
 # Import oc_validator interface for HTML generation and merging
+from oc_validator.helper import CSVStreamReader
 from oc_validator.interface.gui import make_gui, merge_html_files
 
 router = APIRouter()
@@ -51,11 +52,13 @@ def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool,
     Safely handles the zero-errors case: when the validation report is empty
     ``make_gui`` crashes (it tries to open ``valid_page.html`` via a bare
     relative path that does not exist in this project).  We detect this and
-    delegate to ``ValidatorService._make_no_errors_html`` instead.
-    ``table_label`` ('Metadata'/'Citations') is only used on that path.
+    delegate to ``ValidatorService.make_valid_table_html`` instead, which
+    renders the same editable table (with zero issue icons), so valid tables
+    stay editable.  ``table_label`` ('Metadata'/'Citations') is only used on
+    that path's no-data-rows fallback.
     """
     if is_valid:
-        ValidatorService._make_no_errors_html(out_fp, csv_fp, table_label)
+        ValidatorService.make_valid_table_html(out_fp, csv_fp, table_label)
     else:
         make_gui(csv_fp, report_fp, out_fp)
 
@@ -198,6 +201,17 @@ def _report_counts(report_path: Optional[str]) -> tuple:
         return 0, 0
 
 
+def _csv_data_rows(csv_path: Optional[str]) -> int:
+    """Data-row count of a session CSV (0 when unreadable) — used by the
+    table-less legacy branches, which have no artifacts to count rows from."""
+    if not csv_path:
+        return 0
+    try:
+        return sum(1 for _ in CSVStreamReader(csv_path))
+    except Exception:
+        return 0
+
+
 def _table_header_html(label: str, errors: int, warnings: int,
                        invalid_rows: int, total_rows: int,
                        filename: Optional[str] = None,
@@ -305,13 +319,15 @@ async def _table_fragment(session_id: str, table_type: str, *, page: int,
                           show_all: bool, changes_only: bool,
                           issue_id: Optional[str],
                           focus_row_id: Optional[str],
-                          report_path: Optional[str]):
+                          report_path: Optional[str],
+                          csv_filename: Optional[str] = None):
     """Build one table's page fragment: stats header (+ per-table filter
     controls, filter banner, empty state) + journal-replayed table page +
     pager.  Returns ``(html, info)`` where ``info`` carries the clamped
     page/page_count and the filtered-view row count, or ``(None, None)``
-    when the table has no parsable table (fully-valid side).  Caller must
-    hold the session lock.
+    when the table has no parsable table (fully-valid side).
+    ``csv_filename`` adds the ✓ "no issues" line under the header when the
+    table's report is empty.  Caller must hold the session lock.
     """
     loaded = await load_journal_view(session_id, table_type)
     if loaded is None or not loaded[2]['artifacts'].get('has_table'):
@@ -325,8 +341,13 @@ async def _table_fragment(session_id: str, table_type: str, *, page: int,
     issues = view.issue_row_ids()
 
     if issue_id is not None:
+        # dict.fromkeys dedupes while keeping document order: an issue can
+        # involve several cells of the SAME row (self-citation), and
+        # artifacts built before the issue_index dedupe fix list that row
+        # once per icon.
         entries = [{'row_id': rid, 'ghost': False}
-                   for rid in artifacts['issue_index'].get(issue_id, [])
+                   for rid in dict.fromkeys(
+                       artifacts['issue_index'].get(issue_id, []))
                    if rid in view.row_ids]
     else:
         entries = [e for e in view.display_rows()
@@ -375,8 +396,11 @@ async def _table_fragment(session_id: str, table_type: str, *, page: int,
     total_rows = len(view.row_ids)
 
     filtered = issue_id is not None
+    # A table whose report is empty (fully valid) keeps the ✓ reassurance.
+    header_filename = csv_filename if errors + warnings == 0 else None
     parts = [_table_header_html(label, errors, warnings, invalid_rows,
-                                total_rows, table_type=table_type)]
+                                total_rows, filename=header_filename,
+                                table_type=table_type)]
     if filtered:
         parts.append(_filter_banner_html(table_type, issue_id, total))
     if not entries:
@@ -509,7 +533,8 @@ async def get_table_view(session_id: str, page: int = 1, show_all: bool = False,
                 csv_path = (session.meta_csv_path if t == 'meta'
                             else session.cits_csv_path) or ''
                 replacements.append(_table_header_html(
-                    'Metadata' if t == 'meta' else 'Citations', 0, 0, 0, 0,
+                    'Metadata' if t == 'meta' else 'Citations', 0, 0, 0,
+                    _csv_data_rows(csv_path),
                     filename=Path(csv_path).name if csv_path else None))
             if session.has_metadata and session.has_citations:
                 if states.get('cits') is None:
@@ -546,8 +571,12 @@ async def get_table_view(session_id: str, page: int = 1, show_all: bool = False,
                 continue
             report_path = (session.meta_report_path if tt == 'meta'
                            else session.cits_report_path)
+            csv_path = (session.meta_csv_path if tt == 'meta'
+                        else session.cits_csv_path) or ''
             html, info = await _table_fragment(session_id, tt,
                                                report_path=report_path,
+                                               csv_filename=Path(csv_path).name
+                                               if csv_path else None,
                                                **params_by_table[tt])
             html_parts.append(html)
             info_by_table[tt] = info
@@ -564,7 +593,7 @@ async def get_table_view(session_id: str, page: int = 1, show_all: bool = False,
             csv_path = (session.meta_csv_path if tt == 'meta'
                         else session.cits_csv_path) or ''
             card = _table_header_html('Metadata' if tt == 'meta' else 'Citations',
-                                      0, 0, 0, 0,
+                                      0, 0, 0, _csv_data_rows(csv_path),
                                       filename=Path(csv_path).name
                                       if csv_path else None,
                                       table_type=tt)
