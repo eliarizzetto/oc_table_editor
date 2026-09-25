@@ -80,6 +80,7 @@ async def editor(request: Request, session_id: str):
     return templates.TemplateResponse(
         "editor.html",
         {"request": request, "session_id": session_id,
+         "session_name": session.draft_name,
          "has_metadata": session.has_metadata,
          "has_citations": session.has_citations}
     )

@@ -495,6 +495,27 @@ class TableView:
                    for rid in self.added_row_ids)
         return out
 
+    def search_row_ids(self, q: str) -> set:
+        """Ids of rows (ghost rows included) whose *current* item values
+        contain ``q`` (case-insensitive) — the server side of the per-table
+        search box.  Same branching as ``rows_for_export``: unchanged rows
+        read the plain-text values straight from the in-RAM artifacts (no
+        HTML parse); only changed/added rows parse their already-computed
+        row html.  Deleted *items* inside surviving rows are not searched
+        (live values only, same semantics as export)."""
+        needle = q.casefold()
+        out: set = set()
+        for e in self.display_rows():
+            rid = e['row_id']
+            if rid in self._row_html_overrides or rid in self.added_row_ids:
+                fields = parse_row_fields(self.row_html(rid) or '')
+            else:
+                fields = self.artifacts['rows'].get(rid, {})
+            if any(needle in value.casefold()
+                   for pairs in fields.values() for _iid, value in pairs):
+                out.add(rid)
+        return out
+
     def changed_row_ids(self, deletions: Optional[dict] = None) -> set:
         """Ids of rows with any edit, addition or deletion (incl. ghost rows)."""
         if deletions is None:

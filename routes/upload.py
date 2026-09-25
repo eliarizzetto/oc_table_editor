@@ -63,7 +63,8 @@ def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool,
 async def upload_files(
     metadata_file: Optional[UploadFile] = File(None),
     citations_file: Optional[UploadFile] = File(None),
-    verify_id_existence: bool = Form(DEFAULT_VERIFY_ID_EXISTENCE)
+    verify_id_existence: bool = Form(DEFAULT_VERIFY_ID_EXISTENCE),
+    draft_name: Optional[str] = Form(None)
 ):
     """
     Upload CSV files and run initial validation.
@@ -71,6 +72,7 @@ async def upload_files(
     - **metadata_file**: Optional metadata CSV file
     - **citations_file**: Optional citations CSV file
     - **verify_id_existence**: Whether to check ID existence (external APIs)
+    - **draft_name**: Optional user-assigned session name
     """
     # ── file-size checks ──────────────────────────────────────────────────────
     has_metadata = False
@@ -103,6 +105,12 @@ async def upload_files(
     if not has_metadata and not has_citations:
         raise HTTPException(status_code=400, detail="At least one CSV file must be provided")
 
+    # Optional user-assigned name (shown in the saved-drafts list; renamable)
+    clean_name = (draft_name or '').strip()
+    if len(clean_name) > 120:
+        raise HTTPException(status_code=400,
+                            detail="Session name must be at most 120 characters")
+
     # ── session creation ──────────────────────────────────────────────────────
     session_id = SessionManager.create_session_id()
     session_dir = SessionManager.create_session_dir(session_id)
@@ -111,7 +119,8 @@ async def upload_files(
         session_id=session_id,
         has_metadata=has_metadata,
         has_citations=has_citations,
-        verify_id_existence=verify_id_existence
+        verify_id_existence=verify_id_existence,
+        draft_name=clean_name or None
     )
 
     # ── save uploaded files ───────────────────────────────────────────────────

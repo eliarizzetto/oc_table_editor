@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}OC Table Editor - {{ session_id[:8] }}{% endblock %}
+{% block title %}OC Table Editor - {{ session_name or session_id[:8] }}{% endblock %}
 
 {% block navbar_extra %}
 <button type="button" class="btn btn-sm btn-outline-light rounded-circle py-0 px-2 me-2 fw-bold"
@@ -65,6 +65,13 @@
                 <span id="unsavedBadge" class="badge bg-warning text-dark d-none" title="You have changes not yet written to the table file (Save Changes)">unsaved</span>
             </div>
             <div class="card-body p-2">
+                <p class="mb-1 small d-flex align-items-center">
+                    <strong class="me-1">Name:</strong>
+                    <span id="sessionName" class="text-truncate">{{ session_name or '—' }}</span>
+                    <button type="button" class="btn btn-sm btn-link py-0 px-1 ms-auto"
+                            id="renameSessionBtn" title="Rename this session"
+                            aria-label="Rename session">✏️</button>
+                </p>
                 <p class="mb-1 small"><strong>Session:</strong> <span id="sessionId">{{ session_id[:8] }}</span></p>
                 <p class="mb-1 small"><strong>Edited Items:</strong> <span id="editedCount">0</span></p>
                 <p class="mb-1 small" id="editedSinceValContainer">
@@ -97,7 +104,7 @@
     <div class="modal-dialog">
         <div class="modal-content">
             <div class="modal-header">
-                <h5 class="modal-title">Edit Item</h5>
+                <h5 class="modal-title" id="editModalTitle">Edit Item</h5>
                 <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
@@ -162,6 +169,9 @@
                     <li>Red strikethrough = deleted data (always visible as ghosts)</li>
                     <li>Underline = has validation issues</li>
                     <li>Click colored square to filter by issue</li>
+                    <li>The <em>search box</em> above each table filters the <strong>whole table</strong> (all pages, including your edits) as you type; × clears it</li>
+                    <li>The <em>Issue filters</em> dropdown narrows a table to rows carrying specific issue types, grouped under Errors/Warnings; a group's checkbox selects all of its types</li>
+                    <li>Sessions can be named at upload and renamed anytime (✏️ in the saved-sessions list or the Session Info card)</li>
                     <li>Cells are reduced by default: one line per valid cell; in cells with issues, all invalid items are shown in full and valid ones are hidden behind an ellipsis</li>
                     <li>Use the <em>Expand cells</em> button above each table (each table expands independently), or the ▸/▾ chevron next to the row number, to show full cell contents</li>
                     <li>By default only rows with errors/warnings or changes are shown; <em>Show all rows</em> reveals the rest</li>
@@ -251,6 +261,8 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('saveNewItemBtn').addEventListener('click', saveNewItem);
     document.getElementById('undoBtn').addEventListener('click', undoEdit);
     document.getElementById('redoBtn').addEventListener('click', redoEdit);
+    const renameSessionBtn = document.getElementById('renameSessionBtn');
+    if (renameSessionBtn) renameSessionBtn.addEventListener('click', renameSession);
 
     // ── Keyboard shortcuts ──────────────────────────────────────────────────
     // Only intercept when no text-input / textarea has focus (so that the
@@ -289,6 +301,7 @@ async function loadSessionInfo() {
         const data = await response.json();
         
         if (response.ok) {
+            document.getElementById('sessionName').textContent = data.draft_name || '—';
             document.getElementById('editedCount').textContent = data.edited_items_count;
             document.getElementById('editedSinceVal').textContent = data.has_edits_since_validation ? 'Yes' : 'No';
             document.getElementById('lastValidated').textContent = data.last_validated_at
@@ -300,6 +313,36 @@ async function loadSessionInfo() {
         }
     } catch (error) {
         console.error('Error loading session info:', error);
+    }
+}
+
+async function renameSession() {
+    const nameEl = document.getElementById('sessionName');
+    const current = nameEl.textContent === '—' ? '' : nameEl.textContent;
+    const name = prompt('New session name:', current);
+    if (name === null) return;   // cancelled
+    const clean = name.trim();
+    if (!clean) {
+        showAlert('warning', 'Invalid Name', 'Session name cannot be empty.');
+        return;
+    }
+    if (clean.length > 120) {
+        showAlert('warning', 'Invalid Name', 'Session name must be at most 120 characters.');
+        return;
+    }
+    try {
+        const response = await fetch('/api/draft/rename', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sessionId, draft_name: clean })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Rename failed');
+        nameEl.textContent = clean;
+        document.title = 'OC Table Editor - ' + clean;
+        showAlert('success', 'Renamed', 'Session renamed successfully.');
+    } catch (error) {
+        showAlert('error', 'Error', error.message);
     }
 }
 
@@ -415,10 +458,12 @@ function disposePopoversIn(el) {
     });
 }
 
-function openEditModal(currentValue, itemId) {
+function openEditModal(currentValue, itemId, fieldName = null) {
     document.getElementById('currentValue').textContent = currentValue;
     document.getElementById('newValue').value = currentValue;
     document.getElementById('itemInfo').textContent = `Item ID: ${itemId}`;
+    document.getElementById('editModalTitle').textContent =
+        fieldName ? `Edit Item in "${fieldName}" field` : 'Edit Item';
     editModal.show();
 }
 
@@ -627,7 +672,10 @@ async function revalidate() {
             // resets — drop the issue filters (without restoring stale
             // state), reset pages and cell-display overrides.
             exitFilteredView(false);
-            for (const tt of ['meta', 'cits']) tableStates[tt].page = 1;
+            for (const tt of ['meta', 'cits']) {
+                tableStates[tt].page = 1;
+                tableStates[tt].q = '';   // row ids and issues are renumbered
+            }
             resetCellDisplayOverrides();   // row ids are renumbered per generation
             renderView({ scrollToTable: primaryTable });
             loadSessionInfo();

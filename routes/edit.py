@@ -9,6 +9,7 @@ upload/revalidate (artifact building), and the only big writes happen on
 Save (commit) and revalidate.
 """
 import asyncio
+import html
 import json
 from functools import lru_cache
 from pathlib import Path
@@ -201,6 +202,36 @@ def _report_counts(report_path: Optional[str]) -> tuple:
         return 0, 0
 
 
+@lru_cache(maxsize=128)
+def _cached_report_entries(path: str, mtime_ns: int) -> tuple:
+    """((error_type, error_label), ...) per report line, in line order —
+    the metadata behind the issue-type filter (issue ids are
+    ``{table_type}-{line index}``; see oc_validator's map_errors_to_data)."""
+    entries = load_jsonl_report(path)
+    return tuple((e.get('error_type', ''), e.get('error_label', ''))
+                 for e in entries)
+
+
+def _report_entries(report_path: Optional[str]) -> tuple:
+    """Per-line (error_type, error_label) tuples; () when missing/unreadable.
+    Same mtime-keyed caching + guard pattern as ``_report_counts``."""
+    if not report_path:
+        return ()
+    try:
+        mtime_ns = Path(report_path).stat().st_mtime_ns
+    except OSError:
+        return ()
+    try:
+        return _cached_report_entries(report_path, mtime_ns)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ()
+
+
+def _parse_csv_param(raw: Optional[str]) -> set:
+    """Comma-separated query param → set of stripped non-empty items."""
+    return {p.strip() for p in (raw or '').split(',') if p.strip()}
+
+
 def _csv_data_rows(csv_path: Optional[str]) -> int:
     """Data-row count of a session CSV (0 when unreadable) — used by the
     table-less legacy branches, which have no artifacts to count rows from."""
@@ -235,6 +266,82 @@ def _table_header_html(label: str, errors: int, warnings: int,
     return ''.join(parts)
 
 
+def _table_tools_html(table_type: str, q: Optional[str],
+                      match_count: int, facet_dropdown: str = '') -> str:
+    """Per-table tools row: the full-table search box + the issue-filter
+    dropdown.  Server-rendered so the input's value is state-correct across
+    re-renders; typing is debounced in editor.js
+    (``[data-search-input]``), which also restores focus/caret after each
+    re-render.  ``type="search"`` gives the native clear (×) affordance."""
+    value = html.escape(q, quote=True) if q else ''
+    count = ''
+    if q:
+        rows_label = 'row' if match_count == 1 else 'rows'
+        count = (f'<span class="search-count">{match_count} {rows_label} '
+                 f'matching “{html.escape(q, quote=True)}”</span>')
+    return (f'<div class="table-tools" data-table-type="{table_type}">'
+            f'<input type="search" class="form-control form-control-sm '
+            f'table-search" data-search-input="{table_type}" '
+            f'value="{value}" placeholder="Search this table…" '
+            f'aria-label="Search this table"> {count}{facet_dropdown}</div>')
+
+
+def _facet_desc(types: set) -> str:
+    """Human summary of the selected issue types for the filter banner."""
+    return ', '.join(sorted(t.replace('_', ' ') for t in types))
+
+
+def _facet_dropdown_html(table_type: str, facet_rows: dict, types: set) -> str:
+    """Issue-filter dropdown for one table (server-rendered, state-correct:
+    checkboxes reflect the current selection).  ``facet_rows`` maps
+    ``(severity, label)`` → live row ids; counts are rows affected.  The
+    severity group checkbox is a client-only select-all for its labels;
+    Apply/Clear are delegated in editor.js (``[data-facet-apply]`` /
+    ``[data-facet-clear]``).  ``data-bs-auto-close="outside"`` keeps the
+    menu open on checkbox clicks."""
+    if not facet_rows:
+        return ''
+    groups = []
+    for sev, title in (('error', 'Errors'), ('warning', 'Warnings')):
+        items = sorted((label, rows) for (s, label), rows in facet_rows.items()
+                       if s == sev)
+        if not items:
+            continue
+        group_rows = set().union(*(rows for _, rows in items))
+        items_html = []
+        for label, rows in items:
+            n = len(rows)
+            rows_label = 'row' if n == 1 else 'rows'
+            items_html.append(
+                f'<label class="facet-item">'
+                f'<input type="checkbox" data-label="{html.escape(label, quote=True)}"'
+                f'{" checked" if label in types else ""}>'
+                f'<span>{html.escape(label.replace("_", " "))}</span>'
+                f'<span class="facet-count">{n} {rows_label}</span>'
+                f'</label>')
+        groups.append(
+            f'<div class="facet-group">'
+            f'<div class="facet-group-head">'
+            f'<input type="checkbox" data-facet-group="{sev}" '
+            f'aria-label="Select all {title.lower()}">'
+            f'<strong>{title}</strong>'
+            f'<span class="facet-meta">{len(items)} types · {len(group_rows)} rows</span>'
+            f'</div>{"".join(items_html)}</div>')
+    return (f'<div class="btn-group facet-dropdown ms-auto">'
+            f'<button type="button" class="btn btn-sm btn-outline-secondary '
+            f'view-toggle" data-bs-toggle="dropdown" '
+            f'data-bs-auto-close="outside" aria-expanded="false" '
+            f'title="Filter rows by issue type">Issue filters ▾</button>'
+            f'<div class="dropdown-menu dropdown-menu-end p-2 facet-menu" '
+            f'data-table-type="{table_type}">{"".join(groups)}'
+            f'<div class="d-flex gap-2 mt-2">'
+            f'<button type="button" class="btn btn-sm btn-primary" '
+            f'data-facet-apply="{table_type}">Apply</button>'
+            f'<button type="button" class="btn btn-sm btn-outline-secondary" '
+            f'data-facet-clear="{table_type}">Clear</button>'
+            f'</div></div></div>')
+
+
 def _table_controls_html(table_type: str, show_all: bool, changes_only: bool,
                          filtered: bool) -> str:
     """Per-table filter buttons, rendered with each table's fragment (each
@@ -252,27 +359,39 @@ def _table_controls_html(table_type: str, show_all: bool, changes_only: bool,
             + '</div>')
 
 
-def _filter_banner_html(table_type: str, issue_id: str, row_count: int) -> str:
-    """Banner above a table in the issue-filtered view (server-rendered;
-    the exit button is delegated in editor.js via ``[data-exit-filter]``)."""
+def _filter_banner_html(table_type: str, row_count: int,
+                        issue_id: Optional[str] = None,
+                        facet_desc: Optional[str] = None) -> str:
+    """Banner above a table in a filtered view — the single-issue view
+    (``issue_id``) or the issue-type facet selection (``facet_desc``).
+    Server-rendered; the exit button is delegated in editor.js via
+    ``[data-exit-filter]``."""
     rows_label = 'row' if row_count == 1 else 'rows'
+    if issue_id is not None:
+        what = f'Filtered by issue: <strong>{html.escape(issue_id)}</strong>'
+    else:
+        what = (f'Filtered by issues: '
+                f'<strong>{html.escape(facet_desc or "selected types")}</strong>')
     return (f'<div class="filter-banner" data-table-type="{table_type}">'
             f'<div class="filter-banner-content">'
             f'<button type="button" class="btn btn-sm btn-outline-primary" '
             f'data-exit-filter="{table_type}">← Back to full table</button>'
-            f'<span class="filter-banner-text">Filtered by issue: '
-            f'<strong>{issue_id}</strong></span>'
+            f'<span class="filter-banner-text">{what}</span>'
             f'<span class="badge bg-secondary">{row_count} {rows_label}</span>'
             f'</div></div>')
 
 
 def _empty_state_html(table_type: str, show_all: bool, changes_only: bool,
-                      filtered: bool) -> str:
+                      filtered: bool, q: Optional[str] = None) -> str:
     """Context-dependent message when a table's filtered view has no rows
     (server-rendered; the CTA button is delegated via
     ``[data-empty-show-all]``)."""
-    if filtered:
-        text = ('No rows involved in this issue are left in the table '
+    if q and filtered:
+        text = f'No rows matching “{html.escape(q)}” within the filtered view.'
+    elif q:
+        text = f'No rows matching “{html.escape(q)}”.'
+    elif filtered:
+        text = ('No rows match the active issue filters '
                 '(deleted rows drop out of the filtered view).')
     elif changes_only:
         text = ('No changes yet — edit, add or delete content, or turn off '
@@ -320,7 +439,9 @@ async def _table_fragment(session_id: str, table_type: str, *, page: int,
                           issue_id: Optional[str],
                           focus_row_id: Optional[str],
                           report_path: Optional[str],
-                          csv_filename: Optional[str] = None):
+                          csv_filename: Optional[str] = None,
+                          q: Optional[str] = None,
+                          issue_types: Optional[str] = None):
     """Build one table's page fragment: stats header (+ per-table filter
     controls, filter banner, empty state) + journal-replayed table page +
     pager.  Returns ``(html, info)`` where ``info`` carries the clamped
@@ -340,6 +461,47 @@ async def _table_fragment(session_id: str, table_type: str, *, page: int,
     changed = view.changed_row_ids(deletions)
     issues = view.issue_row_ids()
 
+    # Issue-type filter (faceted view): joins the artifacts' issue_index
+    # (issue id → rows) with the report's per-line (severity, label)
+    # metadata.  Ids are renumbered on every revalidate, so the selection
+    # travels as error *labels*, never ids.
+    types = _parse_csv_param(issue_types)
+    facet_meta = _report_entries(report_path)
+    live = set(view.row_ids)
+
+    def _facet_line(iid: str) -> Optional[tuple]:
+        """(severity, label) of the report line behind an issue id, if any."""
+        prefix = f'{table_type}-'
+        if not iid.startswith(prefix):
+            return None
+        try:
+            idx = int(iid[len(prefix):])
+        except ValueError:
+            return None
+        return facet_meta[idx] if 0 <= idx < len(facet_meta) else None
+
+    facet_active = bool(types)
+    facet_rows: dict = {}   # (severity, label) → live row ids (dropdown counts)
+    keep: set = set()
+    for iid, row_ids in artifacts['issue_index'].items():
+        line = _facet_line(iid)
+        if line is None:
+            continue
+        rows_here = {r for r in row_ids if r in live}
+        if not rows_here:
+            continue
+        facet_rows.setdefault(line, set()).update(rows_here)
+        if facet_active and line[1] in types:
+            keep.update(rows_here)
+
+    # Full-table search: rows whose current values contain q.  A query
+    # implies show-all-like base visibility, but still ANDs with
+    # changes_only and with the issue-filter predicates.
+    search_ids = view.search_row_ids(q) if q else None
+
+    def _matches_search(rid: str) -> bool:
+        return search_ids is None or rid in search_ids
+
     if issue_id is not None:
         # dict.fromkeys dedupes while keeping document order: an issue can
         # involve several cells of the SAME row (self-citation), and
@@ -348,12 +510,19 @@ async def _table_fragment(session_id: str, table_type: str, *, page: int,
         entries = [{'row_id': rid, 'ghost': False}
                    for rid in dict.fromkeys(
                        artifacts['issue_index'].get(issue_id, []))
-                   if rid in view.row_ids]
+                   if rid in view.row_ids and _matches_search(rid)]
+    elif facet_active:
+        # Facet-filtered view: live rows carrying at least one issue of a
+        # selected type (ghosts excluded, like the single-issue view).
+        entries = [e for e in view.display_rows()
+                   if e['row_id'] in keep and _matches_search(e['row_id'])]
     else:
         entries = [e for e in view.display_rows()
-                   if (show_all or e['row_id'] in issues
+                   if (search_ids is not None
+                       or show_all or e['row_id'] in issues
                        or e['row_id'] in changed)
-                   and (not changes_only or e['row_id'] in changed)]
+                   and (not changes_only or e['row_id'] in changed)
+                   and _matches_search(e['row_id'])]
 
     total = len(entries)
     page_count = _page_count(total)
@@ -395,17 +564,25 @@ async def _table_fragment(session_id: str, table_type: str, *, page: int,
     invalid_rows = len(issues & live_rows)
     total_rows = len(view.row_ids)
 
-    filtered = issue_id is not None
+    filtered = issue_id is not None or facet_active
     # A table whose report is empty (fully valid) keeps the ✓ reassurance.
     header_filename = csv_filename if errors + warnings == 0 else None
     parts = [_table_header_html(label, errors, warnings, invalid_rows,
                                 total_rows, filename=header_filename,
                                 table_type=table_type)]
     if filtered:
-        parts.append(_filter_banner_html(table_type, issue_id, total))
+        if issue_id is not None:
+            parts.append(_filter_banner_html(table_type, total,
+                                             issue_id=issue_id))
+        else:
+            parts.append(_filter_banner_html(
+                table_type, total, facet_desc=_facet_desc(types)))
+    parts.append(_table_tools_html(
+        table_type, q, total,
+        facet_dropdown=_facet_dropdown_html(table_type, facet_rows, types)))
     if not entries:
         parts.append(_empty_state_html(table_type, show_all, changes_only,
-                                       filtered))
+                                       filtered, q=q))
     parts.extend([
         _table_controls_html(table_type, show_all, changes_only, filtered),
         '<div class="table-container container-fluid">',
@@ -489,7 +666,11 @@ async def get_table_view(session_id: str, page: int = 1, show_all: bool = False,
                          cits_show_all: bool = False,
                          cits_changes_only: bool = False,
                          cits_issue_id: Optional[str] = None,
-                         cits_focus_row_id: Optional[str] = None):
+                         cits_focus_row_id: Optional[str] = None,
+                         q: Optional[str] = None,
+                         cits_q: Optional[str] = None,
+                         issue_types: Optional[str] = None,
+                         cits_issue_types: Optional[str] = None):
     """
     One page (≤ TABLE_PAGE_SIZE rows) per table of the editor's view —
     every table of the session (metadata and citations, both editable) is
@@ -552,17 +733,22 @@ async def get_table_view(session_id: str, page: int = 1, show_all: bool = False,
         # The primary table's fragment is described by the top-level params
         # (compat); the other table — only possible when primary is 'meta'
         # — by the cits_* params.
+        q = (q or '').strip() or None
+        cits_q = (cits_q or '').strip() or None
         params_by_table = {primary: dict(page=page, show_all=show_all,
                                          changes_only=changes_only,
                                          issue_id=issue_id,
-                                         focus_row_id=focus_row_id)}
+                                         focus_row_id=focus_row_id,
+                                         q=q, issue_types=issue_types)}
         other = 'cits' if primary == 'meta' else 'meta'
         if other in states and states[other] is not None \
                 and states[other]['artifacts'].get('has_table'):
             params_by_table[other] = dict(page=cits_page, show_all=cits_show_all,
                                           changes_only=cits_changes_only,
                                           issue_id=cits_issue_id,
-                                          focus_row_id=cits_focus_row_id)
+                                          focus_row_id=cits_focus_row_id,
+                                          q=cits_q,
+                                          issue_types=cits_issue_types)
 
         html_parts: list = []
         info_by_table: dict = {}
@@ -1285,6 +1471,7 @@ async def get_session(session_id: str):
         "has_metadata": session.has_metadata,
         "has_citations": session.has_citations,
         "verify_id_existence": session.verify_id_existence,
+        "draft_name": session.draft_name,
         "has_edits_since_validation": session.has_edits_since_validation,
         "edited_items_count": edited_count,
         "unsaved_changes": unsaved,

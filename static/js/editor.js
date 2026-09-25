@@ -42,10 +42,10 @@ function initBootstrapWidgets() {
 // and Ctrl+Z/Y) target it.
 
 function mkTableState() {
-    return { page: 1, showAllRows: false, changesOnly: false };
+    return { page: 1, showAllRows: false, changesOnly: false, q: '' };
 }
 const tableStates = { meta: mkTableState(), cits: mkTableState() };
-const filteredStates = { meta: null, cits: null };  // {issueId, page} per table
+const filteredStates = { meta: null, cits: null };  // {issueId, page, types} per table
 const savedStates = { meta: null, cits: null };     // captured on entering the filtered view
 let primaryTable = 'meta';   // corrected from the response's table_type on first render
 let activeTable = null;      // last-interacted table (undo/redo target)
@@ -103,8 +103,11 @@ async function renderView(opts = {}) {
         const filtered = filteredStates[tt];
         const st = filtered || tableStates[tt];
         params.set(paramName(tt, 'page'), String(st.page));
+        if (tableStates[tt].q) params.set(paramName(tt, 'q'), tableStates[tt].q);
         if (filtered) {
-            params.set(paramName(tt, 'issue_id'), filtered.issueId);
+            if (filtered.issueId) params.set(paramName(tt, 'issue_id'), filtered.issueId);
+            if (filtered.types && filtered.types.length)
+                params.set(paramName(tt, 'issue_types'), filtered.types.join(','));
         } else {
             params.set(paramName(tt, 'show_all'), String(st.showAllRows));
             params.set(paramName(tt, 'changes_only'), String(st.changesOnly));
@@ -135,6 +138,17 @@ async function renderView(opts = {}) {
             if (info) (filteredStates[tt] || tableStates[tt]).page = info.page;
         }
 
+        // Capture the focused search box (if any) so the innerHTML swap
+        // below doesn't kill it mid-keystroke — the debounced search
+        // re-renders on every typing pause.
+        const activeEl = document.activeElement;
+        let searchFocus = null;
+        if (activeEl && activeEl.matches &&
+                activeEl.matches('[data-search-input]')) {
+            searchFocus = { tt: activeEl.dataset.searchInput,
+                            start: activeEl.selectionStart,
+                            end: activeEl.selectionEnd };
+        }
         // Empty states, filter banners and the per-table filter buttons are
         // server-rendered with each fragment; the per-table "Expand cells"
         // buttons are client-injected into the same controls row.
@@ -143,6 +157,15 @@ async function renderView(opts = {}) {
         if (typeof setupEditHandlers === 'function') setupEditHandlers();
         applyCellDisplay();   // after enhanceRow (buttons exist) and before the focus scroll
         initBootstrapWidgets();
+        if (searchFocus) {
+            const el = container.querySelector(
+                `[data-search-input="${searchFocus.tt}"]`);
+            if (el) {
+                el.focus();
+                try { el.setSelectionRange(searchFocus.start, searchFocus.end); }
+                catch (e) { /* be safe across input types */ }
+            }
+        }
 
         if (opts.focusRowId && opts.focusTable) {
             const target = container.querySelector(
@@ -268,6 +291,24 @@ function setupTableDelegation() {
             return;
         }
 
+        // Issue-filter dropdown (server-rendered in the tools row).  Apply
+        // reads the menu's checkboxes and enters the facet-filtered view;
+        // Clear leaves it.  Both scroll to their own table.
+        const facetApply = e.target.closest('[data-facet-apply]');
+        if (facetApply) {
+            e.stopPropagation();
+            applyFacetFilter(facetApply.dataset.facetApply);
+            return;
+        }
+        const facetClear = e.target.closest('[data-facet-clear]');
+        if (facetClear) {
+            e.stopPropagation();
+            const tt = facetClear.dataset.facetClear;
+            exitFilteredView(true, tt);
+            renderView({ scrollToTable: tt });
+            return;
+        }
+
         const btn = e.target.closest('button');
         if (btn) {
             // Cell-display chevron — works on every table.
@@ -312,9 +353,38 @@ function setupTableDelegation() {
             setActiveTable(tt);
             currentItemTable = tt;
             currentItemId = itemContainer.id;
-            openEditModal(item.textContent, currentItemId);
+            openEditModal(item.textContent, currentItemId,
+                          fieldNameFromCell(item.closest('td.field-value')));
         }
     });
+
+    // Severity group checkbox in the issue-filter dropdown: select/deselect
+    // all of its labels (pure client convenience — no fetch until Apply).
+    container.addEventListener('change', e => {
+        const group = e.target.closest('[data-facet-group]');
+        if (!group) return;
+        const grp = group.closest('.facet-group');
+        if (!grp) return;
+        grp.querySelectorAll('input[data-label]').forEach(i => {
+            i.checked = group.checked;
+        });
+    });
+
+    // Search box (server-rendered per table in the .table-tools row): the
+    // server filters all rows of the table (pagination-friendly full-text
+    // search) and re-renders the input state-correct; focus/caret are
+    // restored by renderView.  The native × clear also fires 'input' with ''.
+    const onSearchInput = debounce(e => {
+        const input = e.target.closest('[data-search-input]');
+        if (!input) return;
+        const tt = input.dataset.searchInput;
+        if (!tt) return;
+        setActiveTable(tt);
+        tableStates[tt].q = input.value;
+        (filteredStates[tt] || tableStates[tt]).page = 1;
+        renderView({ preserveScroll: true });
+    }, 300);
+    container.addEventListener('input', onSearchInput);
 
     // Lazy popover/tooltip initialisation: construct the Bootstrap instance
     // on first hover (and show it immediately, since the mouse is already
@@ -566,7 +636,7 @@ async function loadFilteredTable(issueId, tableType = null) {
         return;
     }
     if (!filteredStates[tt]) savedStates[tt] = { ...tableStates[tt] };
-    filteredStates[tt] = { issueId, page: 1 };
+    filteredStates[tt] = { issueId, page: 1, types: [] };
     await renderView({ scrollToTable: tt });
 }
 
@@ -595,6 +665,33 @@ function exitFilteredView(restore = true, tableType = null) {
 function exitFilteredViewAndReload(tableType = null) {
     const tt = tableType || activeTable || primaryTable;
     exitFilteredView(true, tt);
+    renderView({ scrollToTable: tt });
+}
+
+/**
+ * Read the checked boxes of one table's issue-filter dropdown and enter
+ * (or, when nothing is checked, leave) the facet-filtered view — rows
+ * carrying at least one issue of a selected type.  The severity group
+ * checkboxes are a select-all for their labels, so "all errors" is one
+ * click.  Entering facets while a single-issue filter is active replaces
+ * it (and vice versa) without re-capturing the saved state, so "Back to
+ * full table" always restores the view the user started from.
+ */
+function applyFacetFilter(tt) {
+    const container = document.getElementById('tableContainer');
+    const menu = container && container.querySelector(
+        `.facet-menu[data-table-type="${tt}"]`);
+    if (!menu) return;
+    setActiveTable(tt);
+    const types = [...new Set(
+        [...menu.querySelectorAll('input[data-label]:checked')]
+            .map(i => i.dataset.label))];
+    if (!types.length) {
+        exitFilteredView(true, tt);
+    } else {
+        if (!filteredStates[tt]) savedStates[tt] = { ...tableStates[tt] };
+        filteredStates[tt] = { issueId: null, page: 1, types };
+    }
     renderView({ scrollToTable: tt });
 }
 

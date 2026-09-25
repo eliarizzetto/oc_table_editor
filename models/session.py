@@ -17,6 +17,7 @@ class Session:
     has_metadata: bool = False
     has_citations: bool = False
     verify_id_existence: bool = False
+    draft_name: Optional[str] = None   # user-assigned display name
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     last_updated: str = field(default_factory=lambda: datetime.now().isoformat())
     
@@ -40,6 +41,7 @@ class Session:
             'has_metadata': self.has_metadata,
             'has_citations': self.has_citations,
             'verify_id_existence': self.verify_id_existence,
+            'draft_name': self.draft_name,
             'created_at': self.created_at,
             'last_updated': self.last_updated,
             'meta_csv_path': self.meta_csv_path,
@@ -61,6 +63,7 @@ class Session:
             has_metadata=data.get('has_metadata', False),
             has_citations=data.get('has_citations', False),
             verify_id_existence=data.get('verify_id_existence', False),
+            draft_name=data.get('draft_name'),
             created_at=data.get('created_at', datetime.now().isoformat()),
             last_updated=data.get('last_updated', datetime.now().isoformat()),
             meta_csv_path=data.get('meta_csv_path'),

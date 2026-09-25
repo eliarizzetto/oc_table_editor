@@ -545,3 +545,60 @@ tr:hover .cell-toggle-btn {
 #table-data td.row-number .cell-toggle-btn:hover {
     opacity: 1;
 }
+
+/* ── Per-table tools row: full-table search box + issue-filter dropdown ── */
+.table-tools {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0 0.5rem 0;
+    flex-wrap: wrap;
+}
+
+.table-tools .table-search {
+    max-width: 280px;
+}
+
+.table-tools .search-count {
+    color: #6c757d;
+    font-size: 0.875em;
+}
+
+/* Issue-filter dropdown (facet menu, server-rendered per table). */
+.facet-menu {
+    min-width: 320px;
+}
+
+.facet-group-head {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.25rem 0;
+}
+
+.facet-meta {
+    color: #6c757d;
+    font-size: 0.8em;
+}
+
+.facet-item {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.15rem 0 0.15rem 1.25rem;
+    margin: 0;
+    cursor: pointer;
+}
+
+.facet-count {
+    margin-left: auto;
+    color: #6c757d;
+    font-size: 0.8em;
+    white-space: nowrap;
+}
+
+/* Session name row in the sidebar's Session Info card — allow the name to
+   shrink so text-truncate can ellipsize long names inside the flex row. */
+#sessionName {
+    min-width: 0;
+}
