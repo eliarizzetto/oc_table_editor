@@ -21,7 +21,7 @@ import re
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from aiofiles import open as aio_open
 from bs4 import BeautifulSoup
@@ -282,8 +282,9 @@ class TableView:
 
         # Row existence is order-aware: a row is currently dead when its
         # LAST add_row/delete_row event is a delete.  ``next_add_row_id``
-        # can reuse the id of a deleted added row, so "any delete event
-        # exists" would wrongly kill the re-added row.
+        # no longer re-issues used ids, but legacy journals can still
+        # hold a re-added id, so "any delete event exists" would wrongly
+        # kill the re-added row.
         last_row_op: Dict[str, str] = {}
         for ev in events:
             if ev['op'] in ('add_row', 'delete_row'):
@@ -456,9 +457,25 @@ class TableView:
             return None
         return self.row_ids[idx + 1] if idx + 1 < len(self.row_ids) else None
 
-    def next_add_row_id(self) -> str:
-        numbers = [int(r[3:]) for r in self.row_ids if r.startswith('row')
-                   and r[3:].isdigit()]
+    def next_add_row_id(self, reserved_rows: Iterable[str] = ()) -> str:
+        """Id for the next added row — one that has NEVER been used in this
+        table.
+
+        Replay groups all of a row's events by id and the baseline keeps
+        every original id forever, so a reused id either splices two row
+        incarnations together (resurrecting the first one's content) or
+        collides with a baseline row (the row renders twice).  Candidates
+        are therefore every baseline id (deleted baseline rows included),
+        every live view id, and ``reserved_rows`` — the row ids of the
+        journal's FULL event list, which the view cannot see because it is
+        built from applied events only: it covers added-then-deleted ids
+        and ids living solely in an undone redo tail.  Ids only grow
+        within a generation; revalidate renumbers from scratch.
+        """
+        used = (set(self.artifacts.get('row_ids', [])) | set(self.row_ids)
+                | set(reserved_rows))
+        numbers = [int(r[3:]) for r in used
+                   if r.startswith('row') and r[3:].isdigit()]
         return f'row{(max(numbers) + 1) if numbers else 0}'
 
     def rows_for_export(self) -> List[Dict[str, List[str]]]:

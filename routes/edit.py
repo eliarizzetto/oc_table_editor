@@ -1038,7 +1038,13 @@ async def add_row(request: AddRowRequest):
                                                 table_type)
         if not state['artifacts'].get('has_table'):
             raise HTTPException(status_code=500, detail="Failed to add new row")
-        new_row_id = view.next_add_row_id()
+        # Reserved = every row id this table's journal has EVER recorded
+        # (applied events + redo tail): the view is built from applied
+        # events only, so an added-then-deleted or undone id would
+        # otherwise look free and be re-issued — replay would splice the
+        # old incarnation's item events onto the new row.
+        new_row_id = view.next_add_row_id(
+            reserved_rows={ev['row'] for ev in journal.events})
         await _append_event(session, request.session_id, table_type,
                             journal, 'add_row', row=new_row_id)
         new_view = _recompute(state, journal)
