@@ -63,7 +63,7 @@ app.include_router(api_router, prefix="/api")
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Render the upload page."""
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html")
 
 
 @app.get("/editor/{session_id}", response_class=HTMLResponse)
@@ -73,13 +73,15 @@ async def editor(request: Request, session_id: str):
     session = await SessionManager.load_session(session_id)
     if not session:
         return templates.TemplateResponse(
+            request,
             "error.html",
-            {"request": request, "message": f"Session '{session_id}' not found or has expired."}
+            {"message": f"Session '{session_id}' not found or has expired."}
         )
-    
+
     return templates.TemplateResponse(
+        request,
         "editor.html",
-        {"request": request, "session_id": session_id,
+        {"session_id": session_id,
          "session_name": session.draft_name,
          "has_metadata": session.has_metadata,
          "has_citations": session.has_citations}

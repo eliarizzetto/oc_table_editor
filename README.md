@@ -28,7 +28,7 @@ A web application for editing validated CSV tables (metadata and citations) with
 oc_table_editor/
 ├── main.py                 # FastAPI application entry point
 ├── config.py               # Configuration settings
-├── requirements.txt        # Python dependencies
+├── pyproject.toml          # Python dependencies (uv-managed, locked in uv.lock)
 ├── models/
 │   └── session.py         # Session data model
 ├── services/
@@ -55,35 +55,24 @@ oc_table_editor/
 
 ## Installation
 
-1. Create a virtual environment:
+The project is managed with [uv](https://docs.astral.sh/uv/) (dependencies in `pyproject.toml`, locked in `uv.lock`, Python version in `.python-version`):
+
 ```bash
 cd C:\Users\media\Lavoro\oc_table_editor
-python -m venv venv
-venv\Scripts\activate
+uv sync
 ```
 
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+This creates/updates the `.venv` virtual environment with all dependencies.
 
 ## Running the Application
 
-### Server Mode (Full Features)
-
 ```bash
-python main.py --mode server
+uv run python main.py
 ```
+
+(Equivalently: `.venv\Scripts\activate` then `python main.py`.)
 
 Then open `http://localhost:8000` in your browser.
-
-### Static File Mode (Browser-Only)
-
-```bash
-python main.py --mode static
-```
-
-This generates HTML files that can be opened directly in a browser without a running server (no session management or persistent storage).
 
 ## Usage
 
