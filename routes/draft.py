@@ -1,4 +1,5 @@
 """Draft management routes."""
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -124,6 +125,14 @@ def _display_name(session) -> str:
     return 'Untitled Draft'
 
 
+def _last_updated(draft: dict) -> datetime:
+    """Sortable ``last_updated``; minimal datetime when missing/unparsable."""
+    try:
+        return datetime.fromisoformat(draft["last_updated"])
+    except (ValueError, TypeError):
+        return datetime.min
+
+
 @router.get("/list")
 async def list_drafts():
     """
@@ -147,7 +156,10 @@ async def list_drafts():
                 "created_at": session.created_at,
                 "last_updated": session.last_updated
             })
-    
+
+    # Most recently updated/touched first.
+    drafts.sort(key=_last_updated, reverse=True)
+
     return {"drafts": drafts}
 
 
