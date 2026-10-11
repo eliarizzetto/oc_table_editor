@@ -4,14 +4,13 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Optional
 
 from services import SessionManager
 from services.session_document import document_cache
+from config import MAX_DRAFT_NAME_LEN
 
 router = APIRouter()
-
-MAX_DRAFT_NAME_LEN = 120
 
 
 def _clean_name(raw: Optional[str]) -> Optional[str]:
@@ -24,48 +23,10 @@ def _clean_name(raw: Optional[str]) -> Optional[str]:
     return name or None
 
 
-class SaveDraftRequest(BaseModel):
-    """Request model for saving a draft."""
-    session_id: str
-    draft_name: Optional[str] = None
-
-
-class LoadDraftRequest(BaseModel):
-    """Request model for loading a draft."""
-    session_id: str
-
-
 class RenameRequest(BaseModel):
     """Request model for renaming a session."""
     session_id: str
     draft_name: str
-
-
-@router.post("/save")
-async def save_draft(request: SaveDraftRequest):
-    """
-    Save current session as a draft.
-    
-    - **session_id**: Session identifier
-    - **draft_name**: Optional custom name for the draft
-    """
-    session = await SessionManager.load_session(request.session_id)
-    
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    # Update session with draft name if provided
-    if request.draft_name:
-        session.draft_name = _clean_name(request.draft_name)
-
-    # Save session (this already persists all files)
-    await SessionManager.save_session(session)
-
-    return {
-        "success": True,
-        "message": "Draft saved successfully",
-        "session_id": request.session_id
-    }
 
 
 @router.post("/rename")
@@ -93,28 +54,6 @@ async def rename_draft(request: RenameRequest):
         await SessionManager.save_session(session)
 
     return {"success": True, "session_id": request.session_id, "draft_name": name}
-
-
-@router.post("/load")
-async def load_draft(request: LoadDraftRequest):
-    """
-    Load a saved draft.
-    
-    - **session_id**: Session identifier of the draft to load
-    """
-    session = await SessionManager.load_session(request.session_id)
-    
-    if not session:
-        raise HTTPException(status_code=404, detail="Draft not found")
-    
-    return {
-        "success": True,
-        "session_id": session.session_id,
-        "has_metadata": session.has_metadata,
-        "has_citations": session.has_citations,
-        "draft_name": session.draft_name,
-        "last_updated": session.last_updated
-    }
 
 
 def _display_name(session) -> str:
@@ -170,8 +109,11 @@ async def delete_draft(session_id: str):
     
     - **session_id**: Session identifier of the draft to delete
     """
-    deleted = SessionManager.delete_session(session_id)
-    
+    # Hold the session lock: a concurrent edit could be mid-journal-append
+    # while rmtree removes the directory (Windows open-handle → 500).
+    async with document_cache.session_lock(session_id):
+        deleted = SessionManager.delete_session(session_id)
+
     if not deleted:
         raise HTTPException(status_code=404, detail="Draft not found")
     

@@ -3,10 +3,9 @@
 Every mutation is recorded as one normalized event line in the table's
 journal ``journal_{table_type}.jsonl``; the companion
 ``journal_{table_type}_state.json`` tracks the replay cursor (undo
-position), the last written sequence number, and the last committed
-(saved) sequence number.  Each table of a session ('meta' and 'cits')
-has its own journal: independent undo history, cursor, saved marker and
-generation stamp.
+position) and the last committed (saved) sequence number.  Each table of a
+session ('meta' and 'cits') has its own journal: independent undo
+history, cursor, saved marker and generation stamp.
 
 Semantics:
 - **View** = base (baseline HTML + generation artifacts) + events ``[:cursor]``.
@@ -15,8 +14,7 @@ Semantics:
   (``time.time_ns()`` at append) that orders it against the events of the
   OTHER table's journal too — undo/redo move the cursor of whichever journal
   holds the chronologically last/first event, so both tables share one
-  logical stack (events of pre-gseq sessions fall back to ``0``; those
-  histories are single-journal, so journal order is chronological).
+  logical stack.
   A new edit **truncates the redo tails of every journal** of the session
   (``truncate_redo_tails``) — single-stream semantics: a new action destroys
   the whole redo stack.
@@ -35,9 +33,6 @@ Semantics:
   never replayed against this one.  The ``gseq`` ordering never crosses that
   boundary: it only decides *which* journal's cursor moves, never replays
   events against the wrong table.
-- **Legacy migration**: sessions created before per-table journals carry a
-  single ``journal.jsonl`` + ``journal_meta.json`` pair; ``load`` adopts
-  them once (verbatim) into the per-table files named by their stamp.
 
 All journal operations must run while holding the session lock
 (``document_cache.session_lock``).
@@ -51,9 +46,6 @@ from aiofiles import open as aio_open
 
 from config import TEMP_DIR
 from services.session_document import atomic_write
-
-LEGACY_JOURNAL_FILENAME = 'journal.jsonl'
-LEGACY_STATE_FILENAME = 'journal_meta.json'
 
 
 def _journal_filename(table_type: str) -> str:
@@ -93,47 +85,6 @@ class ChangeJournal:
     # -- loading -------------------------------------------------------------
 
     @classmethod
-    async def _migrate_legacy_files(cls, session_id: str) -> None:
-        """Adopt a pre-per-table journal (``journal.jsonl`` + ``journal_meta.json``).
-
-        The legacy state's ``table_type`` stamp says which table the history
-        belongs to.  The raw event text is copied verbatim (a torn trailing
-        line stays torn for the tolerant loader) and the state is
-        re-serialized under the per-table names before the legacy files are
-        removed.  Events are written before the state file, mirroring
-        ``append``'s crash ordering — a crash mid-migration leaves the
-        legacy files in place (they stay authoritative until both new files
-        exist and the legacy ones are gone), so the next load simply re-runs.
-        """
-        base = TEMP_DIR / session_id
-        legacy_state = base / LEGACY_STATE_FILENAME
-        legacy_journal = base / LEGACY_JOURNAL_FILENAME
-        if not legacy_state.exists() and not legacy_journal.exists():
-            return
-        meta: dict = {}
-        if legacy_state.exists():
-            try:
-                async with aio_open(legacy_state, 'r', encoding='utf-8') as f:
-                    meta = json.loads(await f.read())
-            except Exception:
-                meta = {}
-        table_type = meta.get('table_type', 'meta')
-        if legacy_journal.exists():
-            async with aio_open(legacy_journal, 'r', encoding='utf-8') as f:
-                raw_events = await f.read()
-            await atomic_write(base / _journal_filename(table_type), raw_events)
-        await atomic_write(base / _state_filename(table_type),
-                           json.dumps({
-                               'generation': meta.get('generation'),
-                               'table_type': table_type,
-                               'cursor': meta.get('cursor', 0),
-                               'last_seq': meta.get('last_seq', 0),
-                               'saved_seq': meta.get('saved_seq', 0),
-                           }, indent=2))
-        legacy_state.unlink(missing_ok=True)
-        legacy_journal.unlink(missing_ok=True)
-
-    @classmethod
     async def load(cls, session_id: str, expected_generation: Optional[str] = None,
                    table_type: str = 'meta') -> 'ChangeJournal':
         """Load and reconcile the journal for one table of a session.
@@ -141,8 +92,6 @@ class ChangeJournal:
         ``expected_generation`` comes from the current generation artifacts;
         a mismatch (stale events from before a revalidate) resets the journal.
         """
-        await cls._migrate_legacy_files(session_id)
-
         state_path = TEMP_DIR / session_id / _state_filename(table_type)
         journal_path = TEMP_DIR / session_id / _journal_filename(table_type)
 
@@ -172,7 +121,7 @@ class ChangeJournal:
                     break
                 events.append(ev)
 
-        last_seq = len(events)
+        num_events = len(events)
         generation = meta.get('generation')
         stored_table_type = meta.get('table_type', table_type)
 
@@ -191,13 +140,13 @@ class ChangeJournal:
                 generation = expected_generation
             stored_table_type = table_type
 
-        cursor = min(meta.get('cursor', 0), last_seq) if events or meta_exists else 0
+        cursor = min(meta.get('cursor', 0), num_events) if events or meta_exists else 0
         if not events:
             cursor = 0
         # Clamp saved_seq to existing events only — saved_seq > cursor is a
         # legitimate state (undo below the last save; the file on disk holds
         # more than the view and no rewrite happens on undo).
-        saved_seq = min(meta.get('saved_seq', 0), last_seq)
+        saved_seq = min(meta.get('saved_seq', 0), num_events)
 
         return cls(session_id, events, generation or expected_generation or '',
                    stored_table_type, cursor, saved_seq, meta_exists)
@@ -219,7 +168,6 @@ class ChangeJournal:
             'generation': self.generation,
             'table_type': self.table_type,
             'cursor': self.cursor,
-            'last_seq': len(self.events),
             'saved_seq': self.saved_seq,
         }, indent=2)
         await atomic_write(self._meta_path, payload)
@@ -237,7 +185,7 @@ class ChangeJournal:
         Every event is stamped with ``gseq`` (monotonic wall-clock ns) so
         the session-wide undo stack can order it against the other table's
         events."""
-        ev = {'seq': self.cursor + 1, 'op': op, 'gseq': time.time_ns(), **fields}
+        ev = {'op': op, 'gseq': time.time_ns(), **fields}
         if self.cursor < len(self.events):
             self.events = self.events[:self.cursor]
             self.events.append(ev)

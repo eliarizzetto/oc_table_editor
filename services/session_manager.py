@@ -42,20 +42,30 @@ class SessionManager:
         return session_dir
 
     @staticmethod
-    async def save_uploaded_file(session_id: str, file_content: bytes, filename: str) -> str:
+    async def save_uploaded_file(session_id: str, file_content: bytes,
+                                 filename: str, fallback: str) -> str:
         """
-        Save an uploaded CSV file to session directory.
+        Save an uploaded CSV file to the session directory.
+
+        The client-supplied filename is sanitized to its final path
+        component (a name containing ``..\\`` or an absolute path must never
+        escape the session directory); ``fallback`` is used when nothing
+        safe remains.
 
         Args:
             session_id: Session identifier
             file_content: File content as bytes
-            filename: Original filename
+            filename: Original (client-supplied) filename
+            fallback: Name to use when ``filename`` sanitizes to nothing
 
         Returns:
             Path to saved file
         """
+        safe = Path(filename).name.replace('\x00', '').strip()
+        if safe in ('', '.', '..'):
+            safe = fallback
         session_dir = TEMP_DIR / session_id
-        file_path = session_dir / filename
+        file_path = session_dir / safe
 
         async with aio_open(file_path, 'wb') as f:
             await f.write(file_content)
@@ -85,10 +95,8 @@ class SessionManager:
     # ---------------------------------------------------------------------------
     # HTML file IO (atomic, newline-stable)
     #
-    #  table_type='meta'    → meta_table.html   (commit artifact, edited table)
-    #  table_type='cits'    → cits_table.html   (commit artifact, edited table)
-    #  table_type='display' → meta_html.html    (merged display; also derivable
-    #                                             via session_document.compose_display)
+    #  table_type='meta' → meta_table.html  (commit artifact, edited table)
+    #  table_type='cits' → cits_table.html  (commit artifact, edited table)
     # ---------------------------------------------------------------------------
 
     @staticmethod
@@ -100,26 +108,9 @@ class SessionManager:
         await atomic_write(html_file, html_content)
         return str(html_file)
 
-    @staticmethod
-    async def load_html(session_id: str, table_type: str) -> Optional[str]:
-        """Load an HTML artifact, or None if missing/empty."""
-        html_file = TEMP_DIR / session_id / filename_for(table_type)
-        if not html_file.exists() or html_file.stat().st_size == 0:
-            return None
-        try:
-            async with aio_open(html_file, 'r', encoding='utf-8',
-                                newline='') as f:
-                return await f.read()
-        except Exception:
-            return None
-
     # ---------------------------------------------------------------------------
     # Baseline snapshots (the immutable per-generation base)
     # ---------------------------------------------------------------------------
-
-    @staticmethod
-    def _baseline_filename(table_type: str) -> str:
-        return f"baseline_{table_type}.html"
 
     @staticmethod
     async def save_baseline_snapshot(session_id: str, html_content: str, table_type: str) -> None:
@@ -131,7 +122,7 @@ class SessionManager:
         """
         session_dir = TEMP_DIR / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
-        baseline_file = session_dir / SessionManager._baseline_filename(table_type)
+        baseline_file = session_dir / filename_for(f'baseline_{table_type}')
         await atomic_write(baseline_file, html_content)
 
     @staticmethod

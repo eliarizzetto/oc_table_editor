@@ -1,12 +1,12 @@
 """Edit operations routes — event-sourced.
 
-Mutations append normalized events to the session's change journal
-(``services/journal.py``) and return the affected row's HTML (computed by
-``services/view_builder.py`` from the immutable baseline + replayed events)
-so the frontend can patch a single ``<tr>`` in place.  No route parses a
-whole document or writes a 12 MB file: the only full parses happen inside
-upload/revalidate (artifact building), and the only big writes happen on
-Save (commit) and revalidate.
+Mutations append normalized events to the session's change journals
+(``services/journal.py``); the frontend then re-renders the current page
+from ``GET /table/{session_id}`` (page-bounded views computed by
+``services/view_builder.py`` from the immutable baseline + replayed
+events).  No route parses a whole document or writes a 12 MB file: the
+only full parses happen inside upload/revalidate (artifact building), and
+the only big writes happen on Save (commit) and revalidate.
 """
 import asyncio
 import html
@@ -20,13 +20,14 @@ from typing import Optional
 
 from services import SessionManager, HTMLParser, ValidatorService, CSVExporter
 from services.journal import ChangeJournal, truncate_redo_tails
-from services.session_document import (
-    compose_display,
-    document_cache,
+from services.session_document import document_cache
+from services.table_scope import (
+    editable_table_type,
+    resolve_table_type,
+    session_table_types,
 )
 from services.validator_service import load_jsonl_report
 from services.view_builder import (
-    TableView,
     build_generation_artifacts,
     load_journal_view,
     load_table_state,
@@ -34,9 +35,9 @@ from services.view_builder import (
 from models import Session
 from config import TABLE_PAGE_SIZE, TEMP_DIR
 
-# Import oc_validator interface for HTML generation and merging
+# For counting CSV rows on the table-less fallback path
 from oc_validator.helper import CSVStreamReader
-from oc_validator.interface.gui import make_gui, merge_html_files
+from oc_validator.main import TableNotMatchingInstance
 
 router = APIRouter()
 
@@ -44,61 +45,6 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool,
-                   table_label: str = 'Metadata') -> None:
-    """
-    Generate an HTML visualisation for a validated CSV table.
-
-    Safely handles the zero-errors case: when the validation report is empty
-    ``make_gui`` crashes (it tries to open ``valid_page.html`` via a bare
-    relative path that does not exist in this project).  We detect this and
-    delegate to ``ValidatorService.make_valid_table_html`` instead, which
-    renders the same editable table (with zero issue icons), so valid tables
-    stay editable.  ``table_label`` ('Metadata'/'Citations') is only used on
-    that path's no-data-rows fallback.
-    """
-    if is_valid:
-        ValidatorService.make_valid_table_html(out_fp, csv_fp, table_label)
-    else:
-        make_gui(csv_fp, report_fp, out_fp)
-
-
-def _editable_table_type(session: Session) -> str:
-    """The session's primary table ('meta' when metadata was uploaded)."""
-    return 'meta' if session.has_metadata else 'cits'
-
-
-def _session_table_types(session: Session) -> tuple:
-    """The table types present in the session, meta first (document order)."""
-    tts = []
-    if session.has_metadata:
-        tts.append('meta')
-    if session.has_citations:
-        tts.append('cits')
-    return tuple(tts)
-
-
-def _resolve_table_type(session: Session, requested: Optional[str]) -> str:
-    """Validate a client-requested table type against the session.
-
-    ``None`` keeps the legacy behaviour (the session's primary table).
-    Both tables of a paired session are editable, so mutations carry an
-    explicit ``table_type``; the row/item id space is shared between the
-    two tables, and resolving against the wrong one would silently edit
-    the wrong table.
-    """
-    if requested is None:
-        return _editable_table_type(session)
-    if requested not in ('meta', 'cits'):
-        raise HTTPException(status_code=422,
-                            detail=f"Invalid table_type '{requested}' "
-                                   f"(expected 'meta' or 'cits')")
-    if requested not in _session_table_types(session):
-        raise HTTPException(status_code=404,
-                            detail=f"Table '{requested}' not in this session")
-    return requested
-
 
 def _row_id_for_item(item_id: str) -> str:
     """'rowN' for an item id '{N}-{field}-{idx}'."""
@@ -117,16 +63,11 @@ async def _load_view(session_id: str, session: Session,
     Caller must hold the session lock.  Raises 404 when the baseline
     (base) is missing.
     """
-    tt = _resolve_table_type(session, table_type)
+    tt = resolve_table_type(session, table_type)
     loaded = await load_journal_view(session_id, tt)
     if loaded is None:
         raise HTTPException(status_code=404, detail="HTML content not found")
     return loaded
-
-
-def _recompute(state: dict, journal: ChangeJournal) -> TableView:
-    return TableView(state['base_html'], state['artifacts'],
-                     journal.applied_events)
 
 
 async def _append_event(session: Session, session_id: str, table_type: str,
@@ -137,19 +78,9 @@ async def _append_event(session: Session, session_id: str, table_type: str,
     ``gseq`` stamp), so a new edit must destroy the redo tails of EVERY
     journal — not just the one being appended to — before appending.
     Caller must hold the session lock."""
-    await truncate_redo_tails(session_id, _session_table_types(session),
+    await truncate_redo_tails(session_id, session_table_types(session),
                               exclude=(table_type,))
     return await journal.append(op, **fields)
-
-
-def _cleanup_legacy_state_files(session_id: str) -> None:
-    """Remove pre-journal tracking files if a session still carries them."""
-    session_dir = TEMP_DIR / session_id
-    for name in ('edit_state.json', 'row_change_state.json',
-                 'deleted_item_state.json', 'undo_state.json'):
-        (session_dir / name).unlink(missing_ok=True)
-    import shutil
-    shutil.rmtree(session_dir / 'undo', ignore_errors=True)
 
 
 def _page_count(total: int) -> int:
@@ -308,6 +239,7 @@ def _facet_dropdown_html(table_type: str, facet_rows: dict, types: set) -> str:
         if not items:
             continue
         group_rows = set().union(*(rows for _, rows in items))
+        group_checked = all(label in types for label, _ in items)
         items_html = []
         for label, rows in items:
             n = len(rows)
@@ -322,7 +254,8 @@ def _facet_dropdown_html(table_type: str, facet_rows: dict, types: set) -> str:
         groups.append(
             f'<div class="facet-group">'
             f'<div class="facet-group-head">'
-            f'<input type="checkbox" data-facet-group="{sev}" '
+            f'<input type="checkbox" data-facet-group="{sev}"'
+            f'{" checked" if group_checked else ""} '
             f'aria-label="Select all {title.lower()}">'
             f'<strong>{title}</strong>'
             f'<span class="facet-meta">{len(items)} types · {len(group_rows)} rows</span>'
@@ -406,32 +339,6 @@ def _empty_state_html(table_type: str, show_all: bool, changes_only: bool,
         text = 'The table is empty.'
     return (f'<div class="empty-state" data-table-type="{table_type}">'
             f'{text}</div>')
-
-
-def _replace_general_info(html: str, replacements: list) -> str:
-    """Positionally swap every general-info div for ``replacements[i]``
-    (document order).  Fewer divs than replacements → extras ignored; more
-    divs than replacements → extras kept as-is.  Used on the legacy
-    whole-document fallback path, where div 0 is the editable table's header
-    and div 1 (paired sessions) the citations one.  Same find/rfind logic as
-    ``session_document._slice_div`` — assumes no nested <div> inside
-    general-info (true for every variant we generate)."""
-    out: list = []
-    pos = 0
-    for header in replacements:
-        idx = html.find('container-fluid general-info', pos)
-        if idx == -1:
-            break
-        start = html.rfind('<div', 0, idx)
-        end = html.find('</div>', idx)
-        if start == -1 or end == -1:
-            break
-        seg_end = end + len('</div>')
-        out.append(html[pos:start])
-        out.append(header)
-        pos = seg_end
-    out.append(html[pos:])
-    return ''.join(out)
 
 
 async def _table_fragment(session_id: str, table_type: str, *, page: int,
@@ -591,7 +498,7 @@ async def _table_fragment(session_id: str, table_type: str, *, page: int,
         '</tbody></table></div>',
         _pager_html(table_type, page, page_count, total),
     ])
-    info = {"page": page, "page_count": page_count, "total_rows": total}
+    info = {"page": page}
     return ''.join(parts), info
 
 
@@ -614,10 +521,9 @@ class DeleteItemRequest(BaseModel):
 
 class AddItemRequest(BaseModel):
     session_id: str
-    item_id: Optional[str] = None   # ID of an existing item (for backward compatibility)
-    row_id: Optional[str] = None    # Row ID for adding with value
-    field_name: Optional[str] = None  # Field name for adding with value
-    new_value: Optional[str] = None  # Value for the new item
+    row_id: str        # e.g. "row5"
+    field_name: str    # e.g. "id", "author"
+    new_value: str     # value for the new item (non-empty; validated client-side)
     table_type: Optional[str] = None
 
 
@@ -646,9 +552,6 @@ class ClearCellRequest(BaseModel):
 
 class UndoRedoRequest(BaseModel):
     session_id: str
-    table_type: Optional[str] = None   # unused: undo/redo work on the
-                                       # session-wide stack (kept for request
-                                       # compatibility with older clients)
 
 
 class CommitRequest(BaseModel):
@@ -697,38 +600,26 @@ async def get_table_view(session_id: str, page: int = 1, show_all: bool = False,
 
     async with document_cache.session_lock(session_id):
         states = {}
-        for tt in _session_table_types(session):
+        for tt in session_table_types(session):
             states[tt] = await load_table_state(session_id, tt)
         primary = next((tt for tt in ('meta', 'cits')
                         if tt in states and states[tt] is not None
                         and states[tt]['artifacts'].get('has_table')), None)
 
         if primary is None:
-            # Legacy fallback: no parsable table anywhere (fully-valid
-            # uploads) — serve the whole document with the paging UI
-            # disabled.  Both sides are fully valid (zero stats).
-            tt = _editable_table_type(session)
-            _journal, view, _state = await _load_view(session_id, session, tt)
-            replacements = []
-            for t in _session_table_types(session):
+            # No parsable table anywhere (corrupt/missing baselines).
+            # Serve the zero-stats header cards only — nothing to edit.
+            cards = []
+            for t in session_table_types(session):
                 csv_path = (session.meta_csv_path if t == 'meta'
                             else session.cits_csv_path) or ''
-                replacements.append(_table_header_html(
+                cards.append(_table_header_html(
                     'Metadata' if t == 'meta' else 'Citations', 0, 0, 0,
                     _csv_data_rows(csv_path),
-                    filename=Path(csv_path).name if csv_path else None))
-            if session.has_metadata and session.has_citations:
-                if states.get('cits') is None:
-                    raise HTTPException(status_code=404,
-                                        detail="HTML content not found")
-                html_content = compose_display(view.html,
-                                               states['cits']['base_html'])
-            else:
-                html_content = view.html
-            html_content = _replace_general_info(html_content, replacements)
-            return {"html": html_content, "has_table": False,
-                    "paginated": False, "page": 1, "page_count": 1,
-                    "total_rows": 0, "table_type": tt, "cits": None}
+                    filename=Path(csv_path).name if csv_path else None,
+                    table_type=t))
+            return {"html": ''.join(cards), "page": 1,
+                    "table_type": editable_table_type(session), "cits": None}
 
         # The primary table's fragment is described by the top-level params
         # (compat); the other table — only possible when primary is 'meta'
@@ -752,7 +643,7 @@ async def get_table_view(session_id: str, page: int = 1, show_all: bool = False,
 
         html_parts: list = []
         info_by_table: dict = {}
-        for tt in _session_table_types(session):   # document order: meta, cits
+        for tt in session_table_types(session):   # document order: meta, cits
             if tt not in params_by_table:
                 continue
             report_path = (session.meta_report_path if tt == 'meta'
@@ -773,7 +664,7 @@ async def get_table_view(session_id: str, page: int = 1, show_all: bool = False,
         # it is NOT the primary (in solo-cits sessions the top-level fields
         # already describe it).
         cits_info = info_by_table.get('cits') if primary != 'cits' else None
-        for tt in _session_table_types(session):
+        for tt in session_table_types(session):
             if tt in info_by_table or tt not in states:
                 continue
             csv_path = (session.meta_csv_path if tt == 'meta'
@@ -787,12 +678,11 @@ async def get_table_view(session_id: str, page: int = 1, show_all: bool = False,
                 html_parts.insert(0, card)
             else:
                 html_parts.append(card)
-                cits_info = {"page": 1, "page_count": 1, "total_rows": 0}
+                cits_info = {"page": 1}
 
         primary_info = info_by_table[primary]
-    return {"html": ''.join(html_parts), "has_table": True, "paginated": True,
-            "page": primary_info["page"], "page_count": primary_info["page_count"],
-            "total_rows": primary_info["total_rows"],
+    return {"html": ''.join(html_parts),
+            "page": primary_info["page"],
             "table_type": primary, "cits": cits_info}
 
 
@@ -806,13 +696,13 @@ async def edit_item(request: EditItemRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    table_type = _resolve_table_type(session, request.table_type)
+    table_type = resolve_table_type(session, request.table_type)
     row_id = _row_id_for_item(request.item_id)
     field_name = _field_for_item(request.item_id)
 
     async with document_cache.session_lock(request.session_id):
-        journal, view, state = await _load_view(request.session_id, session,
-                                                table_type)
+        journal, view, _state = await _load_view(request.session_id, session,
+                                                 table_type)
         bs, row = view.row_soup(row_id)
         if row is None:
             raise HTTPException(status_code=404,
@@ -836,17 +726,13 @@ async def edit_item(request: EditItemRequest):
                                 item=request.item_id, field=field_name,
                                 value=request.new_value)
 
-        new_view = _recompute(state, journal)
         session.mark_edited()
         await SessionManager.save_session(session)
 
     return {
         "success": True,
-        "original_value": original_value,
-        "new_value": request.new_value,
         "row_id": row_id,
-        "table_type": table_type,
-        "row_html": new_view.row_html(row_id)
+        "table_type": table_type
     }
 
 
@@ -860,99 +746,48 @@ async def add_item_to_cell(request: AddItemRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    table_type = _resolve_table_type(session, request.table_type)
+    table_type = resolve_table_type(session, request.table_type)
 
-    if request.new_value is not None and request.row_id and request.field_name:
-        # ── Adding with value directly ─────────────────────────────────────
-        field_name = request.field_name
-        is_multi_value = field_name in HTMLParser.ITEM_SEPARATORS
+    field_name = request.field_name
+    is_multi_value = field_name in HTMLParser.ITEM_SEPARATORS
 
-        async with document_cache.session_lock(request.session_id):
-            journal, view, state = await _load_view(request.session_id, session,
-                                                    table_type)
-            bs, row = view.row_soup(request.row_id)
-            if row is None:
-                raise HTTPException(status_code=404,
-                                    detail=f"Row '{request.row_id}' not found")
+    async with document_cache.session_lock(request.session_id):
+        journal, view, _state = await _load_view(request.session_id, session,
+                                                 table_type)
+        _bs, row = view.row_soup(request.row_id)
+        if row is None:
+            raise HTTPException(status_code=404,
+                                detail=f"Row '{request.row_id}' not found")
 
-            has_value, _ = HTMLParser.get_cell_state_in_row(row, field_name)
+        has_value, _ = HTMLParser.get_cell_state_in_row(row, field_name)
 
-            if not has_value:
-                new_item_id = f"{request.row_id[3:]}-{field_name}-0"
-                await _append_event(session, request.session_id, table_type,
-                                    journal, 'init_cell', row=request.row_id,
-                                    field=field_name, value=request.new_value)
-            elif not is_multi_value:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Cannot add to single-value field '{field_name}' "
-                           f"that already has a value"
-                )
-            else:
-                new_item_id = HTMLParser.next_item_id_in_cell(row, field_name)
-                if not new_item_id:
-                    raise HTTPException(status_code=404,
-                                        detail=f"Field '{field_name}' not found")
-                await _append_event(session, request.session_id, table_type,
-                                    journal, 'append_item', row=request.row_id,
-                                    field=field_name, value=request.new_value)
-
-            new_view = _recompute(state, journal)
-            session.mark_edited()
-            await SessionManager.save_session(session)
-
-        return {
-            "success": True,
-            "new_item_id": new_item_id,
-            "row_id": request.row_id,
-            "table_type": table_type,
-            "row_html": new_view.row_html(request.row_id)
-        }
-
-    elif request.item_id:
-        # ── Backward compatibility: adding an empty item ───────────────────
-        parts = request.item_id.split('-')
-        if len(parts) < 3:
-            raise HTTPException(status_code=400,
-                                detail=f"Invalid item_id format: '{request.item_id}'")
-        field_name = '-'.join(parts[1:-1])
-        if field_name not in HTMLParser.ITEM_SEPARATORS:
+        if not has_value:
+            await _append_event(session, request.session_id, table_type,
+                                journal, 'init_cell', row=request.row_id,
+                                field=field_name, value=request.new_value)
+        elif not is_multi_value:
             raise HTTPException(
                 status_code=400,
-                detail=f"Field '{field_name}' is not a multi-value field"
+                detail=f"Cannot add to single-value field '{field_name}' "
+                       f"that already has a value"
             )
-        row_id = _row_id_for_item(request.item_id)
-
-        async with document_cache.session_lock(request.session_id):
-            journal, view, state = await _load_view(request.session_id, session,
-                                                    table_type)
-            bs, row = view.row_soup(row_id)
-            if row is None:
-                raise HTTPException(status_code=404,
-                                    detail=f"Item '{request.item_id}' not found in HTML")
+        else:
             new_item_id = HTMLParser.next_item_id_in_cell(row, field_name)
             if not new_item_id:
                 raise HTTPException(status_code=404,
-                                    detail=f"Item '{request.item_id}' not found in HTML")
+                                    detail=f"Field '{field_name}' not found")
             await _append_event(session, request.session_id, table_type,
-                                journal, 'append_item', row=row_id,
-                                field=field_name, value='')
-            new_view = _recompute(state, journal)
-            session.mark_edited()
-            await SessionManager.save_session(session)
+                                journal, 'append_item', row=request.row_id,
+                                field=field_name, value=request.new_value)
 
-        return {
-            "success": True,
-            "new_item_id": new_item_id,
-            "row_id": row_id,
-            "table_type": table_type,
-            "row_html": new_view.row_html(row_id)
-        }
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Must provide either (row_id, field_name, new_value) or item_id"
-        )
+        session.mark_edited()
+        await SessionManager.save_session(session)
+
+    return {
+        "success": True,
+        "row_id": request.row_id,
+        "table_type": table_type
+    }
 
 
 @router.delete("/item")
@@ -962,13 +797,13 @@ async def delete_item(request: DeleteItemRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    table_type = _resolve_table_type(session, request.table_type)
+    table_type = resolve_table_type(session, request.table_type)
     row_id = _row_id_for_item(request.item_id)
     field_name = _field_for_item(request.item_id)
 
     async with document_cache.session_lock(request.session_id):
-        journal, view, state = await _load_view(request.session_id, session,
-                                                table_type)
+        journal, view, _state = await _load_view(request.session_id, session,
+                                                 table_type)
         bs, row = view.row_soup(row_id)
         if row is None:
             raise HTTPException(status_code=404,
@@ -978,25 +813,20 @@ async def delete_item(request: DeleteItemRequest):
             # lenient behaviour of remove_item).
             return {
                 "success": True,
-                "item_id": request.item_id,
                 "row_id": row_id,
-                "table_type": table_type,
-                "row_html": view.row_html(row_id)
+                "table_type": table_type
             }
 
         await _append_event(session, request.session_id, table_type,
                             journal, 'remove_item', row=row_id,
                             item=request.item_id, field=field_name)
-        new_view = _recompute(state, journal)
         session.mark_edited()
         await SessionManager.save_session(session)
 
     return {
         "success": True,
-        "item_id": request.item_id,
         "row_id": row_id,
-        "table_type": table_type,
-        "row_html": new_view.row_html(row_id)
+        "table_type": table_type
     }
 
 
@@ -1007,14 +837,14 @@ async def delete_row(request: DeleteRowRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    table_type = _resolve_table_type(session, request.table_type)
+    table_type = resolve_table_type(session, request.table_type)
     async with document_cache.session_lock(request.session_id):
-        journal, view, state = await _load_view(request.session_id, session,
-                                                table_type)
+        journal, view, _state = await _load_view(request.session_id, session,
+                                                 table_type)
         if request.row_id not in view.row_ids:
             # Already gone — success no-op.
             return {"success": True, "row_id": request.row_id,
-                    "table_type": table_type, "removed": False}
+                    "table_type": table_type}
 
         await _append_event(session, request.session_id, table_type,
                             journal, 'delete_row', row=request.row_id)
@@ -1022,7 +852,7 @@ async def delete_row(request: DeleteRowRequest):
         await SessionManager.save_session(session)
 
     return {"success": True, "row_id": request.row_id,
-            "table_type": table_type, "removed": True}
+            "table_type": table_type}
 
 
 @router.post("/row/add")
@@ -1032,7 +862,7 @@ async def add_row(request: AddRowRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    table_type = _resolve_table_type(session, request.table_type)
+    table_type = resolve_table_type(session, request.table_type)
     async with document_cache.session_lock(request.session_id):
         journal, view, state = await _load_view(request.session_id, session,
                                                 table_type)
@@ -1047,15 +877,13 @@ async def add_row(request: AddRowRequest):
             reserved_rows={ev['row'] for ev in journal.events})
         await _append_event(session, request.session_id, table_type,
                             journal, 'add_row', row=new_row_id)
-        new_view = _recompute(state, journal)
         session.mark_edited()
         await SessionManager.save_session(session)
 
     return {
         "success": True,
         "row_id": new_row_id,
-        "table_type": table_type,
-        "row_html": new_view.row_html(new_row_id)
+        "table_type": table_type
     }
 
 
@@ -1066,12 +894,12 @@ async def clear_cell_route(request: ClearCellRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    table_type = _resolve_table_type(session, request.table_type)
+    table_type = resolve_table_type(session, request.table_type)
     async with document_cache.session_lock(request.session_id):
-        journal, view, state = await _load_view(request.session_id, session,
-                                                table_type)
+        journal, view, _state = await _load_view(request.session_id, session,
+                                                 table_type)
         bs, row = view.row_soup(request.row_id)
-        if row is None or HTMLParser._get_cell_in_row(row, request.field_name) is None:
+        if row is None or HTMLParser.get_cell_in_row(row, request.field_name) is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"Cell '{request.field_name}' not found in row '{request.row_id}'"
@@ -1080,17 +908,13 @@ async def clear_cell_route(request: ClearCellRequest):
         await _append_event(session, request.session_id, table_type,
                             journal, 'clear_cell', row=request.row_id,
                             field=request.field_name)
-        new_view = _recompute(state, journal)
         session.mark_edited()
         await SessionManager.save_session(session)
 
-    new_item_id = f"{request.row_id[3:]}-{request.field_name}-0"
     return {
         "success": True,
-        "new_item_id": new_item_id,
         "row_id": request.row_id,
-        "table_type": table_type,
-        "row_html": new_view.row_html(request.row_id)
+        "table_type": table_type
     }
 
 
@@ -1106,7 +930,7 @@ async def get_undo_state(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
     async with document_cache.session_lock(session_id):
         tables = {}
-        for tt in _session_table_types(session):
+        for tt in session_table_types(session):
             journal, _view, _state = await _load_view(session_id, session, tt)
             tables[tt] = {"can_undo": journal.can_undo,
                           "can_redo": journal.can_redo}
@@ -1115,24 +939,18 @@ async def get_undo_state(session_id: str):
             "can_redo": any(t["can_redo"] for t in tables.values())}
 
 
-def _undo_order_key(ev: dict, table_type: str) -> tuple:
-    """Sort key for the session-wide undo stack (chronological by gseq;
-    pre-gseq legacy events fall back to 0 — those histories are
-    single-journal, so journal order is their chronological order)."""
-    return (ev.get('gseq', 0), table_type)
-
-
 @router.post("/undo")
 async def undo(request: UndoRedoRequest):
     """Undo the most recent mutation across BOTH tables: move the cursor of
-    whichever journal holds the chronologically last applied event."""
+    whichever journal holds the chronologically last applied event (ordered
+    by each event's ``gseq`` stamp)."""
     session = await SessionManager.load_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
     async with document_cache.session_lock(request.session_id):
         journals = {}
-        for tt in _session_table_types(session):
+        for tt in session_table_types(session):
             journals[tt] = await _load_view(request.session_id, session, tt)
 
         target_tt = None
@@ -1141,41 +959,33 @@ async def undo(request: UndoRedoRequest):
             applied = journal.applied_events
             if not applied:
                 continue
-            key = _undo_order_key(applied[-1], tt)
+            key = (applied[-1]['gseq'], tt)
             if target_key is None or key > target_key:
                 target_tt, target_key = tt, key
 
         if target_tt is None:
-            return {"success": False, "message": "Nothing to undo",
-                    "can_undo": False,
-                    "can_redo": any(j.can_redo for j, _v, _s in
-                                    journals.values())}
+            return {"success": False, "message": "Nothing to undo"}
 
-        journal, _view, state = journals[target_tt]
+        journal, _view, _state = journals[target_tt]
         ev = await journal.undo()
-        new_view = _recompute(state, journal)
-        payload = _patch_payload(ev, new_view, journal)
         session.mark_edited()
         await SessionManager.save_session(session)
-        can_undo = any(j.can_undo for j, _v, _s in journals.values())
-        can_redo = any(j.can_redo for j, _v, _s in journals.values())
 
-    return {"success": True, "table_type": target_tt,
-            "can_undo": can_undo, "can_redo": can_redo, **payload}
+    return {"success": True, "table_type": target_tt, "row_id": ev['row']}
 
 
 @router.post("/redo")
 async def redo(request: UndoRedoRequest):
     """Redo the oldest undone mutation across BOTH tables: move the cursor
     of whichever journal holds the chronologically first event in a redo
-    tail."""
+    tail (ordered by each event's ``gseq`` stamp)."""
     session = await SessionManager.load_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
     async with document_cache.session_lock(request.session_id):
         journals = {}
-        for tt in _session_table_types(session):
+        for tt in session_table_types(session):
             journals[tt] = await _load_view(request.session_id, session, tt)
 
         target_tt = None
@@ -1184,43 +994,19 @@ async def redo(request: UndoRedoRequest):
             tail = journal.events[journal.cursor:]
             if not tail:
                 continue
-            key = _undo_order_key(tail[0], tt)
+            key = (tail[0]['gseq'], tt)
             if target_key is None or key < target_key:
                 target_tt, target_key = tt, key
 
         if target_tt is None:
-            return {"success": False, "message": "Nothing to redo",
-                    "can_undo": any(j.can_undo for j, _v, _s in
-                                    journals.values()),
-                    "can_redo": False}
+            return {"success": False, "message": "Nothing to redo"}
 
-        journal, _view, state = journals[target_tt]
+        journal, _view, _state = journals[target_tt]
         ev = await journal.redo()
-        new_view = _recompute(state, journal)
-        payload = _patch_payload(ev, new_view, journal)
         session.mark_edited()
         await SessionManager.save_session(session)
-        can_undo = any(j.can_undo for j, _v, _s in journals.values())
-        can_redo = any(j.can_redo for j, _v, _s in journals.values())
 
-    return {"success": True, "table_type": target_tt,
-            "can_undo": can_undo, "can_redo": can_redo, **payload}
-
-
-def _patch_payload(ev: dict, view: TableView, journal: ChangeJournal) -> dict:
-    """Frontend patch descriptor for an undone/redone row event."""
-    rid = ev['row']
-    if ev['op'] in ('add_row', 'delete_row'):
-        mode = 'insert' if rid in view.row_ids else 'remove'
-    else:
-        mode = 'replace'
-    payload = {"mode": mode, "row_id": rid}
-    if mode == 'replace':
-        payload["row_html"] = view.row_html(rid)
-    elif mode == 'insert':
-        payload["row_html"] = view.row_html(rid)
-        payload["insert_before_row_id"] = view.next_row_id_after(rid)
-    return payload
+    return {"success": True, "table_type": target_tt, "row_id": ev['row']}
 
 
 # ---------------------------------------------------------------------------
@@ -1231,31 +1017,19 @@ def _patch_payload(ev: dict, view: TableView, journal: ChangeJournal) -> dict:
 async def commit(request: CommitRequest):
     """
     Save: materialize the current view (baseline + events ≤ cursor) of every
-    uploaded table into its table file, and refresh the composed display for
-    paired sessions.  Journals and undo history are preserved — undo still
-    steps back past the save.
+    uploaded table into its table file.  Journals and undo history are
+    preserved — undo still steps back past the save.
     """
     session = await SessionManager.load_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
     async with document_cache.session_lock(request.session_id):
-        views = {}
-        for tt in _session_table_types(session):
+        for tt in session_table_types(session):
             journal, view, _state = await _load_view(request.session_id,
                                                      session, tt)
             await SessionManager.save_html(request.session_id, view.html, tt)
             await journal.mark_saved()
-            views[tt] = view.html
-        if session.has_metadata and session.has_citations:
-            try:
-                display = compose_display(views['meta'], views['cits'])
-            except Exception:
-                # A fully-valid (table-less) side can lack the divs
-                # compose_display slices — fall back to the meta view alone.
-                display = views['meta']
-            await SessionManager.save_html(request.session_id, display,
-                                           'display')
 
     return {"success": True, "saved": True}
 
@@ -1292,12 +1066,12 @@ async def revalidate(request: RevalidateRequest):
                 # ── Paired re-validation ────────────────────────────────────
                 journal, meta_view, meta_state = await _load_view(
                     request.session_id, session, 'meta')
-                meta_rows = (meta_view.rows_for_export()
+                meta_rows = (await asyncio.to_thread(meta_view.rows_for_export)
                              if meta_state['artifacts'].get('has_table') else None)
 
                 cits_journal, cits_view, cits_state = await _load_view(
                     request.session_id, session, 'cits')
-                cits_rows = (cits_view.rows_for_export()
+                cits_rows = (await asyncio.to_thread(cits_view.rows_for_export)
                              if cits_state['artifacts'].get('has_table') else None)
 
                 if meta_rows is not None and not meta_rows:
@@ -1333,30 +1107,27 @@ async def revalidate(request: RevalidateRequest):
                         verify_id_existence=verify_id
                     )
 
-                meta_table_path = session_dir / 'meta_table.html'
-                cits_table_path = session_dir / 'cits_table.html'
-                await asyncio.to_thread(_generate_html, str(temp_meta_csv),
-                                        meta_report_path, str(meta_table_path),
-                                        meta_is_valid, 'Metadata')
-                await asyncio.to_thread(_generate_html, str(temp_cits_csv),
-                                        cits_report_path, str(cits_table_path),
-                                        cits_is_valid, 'Citations')
-
-                with open(meta_table_path, 'r', encoding='utf-8', newline='') as f:
+                # Regenerate each table via a temp file, read it back once,
+                # then atomically into its commit artifact + baseline.
+                temp_meta_html = session_dir / 'temp_meta_revalidate.html'
+                temp_cits_html = session_dir / 'temp_cits_revalidate.html'
+                await asyncio.to_thread(ValidatorService.generate_table_html,
+                                        str(temp_meta_csv), meta_report_path,
+                                        str(temp_meta_html), meta_is_valid,
+                                        'Metadata')
+                await asyncio.to_thread(ValidatorService.generate_table_html,
+                                        str(temp_cits_csv), cits_report_path,
+                                        str(temp_cits_html), cits_is_valid,
+                                        'Citations')
+                with open(temp_meta_html, 'r', encoding='utf-8', newline='') as f:
                     new_meta_html = f.read()
-                with open(cits_table_path, 'r', encoding='utf-8', newline='') as f:
+                with open(temp_cits_html, 'r', encoding='utf-8', newline='') as f:
                     new_cits_html = f.read()
+                temp_meta_html.unlink(missing_ok=True)
+                temp_cits_html.unlink(missing_ok=True)
 
                 await SessionManager.save_html(request.session_id, new_meta_html, 'meta')
                 await SessionManager.save_html(request.session_id, new_cits_html, 'cits')
-
-                merged_path = session_dir / 'meta_html.html'
-                await asyncio.to_thread(merge_html_files, str(meta_table_path),
-                                        str(cits_table_path), str(merged_path))
-                with open(merged_path, 'r', encoding='utf-8', newline='') as f:
-                    merged_content = f.read()
-                await SessionManager.save_html(request.session_id, merged_content, 'display')
-
                 await SessionManager.save_baseline_snapshot(
                     request.session_id, new_meta_html, 'meta')
                 await SessionManager.save_baseline_snapshot(
@@ -1368,8 +1139,10 @@ async def revalidate(request: RevalidateRequest):
 
                 session.meta_report_path = meta_report_path
                 session.cits_report_path = cits_report_path
-                total_error_count = (len(load_jsonl_report(meta_report_path))
-                                     + len(load_jsonl_report(cits_report_path)))
+                total_error_count = (
+                    len(await asyncio.to_thread(load_jsonl_report, meta_report_path))
+                    + len(await asyncio.to_thread(load_jsonl_report,
+                                                  cits_report_path)))
 
                 if temp_meta_csv.name.startswith('temp_'):
                     temp_meta_csv.unlink(missing_ok=True)
@@ -1378,9 +1151,9 @@ async def revalidate(request: RevalidateRequest):
 
             else:
                 # ── Single-table re-validation ──────────────────────────────
-                table_type = _editable_table_type(session)
+                table_type = editable_table_type(session)
                 journal, view, state = await _load_view(request.session_id, session)
-                rows_data = (view.rows_for_export()
+                rows_data = (await asyncio.to_thread(view.rows_for_export)
                              if state['artifacts'].get('has_table') else None)
                 if rows_data is not None and not rows_data:
                     raise ValueError("No data found in HTML table")
@@ -1401,16 +1174,18 @@ async def revalidate(request: RevalidateRequest):
                     ValidatorService.validate_single,
                     csv_path=str(temp_csv_path),
                     output_dir=str(session_dir),
-                    verify_id_existence=verify_id
+                    verify_id_existence=verify_id,
+                    expected_type='meta_csv' if table_type == 'meta' else 'cits_csv'
                 )
 
                 temp_html_path = session_dir / 'temp_revalidate.html'
                 await asyncio.to_thread(
-                    _generate_html, str(temp_csv_path), report_path,
-                    str(temp_html_path), is_valid,
+                    ValidatorService.generate_table_html, str(temp_csv_path),
+                    report_path, str(temp_html_path), is_valid,
                     'Metadata' if table_type == 'meta' else 'Citations')
                 with open(temp_html_path, 'r', encoding='utf-8', newline='') as f:
                     new_html = f.read()
+                temp_html_path.unlink(missing_ok=True)
 
                 await SessionManager.save_html(request.session_id, new_html, table_type)
                 await SessionManager.save_baseline_snapshot(
@@ -1423,13 +1198,11 @@ async def revalidate(request: RevalidateRequest):
                     session.meta_report_path = report_path
                 else:
                     session.cits_report_path = report_path
-                total_error_count = len(load_jsonl_report(report_path))
+                total_error_count = len(
+                    await asyncio.to_thread(load_jsonl_report, report_path))
 
                 if temp_csv_path.name.startswith('temp_'):
                     temp_csv_path.unlink(missing_ok=True)
-                temp_html_path.unlink(missing_ok=True)
-
-            _cleanup_legacy_state_files(request.session_id)
 
             session.mark_validated()
             session.verify_id_existence = verify_id
@@ -1437,12 +1210,15 @@ async def revalidate(request: RevalidateRequest):
 
             return {
                 "success": True,
-                "error_count": total_error_count,
-                "html_updated": True
+                "error_count": total_error_count
             }
 
         except HTTPException:
             raise
+        except TableNotMatchingInstance as e:
+            # Defensive: revalidate data comes from the session's own table,
+            # so a type mismatch should never happen — surface it as 400.
+            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1465,7 +1241,7 @@ async def get_session(session_id: str):
         unsaved = False
         can_undo = False
         can_redo = False
-        for tt in _session_table_types(session):
+        for tt in session_table_types(session):
             journal, view, _state = await _load_view(session_id, session, tt)
             edited_count += len(view.edited_item_ids)
             unsaved = unsaved or journal.has_unsaved_changes

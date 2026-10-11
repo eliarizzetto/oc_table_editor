@@ -13,7 +13,7 @@
 <div class="row">
     <!-- Sidebar controls -->
     <div class="col-md-2 sidebar-container" id="sidebarContainer">
-        <div id="sidebarContent">
+        <div>
         <div class="sidebar-head">
             <span class="sidebar-head-title">Tools</span>
             <button type="button" class="btn btn-sm btn-outline-secondary" id="sidebarToggle"
@@ -25,6 +25,13 @@
             </div>
             <div class="card-body p-2">
                 <div class="d-grid gap-2">
+                    <div class="form-check text-start mb-0">
+                        <input class="form-check-input" type="checkbox" id="verifyIdExistenceChk">
+                        <label class="form-check-label small" for="verifyIdExistenceChk"
+                               title="Check if IDs exist in external databases (OpenCitations APIs). Slower and requires internet access.">
+                            Verify ID existence <span class="text-muted">(slower, internet)</span>
+                        </label>
+                    </div>
                     <button class="btn btn-primary btn-sm" id="revalidateBtn">
                         <span class="spinner-border spinner-border-sm d-none" role="status"></span>
                         Re-Validate
@@ -72,10 +79,10 @@
                             id="renameSessionBtn" title="Rename this session"
                             aria-label="Rename session">✏️</button>
                 </p>
-                <p class="mb-1 small"><strong>Session:</strong> <span id="sessionId">{{ session_id[:8] }}</span></p>
+                <p class="mb-1 small"><strong>Session:</strong> <span>{{ session_id[:8] }}</span></p>
                 <p class="mb-1 small"><strong>Edited Items:</strong> <span id="editedCount">0</span></p>
-                <p class="mb-1 small" id="editedSinceValContainer">
-                    <strong>Edits Since Validation:</strong> 
+                <p class="mb-1 small">
+                    <strong>Edits Since Validation:</strong>
                     <span id="editedSinceVal">No</span>
                 </p>
                 <p class="mb-1 small"><strong>Last Validated:</strong> <span id="lastValidated">-</span></p>
@@ -224,6 +231,8 @@
 {% endblock %}
 
 {% block extra_js %}
+<!-- Editor-page JS (loaded here only: index/error pages don't use it) -->
+<script src="{{ url_for('static', path='/js/editor.js') }}?v=9"></script>
 <script>
 // Make sessionId globally accessible for editor.js
 window.currentSessionId = '{{ session_id }}';
@@ -266,10 +275,13 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // ── Keyboard shortcuts ──────────────────────────────────────────────────
     // Only intercept when no text-input / textarea has focus (so that the
-    // browser's native Ctrl+Z inside the modal text box keeps working).
+    // browser's native Ctrl+Z inside the modal text box keeps working) and
+    // no modal is open (a global undo under an open modal would leave the
+    // modal's stale item id as the save target).
     document.addEventListener('keydown', function(e) {
         const tag = document.activeElement && document.activeElement.tagName;
         if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+        if (document.querySelector('.modal.show')) return;
 
         if (e.ctrlKey && !e.shiftKey && e.key === 'z') {
             e.preventDefault();
@@ -307,6 +319,8 @@ async function loadSessionInfo() {
             document.getElementById('lastValidated').textContent = data.last_validated_at
                 ? new Date(data.last_validated_at).toLocaleString()
                 : '-';
+            const verifyChk = document.getElementById('verifyIdExistenceChk');
+            if (verifyChk) verifyChk.checked = !!data.verify_id_existence;
             const unsavedEl = document.getElementById('unsavedBadge');
             if (data.unsaved_changes) unsavedEl.classList.remove('d-none');
             else unsavedEl.classList.add('d-none');
@@ -394,9 +408,7 @@ function enhanceRow(tr) {
     // 3. Clear-cell and add-item buttons per cell
     tr.querySelectorAll('td.field-value').forEach(cell => {
         if (cell.querySelector('.clear-cell-btn')) return; // already enhanced
-        const classes = Array.from(cell.classList);
-        const fvIdx = classes.indexOf('field-value');
-        const fieldName = (fvIdx >= 0 && fvIdx + 1 < classes.length) ? classes[fvIdx + 1] : null;
+        const fieldName = fieldNameFromCell(cell);
         if (!fieldName) return;
 
         // "🧹 clear" button — revealed on cell hover via CSS
@@ -450,10 +462,6 @@ function disposePopoversIn(el) {
     if (!el) return;
     el.querySelectorAll('[data-bs-toggle="popover"]').forEach(pEl => {
         const inst = bootstrap.Popover.getInstance(pEl);
-        if (inst) inst.dispose();
-    });
-    el.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(tEl => {
-        const inst = bootstrap.Tooltip.getInstance(tEl);
         if (inst) inst.dispose();
     });
 }
@@ -654,13 +662,15 @@ async function revalidate() {
     spinner.classList.remove('d-none');
     
     try {
+        const verifyChk = document.getElementById('verifyIdExistenceChk');
         const response = await fetch('/api/edit/revalidate', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                session_id: sessionId
+                session_id: sessionId,
+                verify_id_existence: verifyChk ? verifyChk.checked : undefined
             })
         });
         

@@ -2,13 +2,13 @@
 import json
 from os.path import abspath, dirname, join
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple
 
 from jinja2 import Environment, FileSystemLoader
 
 from oc_validator.helper import CSVStreamReader
 from oc_validator.interface import gui as oc_gui
-from oc_validator.main import Validator, ClosureValidator
+from oc_validator.main import Validator, ClosureValidator, TableNotMatchingInstance
 from oc_validator.table_reader import CitationsRow, MetadataRow
 
 from services.html_parser import HTMLParser  # noqa: used for ITEM_SEPARATORS
@@ -41,6 +41,34 @@ class ValidatorService:
     """Wrapper service for oc_validator functionality."""
 
     @staticmethod
+    def generate_table_html(csv_fp: str, report_fp: str, out_fp: str,
+                            is_valid: bool, table_label: str = 'Metadata') -> None:
+        """
+        Generate the HTML visualisation for a validated CSV table.
+
+        Wraps ``make_gui`` but safely handles the zero-errors case: when the
+        validation report is empty ``make_gui`` crashes (it tries to open
+        ``valid_page.html`` via a bare relative path that does not exist in
+        this project's working directory).  We detect this and delegate to
+        :meth:`make_valid_table_html` instead, which renders the same
+        editable table (with zero issue icons), so valid tables stay
+        editable.  **Every route that builds HTML from a report must go
+        through this wrapper, never ``make_gui`` directly.**
+
+        Args:
+            csv_fp:      Path to the original CSV file.
+            report_fp:   Path to the JSON-Lines validation report.
+            out_fp:      Destination HTML file path.
+            is_valid:    Whether the validation passed (True = empty report).
+            table_label: Table type for the header ('Metadata'/'Citations'),
+                         used only on the zero-errors path.
+        """
+        if is_valid:
+            ValidatorService.make_valid_table_html(out_fp, csv_fp, table_label)
+        else:
+            oc_gui.make_gui(csv_fp, report_fp, out_fp)
+
+    @staticmethod
     def _make_no_errors_html(out_fp: str, csv_path: str,
                              table_label: str = 'Metadata') -> None:
         """
@@ -68,7 +96,7 @@ class ValidatorService:
             '</head><body>'
             '<div class="container-fluid general-info table-stats">'
             f'<h4>{table_label}</h4>'
-            f'<p class="table-stats-line">Errors: 0 | Warnings: 0 | Invalid rows: 0 | Total rows: {total_rows}</p>'
+            f'<p class="table-stats-line">Issues: 0 (errors: 0; warnings: 0) | Invalid rows: 0 | Total rows: {total_rows}</p>'
             f'<p class="text-success mb-0"><strong>✓ No issues found in <em>{filename}</em>.</strong></p>'
             '</div>'
             '<div class="table-container container-fluid"></div>'
@@ -141,7 +169,8 @@ class ValidatorService:
             f.write(html_output)
 
     @staticmethod
-    def validate_single(csv_path: str, output_dir: str, verify_id_existence: bool = False) -> Tuple[bool, str]:
+    def validate_single(csv_path: str, output_dir: str, verify_id_existence: bool = False,
+                        expected_type: str = None) -> Tuple[bool, str]:
         """
         Validate a single CSV file (metadata OR citations — auto-detected).
 
@@ -149,6 +178,11 @@ class ValidatorService:
             csv_path:            Path to the CSV file.
             output_dir:          Directory to store validation output.
             verify_id_existence: Whether to check ID existence via external APIs.
+            expected_type:       Optional ``'meta_csv'``/``'cits_csv'`` — when
+                                 given, a table detected as the other type raises
+                                 ``TableNotMatchingInstance`` (the same error
+                                 ``ClosureValidator`` raises in paired mode)
+                                 *before* validation runs.
 
         Returns:
             Tuple of (is_valid, report_jsonl_path).
@@ -159,13 +193,16 @@ class ValidatorService:
             use_meta_endpoint=False,
             verify_id_existence=verify_id_existence
         )
+        if expected_type is not None and validator.table_to_process != expected_type:
+            raise TableNotMatchingInstance(
+                csv_path, validator.table_to_process, expected_type)
         is_valid = validator.validate()
         return is_valid, validator.output_fp_json
 
     @staticmethod
     def validate_metadata(csv_path: str, output_dir: str, verify_id_existence: bool = False) -> Tuple[bool, str]:
         """
-        Validate a metadata CSV file.
+        Validate a metadata CSV file (a citations-shaped table is rejected).
 
         Args:
             csv_path:            Path to the metadata CSV file.
@@ -175,12 +212,14 @@ class ValidatorService:
         Returns:
             Tuple of (is_valid, report_jsonl_path).
         """
-        return ValidatorService.validate_single(csv_path, output_dir, verify_id_existence)
+        return ValidatorService.validate_single(csv_path, output_dir,
+                                                verify_id_existence,
+                                                expected_type='meta_csv')
 
     @staticmethod
     def validate_citations(csv_path: str, output_dir: str, verify_id_existence: bool = False) -> Tuple[bool, str]:
         """
-        Validate a citations CSV file.
+        Validate a citations CSV file (a metadata-shaped table is rejected).
 
         Args:
             csv_path:            Path to the citations CSV file.
@@ -190,7 +229,9 @@ class ValidatorService:
         Returns:
             Tuple of (is_valid, report_jsonl_path).
         """
-        return ValidatorService.validate_single(csv_path, output_dir, verify_id_existence)
+        return ValidatorService.validate_single(csv_path, output_dir,
+                                                verify_id_existence,
+                                                expected_type='cits_csv')
 
     @staticmethod
     def validate_pair(

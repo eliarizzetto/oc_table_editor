@@ -9,8 +9,8 @@ from io import StringIO
 
 from services import SessionManager, CSVExporter
 from services.session_document import document_cache
+from services.table_scope import resolve_table_type
 from services.view_builder import load_journal_view
-from models import Session
 
 router = APIRouter()
 
@@ -47,16 +47,7 @@ async def export_csv(request: ExportRequest):
 
     # Determine the table to export (both tables of a paired session are
     # independently editable and exportable).
-    table_type = request.table_type or ('meta' if session.has_metadata
-                                        else 'cits')
-    if table_type not in ('meta', 'cits'):
-        raise HTTPException(status_code=422,
-                            detail=f"Invalid table_type '{table_type}' "
-                                   f"(expected 'meta' or 'cits')")
-    if (table_type == 'meta' and not session.has_metadata) or \
-            (table_type == 'cits' and not session.has_citations):
-        raise HTTPException(status_code=404,
-                            detail=f"Table '{table_type}' not in this session")
+    table_type = resolve_table_type(session, request.table_type)
 
     # Rows come from the journal replay (baseline + events) — no HTML parsing.
     async with document_cache.session_lock(request.session_id):

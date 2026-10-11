@@ -7,7 +7,6 @@ source of truth for edits, additions, deletions, and undo history.
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
-import json
 
 
 @dataclass
@@ -20,20 +19,17 @@ class Session:
     draft_name: Optional[str] = None   # user-assigned display name
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     last_updated: str = field(default_factory=lambda: datetime.now().isoformat())
-    
+
     # File paths
     meta_csv_path: Optional[str] = None
     cits_csv_path: Optional[str] = None
     meta_report_path: Optional[str] = None
     cits_report_path: Optional[str] = None
-    meta_html_path: Optional[str] = None
-    cits_html_path: Optional[str] = None
-    edit_state_path: Optional[str] = None
-    
+
     # Validation status
     last_validated_at: Optional[str] = None
     has_edits_since_validation: bool = False
-    
+
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -48,13 +44,10 @@ class Session:
             'cits_csv_path': self.cits_csv_path,
             'meta_report_path': self.meta_report_path,
             'cits_report_path': self.cits_report_path,
-            'meta_html_path': self.meta_html_path,
-            'cits_html_path': self.cits_html_path,
-            'edit_state_path': self.edit_state_path,
             'last_validated_at': self.last_validated_at,
             'has_edits_since_validation': self.has_edits_since_validation
         }
-    
+
     @classmethod
     def from_dict(cls, data: dict) -> 'Session':
         """Create instance from dictionary."""
@@ -70,9 +63,6 @@ class Session:
             cits_csv_path=data.get('cits_csv_path'),
             meta_report_path=data.get('meta_report_path'),
             cits_report_path=data.get('cits_report_path'),
-            meta_html_path=data.get('meta_html_path'),
-            cits_html_path=data.get('cits_html_path'),
-            edit_state_path=data.get('edit_state_path'),
             last_validated_at=data.get('last_validated_at'),
             has_edits_since_validation=data.get('has_edits_since_validation', False)
         )

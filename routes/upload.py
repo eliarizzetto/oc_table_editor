@@ -1,15 +1,16 @@
 """Upload and validation routes."""
+from pathlib import Path
+
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from typing import Optional
 
 from services import ValidatorService, SessionManager
 from services.journal import ChangeJournal
+from services.session_document import document_cache
 from services.view_builder import build_generation_artifacts
 from models import Session
-from config import MAX_UPLOAD_SIZE, DEFAULT_VERIFY_ID_EXISTENCE
-
-# Import oc_validator interface for HTML generation and merging
-from oc_validator.interface.gui import make_gui, merge_html_files
+from config import MAX_UPLOAD_SIZE, DEFAULT_VERIFY_ID_EXISTENCE, MAX_DRAFT_NAME_LEN
+from oc_validator.main import TableNotMatchingInstance
 
 router = APIRouter()
 
@@ -30,33 +31,6 @@ def _check_csv_header(filename: str, content: bytes) -> None:
                    f"rendered in the editor ({', '.join(bad)}). "
                    f"Please fix the header row."
         )
-
-
-def _generate_html(csv_fp: str, report_fp: str, out_fp: str, is_valid: bool,
-                   table_label: str = 'Metadata') -> None:
-    """
-    Generate an HTML visualisation for a validated CSV table.
-
-    Wraps ``make_gui`` but safely handles the zero-errors case:  when the
-    validation report is empty, ``make_gui`` crashes because it tries to open
-    ``'valid_page.html'`` via a bare relative path that does not exist in the
-    oc_table_editor working directory.  We detect this case and delegate to
-    ``ValidatorService.make_valid_table_html`` instead, which renders the
-    same editable table (with zero issue icons), so valid tables stay
-    editable.
-
-    Args:
-        csv_fp:      Path to the original CSV file.
-        report_fp:   Path to the JSON-Lines validation report.
-        out_fp:      Destination HTML file path.
-        is_valid:    Whether the validation passed (True = no errors).
-        table_label: Table type for the header ('Metadata'/'Citations'),
-                     used only on the zero-errors path.
-    """
-    if is_valid:
-        ValidatorService.make_valid_table_html(out_fp, csv_fp, table_label)
-    else:
-        make_gui(csv_fp, report_fp, out_fp)
 
 
 @router.post("/")
@@ -107,9 +81,10 @@ async def upload_files(
 
     # Optional user-assigned name (shown in the saved-drafts list; renamable)
     clean_name = (draft_name or '').strip()
-    if len(clean_name) > 120:
-        raise HTTPException(status_code=400,
-                            detail="Session name must be at most 120 characters")
+    if len(clean_name) > MAX_DRAFT_NAME_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Session name must be at most {MAX_DRAFT_NAME_LEN} characters")
 
     # ── session creation ──────────────────────────────────────────────────────
     session_id = SessionManager.create_session_id()
@@ -124,22 +99,31 @@ async def upload_files(
     )
 
     # ── save uploaded files ───────────────────────────────────────────────────
+    # Names are kept (sanitized to their final path component by
+    # ``save_uploaded_file``); when both uploads share a filename the
+    # citations copy is prefixed so it cannot overwrite the metadata one.
+    meta_filename = metadata_file.filename or 'metadata.csv' if has_metadata else None
+    cits_filename = citations_file.filename or 'citations.csv' if has_citations else None
+    if meta_filename and cits_filename \
+            and Path(meta_filename).name == Path(cits_filename).name:
+        cits_filename = 'cits_' + Path(cits_filename).name
+
     if has_metadata:
-        filename = metadata_file.filename or 'metadata.csv'
         meta_content = await metadata_file.read()
         if not meta_content:
             raise HTTPException(status_code=400, detail="Metadata file is empty.")
-        _check_csv_header(filename, meta_content)
-        meta_path = await SessionManager.save_uploaded_file(session_id, meta_content, filename)
+        _check_csv_header(meta_filename, meta_content)
+        meta_path = await SessionManager.save_uploaded_file(
+            session_id, meta_content, meta_filename, fallback='metadata.csv')
         session.meta_csv_path = meta_path
 
     if has_citations:
-        filename = citations_file.filename or 'citations.csv'
         cits_content = await citations_file.read()
         if not cits_content:
             raise HTTPException(status_code=400, detail="Citations file is empty.")
-        _check_csv_header(filename, cits_content)
-        cits_path = await SessionManager.save_uploaded_file(session_id, cits_content, filename)
+        _check_csv_header(cits_filename, cits_content)
+        cits_path = await SessionManager.save_uploaded_file(
+            session_id, cits_content, cits_filename, fallback='citations.csv')
         session.cits_csv_path = cits_path
 
     # ── validation + HTML generation ──────────────────────────────────────────
@@ -158,37 +142,22 @@ async def upload_files(
             session.meta_report_path = meta_report_path
             session.cits_report_path = cits_report_path
 
-            # Generate individual HTML tables (saved to meta_table.html /
-            # cits_table.html via table_type 'meta' / 'cits').
+            # Generate each table (meta_table.html / cits_table.html — the
+            # commit artifacts), then read back once for the baselines.
             meta_table_path = session_dir / 'meta_table.html'
             cits_table_path = session_dir / 'cits_table.html'
 
-            _generate_html(session.meta_csv_path, meta_report_path,
-                            str(meta_table_path), meta_is_valid, 'Metadata')
-            _generate_html(session.cits_csv_path, cits_report_path,
-                            str(cits_table_path), cits_is_valid, 'Citations')
+            ValidatorService.generate_table_html(
+                session.meta_csv_path, meta_report_path,
+                str(meta_table_path), meta_is_valid, 'Metadata')
+            ValidatorService.generate_table_html(
+                session.cits_csv_path, cits_report_path,
+                str(cits_table_path), cits_is_valid, 'Citations')
 
-            # Save individual tables through session manager (meta_table.html,
-            # cits_table.html) so that re-validation can parse them later.
             with open(meta_table_path, 'r', encoding='utf-8') as f:
                 meta_html_content = f.read()
             with open(cits_table_path, 'r', encoding='utf-8') as f:
                 cits_html_content = f.read()
-
-            await SessionManager.save_html(session_id, meta_html_content, 'meta')
-            await SessionManager.save_html(session_id, cits_html_content, 'cits')
-
-            # Merge the two individual HTMLs into a single display file
-            # (meta_html.html, table_type='display').
-            merged_path = session_dir / 'meta_html.html'
-            merge_html_files(str(meta_table_path), str(cits_table_path),
-                             str(merged_path))
-            with open(merged_path, 'r', encoding='utf-8') as f:
-                merged_content = f.read()
-            await SessionManager.save_html(session_id, merged_content, 'display')
-
-            session.meta_html_path = str(meta_table_path)
-            session.cits_html_path = str(cits_table_path)
 
             # Save baseline snapshots for deletion detection
             await SessionManager.save_baseline_snapshot(session_id, meta_html_content, 'meta')
@@ -205,14 +174,12 @@ async def upload_files(
             session.meta_report_path = meta_report_path
 
             meta_table_path = session_dir / 'meta_table.html'
-            _generate_html(session.meta_csv_path, meta_report_path,
-                            str(meta_table_path), meta_is_valid, 'Metadata')
+            ValidatorService.generate_table_html(
+                session.meta_csv_path, meta_report_path,
+                str(meta_table_path), meta_is_valid, 'Metadata')
 
             with open(meta_table_path, 'r', encoding='utf-8') as f:
                 meta_html_content = f.read()
-            await SessionManager.save_html(session_id, meta_html_content, 'meta')
-
-            session.meta_html_path = str(meta_table_path)
 
             # Save baseline snapshot for deletion detection
             await SessionManager.save_baseline_snapshot(session_id, meta_html_content, 'meta')
@@ -228,14 +195,12 @@ async def upload_files(
             session.cits_report_path = cits_report_path
 
             cits_table_path = session_dir / 'cits_table.html'
-            _generate_html(session.cits_csv_path, cits_report_path,
-                            str(cits_table_path), cits_is_valid, 'Citations')
+            ValidatorService.generate_table_html(
+                session.cits_csv_path, cits_report_path,
+                str(cits_table_path), cits_is_valid, 'Citations')
 
             with open(cits_table_path, 'r', encoding='utf-8') as f:
                 cits_html_content = f.read()
-            await SessionManager.save_html(session_id, cits_html_content, 'cits')
-
-            session.cits_html_path = str(cits_table_path)
 
             # Save baseline snapshot for deletion detection
             await SessionManager.save_baseline_snapshot(session_id, cits_html_content, 'cits')
@@ -258,14 +223,18 @@ async def upload_files(
 
         return {
             "session_id": session_id,
-            "has_metadata": session.has_metadata,
-            "has_citations": session.has_citations,
-            "verify_id_existence": verify_id_existence,
             "html_url": f"/editor/{session_id}"
         }
 
+    except TableNotMatchingInstance as e:
+        # A table uploaded through the wrong input (e.g. citations data as
+        # metadata): same error the paired ClosureValidator path raises.
+        async with document_cache.session_lock(session_id):
+            SessionManager.delete_session(session_id)
+        raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
-        SessionManager.delete_session(session_id)
+        async with document_cache.session_lock(session_id):
+            SessionManager.delete_session(session_id)
         import traceback
         traceback.print_exc()
         error_msg = str(e)
@@ -279,7 +248,8 @@ async def upload_files(
     except HTTPException:
         raise
     except Exception as e:
-        SessionManager.delete_session(session_id)
+        async with document_cache.session_lock(session_id):
+            SessionManager.delete_session(session_id)
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Validation failed: {str(e)}")

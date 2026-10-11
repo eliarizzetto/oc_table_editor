@@ -2,40 +2,34 @@
 from typing import Dict, List
 import csv
 from io import StringIO
-from oc_validator.helper import read_csv
 
 
 class CSVExporter:
     """Export HTML table data to CSV format."""
-    
+
     @staticmethod
-    def generate_csv(rows_data: List[Dict[str, List[str]]], table_type: str) -> str:
+    def generate_csv(rows_data: List[Dict[str, List[str]]]) -> str:
         """
-        Generate CSV string from parsed table data.
-        
+        Generate CSV string from parsed table data (comma-delimited fallback).
+
         Args:
             rows_data: List of dictionaries with field names as keys
                       and lists of items as values
-            table_type: 'meta' or 'cits'
-            
+
         Returns:
             CSV string
         """
         if not rows_data:
             return ""
-        
+
         # Get field names (preserve order from first row)
         fieldnames = list(rows_data[0].keys())
-        
-        # Detect CSV delimiter by checking original file structure
-        # For now, use comma as default
-        delimiter = ','
-        
+
         output = StringIO()
-        writer = csv.DictWriter(output, fieldnames=fieldnames, delimiter=delimiter)
-        
+        writer = csv.DictWriter(output, fieldnames=fieldnames, delimiter=',')
+
         writer.writeheader()
-        
+
         for row in rows_data:
             # Join items with appropriate separator.
             # Filter out blank items first so that emptied item-containers
@@ -51,55 +45,34 @@ class CSVExporter:
                 else:
                     # Single value fields
                     csv_row[field] = items[0] if items else ''
-            
+
             writer.writerow(csv_row)
-        
+
         return output.getvalue()
-    
-    @staticmethod
-    def get_delimiter(csv_content: str) -> str:
-        """
-        Detect CSV delimiter from content.
-        
-        Args:
-            csv_content: CSV string content
-            
-        Returns:
-            Detected delimiter (comma, semicolon, or tab)
-        """
-        # Try to detect delimiter
-        for delimiter in [',', ';', '\t']:
-            # Read first line and count delimiter occurrences
-            first_line = csv_content.split('\n')[0]
-            if first_line.count(delimiter) >= 1:
-                return delimiter
-        
-        # Default to comma
-        return ','
-    
+
     @staticmethod
     def rows_to_csv(rows_data: List[Dict[str, List[str]]], original_csv_path: str) -> str:
         """
         Generate CSV string using delimiter from original file.
-        
+
         Args:
             rows_data: List of dictionaries with field names as keys
                       and lists of items as values
             original_csv_path: Path to original CSV file to detect delimiter
-            
+
         Returns:
             CSV string
         """
         if not rows_data:
             return ""
-        
+
         # Read original file to detect delimiter
         from oc_validator.helper import read_csv
         original_data = read_csv(original_csv_path)
-        
+
         if not original_data:
             # Fallback to default
-            return CSVExporter.generate_csv(rows_data, 'meta')
+            return CSVExporter.generate_csv(rows_data)
         
         # Get delimiter from original file
         first_row_keys = list(original_data[0].keys())

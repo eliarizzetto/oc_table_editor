@@ -6,15 +6,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
-import aiofiles
 
-from config import (
-    SESSION_DIR,
-    SESSION_CLEANUP_INTERVAL,
-    SESSION_EXPIRY_HOURS,
-    MAX_UPLOAD_SIZE,
-    DEFAULT_VERIFY_ID_EXISTENCE
-)
+from config import SESSION_DIR, MAX_UPLOAD_SIZE, BASE_DIR
 from services import SessionManager
 from routes import router as api_router
 
@@ -26,7 +19,6 @@ async def lifespan(app: FastAPI):
     print("OC Table Editor starting up...")
     print(f"Session directory: {SESSION_DIR}")
     print(f"Upload size limit: {MAX_UPLOAD_SIZE / (1024*1024)} MB")
-    print(f"Session expiry: {SESSION_EXPIRY_HOURS} hours")
     yield
     # Shutdown
     print("OC Table Editor shutting down...")
@@ -46,11 +38,9 @@ app.add_middleware(GZipMiddleware, minimum_size=100_000, compresslevel=6)
 
 # Setup directories
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
-(Path(__file__).parent.parent / "oc_table_editor" / "static" / "css").mkdir(parents=True, exist_ok=True)
-(Path(__file__).parent.parent / "oc_table_editor" / "static" / "js").mkdir(parents=True, exist_ok=True)
 
 # Setup templates
-templates = Jinja2Templates(directory="templates")
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 # Mount static files
 static_dir = Path(__file__).parent / "static"
@@ -75,7 +65,9 @@ async def editor(request: Request, session_id: str):
         return templates.TemplateResponse(
             request,
             "error.html",
-            {"message": f"Session '{session_id}' not found or has expired."}
+            {"error": f"Session '{session_id}' not found or has expired.",
+             "referrer": request.headers.get("referer")},
+            status_code=404
         )
 
     return templates.TemplateResponse(
@@ -100,14 +92,14 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    
+
     print("=" * 60)
     print("OC Table Editor")
     print("=" * 60)
     print("Starting server on http://127.0.0.1:8000")
-    print("Press Ctrl+C to stop")
+    print("Press Ctrl+C to exit")
     print("=" * 60)
-    
+
     uvicorn.run(
         "main:app",
         host="127.0.0.1",

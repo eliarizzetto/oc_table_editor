@@ -28,10 +28,11 @@ from bs4 import BeautifulSoup
 
 from config import TEMP_DIR
 from services.html_parser import HTMLParser
-from services.session_document import (
-    SpliceError,
-    atomic_write,
-)
+from services.session_document import atomic_write
+
+
+class SpliceError(Exception):
+    """Raised when a row cannot be located in an HTML string."""
 
 # Matches <tr ... id="rowN" ...> regardless of attribute order
 _ROW_TAG_RE = re.compile(r'<tr[^>]*\sid="row(\d+)"')
@@ -212,8 +213,9 @@ async def load_journal_view(session_id: str, table_type: str):
 # ---------------------------------------------------------------------------
 
 def synthesize_row_html(row_id: str, headers: List[str]) -> str:
-    """Build the HTML of a newly added (empty) row — byte-identical in shape
-    to what ``HTMLParser.add_row_to_soup`` produces."""
+    """Build the HTML of a newly added (empty) row — one ``td.row-number``
+    cell plus one ``td.field-value {field}`` cell per header, each holding
+    a single empty ``item-container`` (the same shape ``make_gui`` emits)."""
     bs = BeautifulSoup('', 'html.parser')
     row_number = row_id[3:]
     tr = bs.new_tag('tr', attrs={'id': row_id})
@@ -281,10 +283,8 @@ class TableView:
             by_row.setdefault(ev['row'], []).append(ev)
 
         # Row existence is order-aware: a row is currently dead when its
-        # LAST add_row/delete_row event is a delete.  ``next_add_row_id``
-        # no longer re-issues used ids, but legacy journals can still
-        # hold a re-added id, so "any delete event exists" would wrongly
-        # kill the re-added row.
+        # LAST add_row/delete_row event is a delete — "any delete event
+        # exists" would also kill a row whose deletion was later undone.
         last_row_op: Dict[str, str] = {}
         for ev in events:
             if ev['op'] in ('add_row', 'delete_row'):
@@ -450,13 +450,6 @@ class TableView:
                 HTMLParser.clear_cell_in_soup(bs, row, ev['field'])
         return str(row)
 
-    def next_row_id_after(self, rid: str) -> Optional[str]:
-        try:
-            idx = self.row_ids.index(rid)
-        except ValueError:
-            return None
-        return self.row_ids[idx + 1] if idx + 1 < len(self.row_ids) else None
-
     def next_add_row_id(self, reserved_rows: Iterable[str] = ()) -> str:
         """Id for the next added row — one that has NEVER been used in this
         table.
@@ -479,8 +472,8 @@ class TableView:
         return f'row{(max(numbers) + 1) if numbers else 0}'
 
     def rows_for_export(self) -> List[Dict[str, List[str]]]:
-        """Rows as {field: [values]} in view order — the same shape
-        ``HTMLParser.parse_table`` produced (CSVExporter consumes it)."""
+        """Rows as {field: [values]} in view order — the row shape
+        ``CSVExporter.rows_to_csv`` consumes."""
         headers = self.artifacts['headers']
         out: List[Dict[str, List[str]]] = []
         for rid in self.row_ids:
@@ -571,7 +564,7 @@ class TableView:
             if len(parts) < 3 or not parts[0].isdigit():
                 continue
             field_name = '-'.join(parts[1:-1])
-            cell = HTMLParser._get_cell_in_row(row, field_name)
+            cell = HTMLParser.get_cell_in_row(row, field_name)
             if not cell:
                 continue
             ghost_item = HTMLParser.create_ghost_item_container(

@@ -38,7 +38,7 @@ class HTMLParser:
     # =====================================================================
 
     @staticmethod
-    def _get_cell_in_row(row: Tag, field_name: str) -> Optional[Tag]:
+    def get_cell_in_row(row: Tag, field_name: str) -> Optional[Tag]:
         """Locate a cell by its 'field-value {field_name}' class pair."""
         for td in row.find_all('td', class_='field-value'):
             if field_name in td.get('class', []):
@@ -78,7 +78,7 @@ class HTMLParser:
     @staticmethod
     def get_cell_state_in_row(row: Tag, field_name: str) -> tuple:
         """``(has_value, container_count)`` for a cell in a row."""
-        cell = HTMLParser._get_cell_in_row(row, field_name)
+        cell = HTMLParser.get_cell_in_row(row, field_name)
         if not cell:
             return False, 0
         containers = cell.find_all('span', class_='item-container', recursive=False)
@@ -96,7 +96,7 @@ class HTMLParser:
 
         Returns the new item id ('' when the cell does not exist).
         """
-        cell = HTMLParser._get_cell_in_row(row, field_name)
+        cell = HTMLParser.get_cell_in_row(row, field_name)
         if not cell:
             return ''
         for container in cell.find_all('span', class_='item-container'):
@@ -117,7 +117,7 @@ class HTMLParser:
         Deterministic from the row's current state, so the id computed at
         event-creation time and the id recomputed during replay always agree.
         """
-        cell = HTMLParser._get_cell_in_row(row, field_name)
+        cell = HTMLParser.get_cell_in_row(row, field_name)
         if not cell:
             return None
         containers = cell.find_all('span', class_='item-container', recursive=False)
@@ -135,7 +135,7 @@ class HTMLParser:
         """Append a new item-container to a cell (sep added to the previous
         last container).  The new index is ``max(numeric indices) + 1`` so
         ids stay unique after middle-item deletions."""
-        cell = HTMLParser._get_cell_in_row(row, field_name)
+        cell = HTMLParser.get_cell_in_row(row, field_name)
         if not cell:
             raise ValueError(f"Field '{field_name}' not found in row")
         containers = cell.find_all('span', class_='item-container', recursive=False)

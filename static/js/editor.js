@@ -177,8 +177,6 @@ async function renderView(opts = {}) {
             window.scrollTo(0, scrollY);
         } else if (opts.scrollToTable) {
             scrollToTableHeader(opts.scrollToTable, container);
-        } else if (opts.scrollToTop) {   // legacy alias: the primary table's header
-            scrollToTableHeader(primaryTable, container);
         }
     } catch (error) {
         if (seq !== renderSeq) return;
@@ -386,20 +384,16 @@ function setupTableDelegation() {
     }, 300);
     container.addEventListener('input', onSearchInput);
 
-    // Lazy popover/tooltip initialisation: construct the Bootstrap instance
-    // on first hover (and show it immediately, since the mouse is already
-    // over the element and the instance's own listeners start from the next
-    // hover cycle).
+    // Lazy popover initialisation: construct the Bootstrap instance on
+    // first hover (and show it immediately, since the mouse is already
+    // over the element and the instance's own listeners start from the
+    // next hover cycle).
     container.addEventListener('mouseover', function(e) {
-        const el = e.target.closest('[data-bs-toggle="popover"], [data-bs-toggle="tooltip"]');
+        const el = e.target.closest('[data-bs-toggle="popover"]');
         if (!el || el.dataset.lazyInit) return;
         el.dataset.lazyInit = '1';
-        if (el.getAttribute('data-bs-toggle') === 'popover') {
-            const popover = new bootstrap.Popover(el);
-            popover.show();
-        } else {
-            new bootstrap.Tooltip(el);
-        }
+        const popover = new bootstrap.Popover(el);
+        popover.show();
     });
 }
 
@@ -426,8 +420,7 @@ document.addEventListener('DOMContentLoaded', function() {
  *  of a paired session reuse the same row ids, so the scope disambiguates
  *  cell-display override keys). */
 function tableScope(table) {
-    return table.dataset.tableType
-        || (table.hasAttribute('data-editable') ? 'meta' : 'cits');
+    return table.dataset.tableType;
 }
 
 /** The mode a row currently uses: its override, else its table's mode. */
@@ -595,31 +588,19 @@ function resetCellDisplayOverrides() {
 
 // ── Issue-filtered view functionality ─────────────────────────────────────────
 
-/**
- * Bridge function called by onclick attributes on .issue-icon spans.
- * The oc_validator package generates onclick="highlightInvolvedElements(this)"
- * so we keep this function name but redirect to the filtered view behavior.
- * (The initBootstrapWidgets override above usually wins — this standalone
- * version is a fallback.)
- *
- * @param {HTMLElement} clickedIssue  The .issue-icon span that was clicked.
- */
-function highlightInvolvedElements(clickedIssue) {
-    const table = clickedIssue.closest('table[data-table-type]');
-    if (!table || !table.hasAttribute('data-editable')) return;
-    const issueId = clickedIssue.id;
-    if (!issueId) {
-        console.warn('Issue icon has no id attribute');
-        return;
-    }
-    loadFilteredTable(issueId, table.dataset.tableType);
+/** Snapshot of the view state restored on leaving a filtered view — the
+ *  page and both toggles only: the search query (``q``) deliberately stays
+ *  live, so text typed during a filtered view survives the exit. */
+function snapshotViewState(st) {
+    return { page: st.page, showAllRows: st.showAllRows,
+             changesOnly: st.changesOnly };
 }
 
 /**
  * Switch one table to the filtered view showing only rows involved in the
  * given issue (paginated).  That table's current view state (page + both
- * toggles) is saved and restored verbatim by exitFilteredViewAndReload();
- * the other table is unaffected.
+ * toggles) is saved and restored verbatim by exitFilteredView(); the other
+ * table is unaffected.
  *
  * @param {string} issueId    The issue ID (e.g., 'meta-0', 'cits-1')
  * @param {string} tableType  'meta' or 'cits'
@@ -635,7 +616,7 @@ async function loadFilteredTable(issueId, tableType = null) {
         await refreshView(null, tt);  // already filtering on this issue — refresh
         return;
     }
-    if (!filteredStates[tt]) savedStates[tt] = { ...tableStates[tt] };
+    if (!filteredStates[tt]) savedStates[tt] = snapshotViewState(tableStates[tt]);
     filteredStates[tt] = { issueId, page: 1, types: [] };
     await renderView({ scrollToTable: tt });
 }
@@ -655,17 +636,6 @@ function exitFilteredView(restore = true, tableType = null) {
             filteredStates[tt] = null;
         }
     }
-}
-
-/**
- * Exit filtered view and return to the exact view the user left (page
- * number + both toggle states).  The exit buttons are server-rendered with
- * each table's banner (delegated via [data-exit-filter]).
- */
-function exitFilteredViewAndReload(tableType = null) {
-    const tt = tableType || activeTable || primaryTable;
-    exitFilteredView(true, tt);
-    renderView({ scrollToTable: tt });
 }
 
 /**
@@ -689,7 +659,7 @@ function applyFacetFilter(tt) {
     if (!types.length) {
         exitFilteredView(true, tt);
     } else {
-        if (!filteredStates[tt]) savedStates[tt] = { ...tableStates[tt] };
+        if (!filteredStates[tt]) savedStates[tt] = snapshotViewState(tableStates[tt]);
         filteredStates[tt] = { issueId: null, page: 1, types };
     }
     renderView({ scrollToTable: tt });
@@ -698,36 +668,6 @@ function applyFacetFilter(tt) {
 
 // ── General utilities ─────────────────────────────────────────────────────────
 
-// Utility function to show alerts
-function showAlert(message, type = 'info', duration = 3000) {
-    const alertDiv = document.createElement('div');
-    alertDiv.className = `alert alert-${type} alert-dismissible fade show`;
-    alertDiv.setAttribute('role', 'alert');
-    alertDiv.innerHTML = `
-        ${message}
-        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-    `;
-
-    // Add to top of container
-    const container = document.querySelector('.container-fluid');
-    if (container) {
-        container.insertBefore(alertDiv, container.firstChild);
-    }
-
-    // Auto-dismiss
-    setTimeout(() => {
-        alertDiv.classList.remove('show');
-        setTimeout(() => alertDiv.remove(), 150);
-    }, duration);
-}
-
-// Format date for display
-function formatDate(dateString) {
-    if (!dateString) return '-';
-    const date = new Date(dateString);
-    return date.toLocaleString();
-}
-
 // Debounce function for performance
 function debounce(func, wait) {
     let timeout;
@@ -735,35 +675,5 @@ function debounce(func, wait) {
         const context = this;
         clearTimeout(timeout);
         timeout = setTimeout(() => func.apply(context, args), wait);
-    };
-}
-
-// Copy text to clipboard
-async function copyToClipboard(text) {
-    try {
-        await navigator.clipboard.writeText(text);
-        showAlert('Copied to clipboard!', 'success');
-    } catch (err) {
-        console.error('Failed to copy:', err);
-        showAlert('Failed to copy to clipboard', 'error');
-    }
-}
-
-// Export for use in other scripts
-if (typeof module !== 'undefined' && module.exports) {
-    module.exports = {
-        initBootstrapWidgets,
-        renderView,
-        refreshView,
-        applyCellDisplay,
-        resetCellDisplayOverrides,
-        highlightInvolvedElements,
-        loadFilteredTable,
-        exitFilteredView,
-        exitFilteredViewAndReload,
-        showAlert,
-        formatDate,
-        debounce,
-        copyToClipboard
     };
 }

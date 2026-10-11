@@ -115,14 +115,6 @@ body {
     pointer-events: none; /* Make unclickable */
 }
 
-/* Ghost placeholder for deleted cells with no items */
-.deleted-placeholder {
-    opacity: 0.6;
-    font-style: italic;
-    color: #842029;
-    pointer-events: none;
-}
-
 /* View toggle buttons ("Show all rows" / "Show Changes Only") — rendered
    per table by the backend (each table filters independently); the toolbar
    keeps only the global "Expand cells" toggle. */
@@ -206,15 +198,6 @@ span.item-data:has(~ span.issue-icon.warning) {
 /* Popover max-width */
 .popover {
     max-width: 500px;
-}
-
-/* Highlight utility classes (used by highlightInvolvedElements) */
-.highlight-error {
-    background-color: LightCoral;
-}
-
-.highlight-warning {
-    background-color: Orange;
 }
 
 /* Separator */
