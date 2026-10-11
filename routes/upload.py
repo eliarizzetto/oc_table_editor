@@ -18,12 +18,12 @@ router = APIRouter()
 def _check_csv_header(filename: str, content: bytes) -> None:
     """
     Reject CSVs whose header contains characters that oc_validator would
-    interpolate unescaped into HTML class names / element ids (<, >, ").
+    interpolate unescaped into HTML class names / element ids (<, >).
     Such headers already produce broken table markup today; failing early
     gives a clear message instead.
     """
     header = content.decode('utf-8-sig', errors='replace').split('\n', 1)[0]
-    bad = [ch for ch in '<>"' if ch in header]
+    bad = [ch for ch in '<>' if ch in header]
     if bad:
         raise HTTPException(
             status_code=400,
