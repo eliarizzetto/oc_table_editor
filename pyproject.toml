@@ -13,3 +13,20 @@ dependencies = [
     "python-multipart>=0.0.32",
     "uvicorn[standard]>=0.54.0",
 ]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+filterwarnings = [
+    # starlette's TestClient warns that httpx is deprecated in favour of
+    # httpx2; httpx still works fine and is what we have pinned.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
