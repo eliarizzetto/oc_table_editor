@@ -49,12 +49,12 @@ from services.session_document import atomic_write
 
 
 def _journal_filename(table_type: str) -> str:
+    # the JSON-Lines file stores the changes made on the table
     return f'journal_{table_type}.jsonl'
 
 
 def _state_filename(table_type: str) -> str:
-    # '_state' suffix — the legacy 'journal_meta.json' held the metadata OF
-    # the journal, while this file is the state of the meta table's journal.
+    # the JSON file stores the state OF THE JOURNAL
     return f'journal_{table_type}_state.json'
 
 
@@ -157,13 +157,18 @@ class ChangeJournal:
             # Reuse the (empty) loaded journal but stamp the fresh generation.
             self.generation = generation
             self.table_type = table_type
-            await self._write_meta()
+            await self._write_journal_meta()
             return
         await self.reset(generation, table_type)
 
     # -- persistence ----------------------------------------------------------
 
-    async def _write_meta(self) -> None:
+    async def _write_journal_meta(self) -> None:
+        """Persist the journal's current state metadata to disk atomically.
+
+        Serializes the generation, table type, cursor, and saved sequence 
+        number to JSON and writes them to the state file (i.e. journal_{table_type}_state.json).
+        """
         payload = json.dumps({
             'generation': self.generation,
             'table_type': self.table_type,
@@ -174,6 +179,11 @@ class ChangeJournal:
         self._meta_exists = True
 
     async def _rewrite_events(self) -> None:
+        """Completely rewrite the journal's event file on disk with the current in-memory events.
+
+        Serializes all events currently in `self.events` to JSON-Lines format and
+        writes them atomically to the journal path, discarding any pruned or undone events.
+        """
         payload = ''.join(json.dumps(ev) + '\n' for ev in self.events)
         await atomic_write(self._journal_path, payload)
 
@@ -196,7 +206,7 @@ class ChangeJournal:
                                 newline='') as f:
                 await f.write(json.dumps(ev) + '\n')
         self.cursor = len(self.events)
-        await self._write_meta()
+        await self._write_journal_meta()
         return ev
 
     async def undo(self) -> Optional[dict]:
@@ -204,7 +214,7 @@ class ChangeJournal:
         if self.cursor == 0:
             return None
         self.cursor -= 1
-        await self._write_meta()
+        await self._write_journal_meta()
         return self.events[self.cursor]
 
     async def redo(self) -> Optional[dict]:
@@ -213,7 +223,7 @@ class ChangeJournal:
             return None
         ev = self.events[self.cursor]
         self.cursor += 1
-        await self._write_meta()
+        await self._write_journal_meta()
         return ev
 
     async def truncate_redo_tail(self) -> bool:
@@ -225,13 +235,13 @@ class ChangeJournal:
             return False
         self.events = self.events[:self.cursor]
         await self._rewrite_events()
-        await self._write_meta()
+        await self._write_journal_meta()
         return True
 
     async def mark_saved(self) -> None:
         """Commit marker: the on-disk table file now reflects ``cursor``."""
         self.saved_seq = self.cursor
-        await self._write_meta()
+        await self._write_journal_meta()
 
     async def reset(self, generation: str, table_type: str) -> None:
         """Clear the journal against a new generation (after revalidate)."""
@@ -241,7 +251,7 @@ class ChangeJournal:
         self.generation = generation
         self.table_type = table_type
         await self._rewrite_events()
-        await self._write_meta()
+        await self._write_journal_meta()
 
     # -- derived state ----------------------------------------------------------
 
@@ -268,7 +278,7 @@ async def truncate_redo_tails(session_id: str, table_types: Sequence[str],
 
     Single-stack semantics: a new edit in one table destroys the redo stack
     of the whole session — otherwise a redo could resurrect an edit older
-    than a newer one.  Caller must hold the session lock."""
+    than a newer one. Caller must hold the session lock."""
     for tt in table_types:
         if tt in exclude:
             continue

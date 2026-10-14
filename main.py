@@ -7,7 +7,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 
-from config import SESSION_DIR, MAX_UPLOAD_SIZE, BASE_DIR
+from config import SESSION_DIR, MAX_UPLOAD_SIZE, BASE_DIR, VERSION
 from services import SessionManager
 from routes import router as api_router
 
@@ -28,7 +28,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="OC Table Editor",
     description="Web-based editor for validated bibliographic CSV tables",
-    version="1.0.0",
+    version=VERSION,
     lifespan=lifespan
 )
 
@@ -86,7 +86,7 @@ async def health_check():
     return {
         "status": "healthy",
         "app": "OC Table Editor",
-        "version": "1.0.0"
+        "version": VERSION
     }
 
 

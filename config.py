@@ -19,3 +19,7 @@ MAX_DRAFT_NAME_LEN = 120  # shared by upload + rename validation
 
 # Table view pagination
 TABLE_PAGE_SIZE = 25  # max rows per page in the editor's main/filtered views
+
+
+# version
+VERSION = "1.0.0"
