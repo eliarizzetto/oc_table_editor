@@ -1,8 +1,11 @@
 [project]
 name = "oc-table-editor"
 version = "0.1.0"
-description = "Add your description here"
+description = "A local web app for editing OpenCitations tables."
 readme = "README.md"
+authors = [
+  { name = "Elia Rizzetto", email = "elia.rizzetto2@unibo.it" }
+]
 requires-python = ">=3.13"
 dependencies = [
     "aiofiles>=25.1.0",

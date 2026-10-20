@@ -165,34 +165,11 @@
                 <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
-                <h6>Editing tips</h6>
-                <ul class="small mb-3">
-                    <li>Click on any text to edit it</li>
-                    <li>Hover on cells to see action buttons (add, clear, delete)</li>
-                    <li>Use <em>+ add</em> to append a new value to multi-value fields</li>
-                    <li>Use <em>+ row</em> at the bottom of every page to add rows</li>
-                    <li>Grey background = edited item</li>
-                    <li>Green background = added item or row</li>
-                    <li>Red strikethrough = deleted data (always visible as ghosts)</li>
-                    <li>Underline = has validation issues</li>
-                    <li>Click colored square to filter by issue</li>
-                    <li>The <em>search box</em> above each table filters the <strong>whole table</strong> (all pages, including your edits) as you type; × clears it</li>
-                    <li>The <em>Issue filters</em> dropdown narrows a table to rows carrying specific issue types, grouped under Errors/Warnings; a group's checkbox selects all of its types</li>
-                    <li>Sessions can be named at upload and renamed anytime (✏️ in the saved-sessions list or the Session Info card)</li>
-                    <li>Cells are reduced by default: one line per valid cell; in cells with issues, all invalid items are shown in full and valid ones are hidden behind an ellipsis</li>
-                    <li>Use the <em>Expand cells</em> button above each table (each table expands independently), or the ▸/▾ chevron next to the row number, to show full cell contents</li>
-                    <li>By default only rows with errors/warnings or changes are shown; <em>Show all rows</em> reveals the rest</li>
-                    <li><em>Show Changes Only</em> = view only edited, added and deleted data</li>
-                    <li>When both a metadata and a citations table are loaded, each table has its own filters, pager and <em>+ row</em> button — they work independently</li>
-                    <li>Undo/Redo (sidebar buttons or Ctrl+Z / Ctrl+Y) works across both tables: the most recent change anywhere is always undone first, and the view jumps to what was undone/redone</li>
-                    <li>Each table is paginated (25 rows per page)</li>
-                    <li>Re-validate after editing</li>
-                </ul>
                 <h6>Understanding the validation view</h6>
                 <div class="small">
                     <p class="mb-2">
-                        The parts of the table that did not validate are marked by an
-                        underlining and immediately followed by a coloured square.
+                        The parts of the table that are invalid or require inspection are marked by an
+                        underlining and immediately followed by a coloured square, representing the issue itself.
                         Data involving an
                         <span style="text-decoration: underline; text-decoration-color: LightCoral">Error</span>
                         is marked by a red underline, data involving a
@@ -202,13 +179,28 @@
                     <p class="mb-2">
                         Each single coloured square represents the association between an
                         Error/Warning and a single piece of data. Squares of the same colour
-                        all represent the same error instance.
+                        all represent the same error instance, which can involve separate parts of the table.
                     </p>
-                    <p class="mb-0">
-                        To get an explanation of an Error/Warning, hover with the mouse cursor
+                <h6>Editing tips</h6>
+                <ul class="small mb-3">
+                    <li>To get an explanation of an Error/Warning, hover with the mouse cursor
                         over any of the squares that represent it. If you click on it, the table
-                        shows only the data involved in that Error/Warning.
-                    </p>
+                        table view is filtered to show only the rows involved in that Error/Warning.</li>
+                    <li>Click on any text to edit it</li>
+                    <li>Hover on cells to see action buttons (add, clear, delete)</li>
+                    <li>Use the "+" button to append a new value to fields that support multiple values or to add the first value of an empty field</li>
+                    <li>Use <em>+ row</em> at the bottom of every page to add rows</li>
+                    <li><span style="background-color: rgb(100 149 237 / 0.12);">Light-blue</span> background = edited item; <span style="background-color: rgb(1 187 1 / 0.08);">green background</span> = added item or row; <span style="background-color: rgb(223 43 43 / 0.08);"> red background with strikethrough</span> = deleted data</li>
+                    <li>Click a colored square to filter the table and show only the rows interested by that specific issue</li>
+                    <li>The <em>search box</em> above each table filters the <strong>whole table</strong> (all pages, including your edits); × clears it</li>
+                    <li>The <em>Issue filters</em> dropdown narrows a table to rows carrying specific issue types, grouped under Errors/Warnings; a group's checkbox selects all of its types</li>
+                    <li>Cells are reduced by default: one line per valid cell; in cells with issues, all invalid items are shown in full and valid ones are hidden behind an ellipsis</li>
+                    <li>Use the <em>Expand cells</em> button above each table (each table expands independently), or the ▸/▾ chevron next to the row number, to show full cell contents</li>
+                    <li><em>Show all rows</em>, when toggled on, shows all rows regardless of their validity state; by default only rows with errors/warnings or changes are shown</li>
+                    <li><em>Show Changes Only</em> = view only edited, added and deleted data</li>
+                    <li>Undo/Redo (sidebar buttons or Ctrl+Z / Ctrl+Y) works across both tables: the most recent change anywhere is always undone first, and the view jumps to what was undone/redone</li>
+                    <li>Sessions can be named at upload and renamed anytime (✏️ in the saved-sessions list or the Session Info card)</li>
+                </ul>
                 </div>
             </div>
             <div class="modal-footer">
